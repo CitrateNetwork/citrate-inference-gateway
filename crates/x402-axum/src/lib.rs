@@ -69,6 +69,7 @@ pub mod client;
 pub mod digest;
 pub mod error;
 pub mod header;
+pub mod keys;
 pub mod layer;
 pub mod nonce;
 pub mod pricing;

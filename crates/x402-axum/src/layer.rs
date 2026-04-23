@@ -233,7 +233,7 @@ impl X402LayerBuilder {
             .ok_or_else(|| X402Error::Internal("operator_secret not set".into()))?;
 
         // Derive operator address from the secp256k1 key.
-        let operator_address = derive_secp256k1_address(&operator_secret)
+        let operator_address = crate::keys::derive_secp256k1_address(&operator_secret)
             .ok_or_else(|| X402Error::Internal("invalid operator_secret: not a valid scalar".into()))?;
 
         // If no chain client was injected, instantiate the default
@@ -262,24 +262,8 @@ impl X402LayerBuilder {
     }
 }
 
-/// Derive an Ethereum address from a secp256k1 private key.
-fn derive_secp256k1_address(secret: &[u8; 32]) -> Option<H160> {
-    use sha3::{Digest, Keccak256};
-    let signing_key = k256::ecdsa::SigningKey::from_bytes(secret.into()).ok()?;
-    let verifying_key = signing_key.verifying_key();
-    let encoded = verifying_key.to_encoded_point(false);
-    let pubkey_bytes = encoded.as_bytes();
-    // Skip 0x04 prefix; hash the 64-byte uncompressed pubkey.
-    if pubkey_bytes.len() != 65 {
-        return None;
-    }
-    let mut h = Keccak256::new();
-    h.update(&pubkey_bytes[1..]);
-    let hash = h.finalize();
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash[12..32]);
-    Some(H160::from(addr))
-}
+// derive_secp256k1_address moved to crate::keys in WP-02.4 so it's
+// shared with the X402Client payer-address derivation.
 
 // ── Tower middleware glue ──────────────────────────────────────────
 
