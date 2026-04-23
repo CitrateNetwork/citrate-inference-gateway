@@ -1,14 +1,24 @@
-//! The `X402Layer` tower middleware — scaffolding only (WP-02.1).
+//! The `X402Layer` tower middleware.
 //!
-//! WP-02.2 fills the challenge generator. WP-02.3 fills verify + settle.
-//! WP-02.5 wires observability. Until those land, [`X402Layer::new`]
-//! only validates the builder config; there is no request path yet.
+//! WP-02.2 wired the unpaid path — requests arriving without
+//! `X-PAYMENT` return 402 with a fully-populated challenge body.
+//! WP-02.3 will fill the paid path (verify + settle). Until then,
+//! requests WITH a header get a 501 "payment verification pending
+//! WP-02.3" response so the full wire shape is observable.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use axum::body::Body;
+use axum::http::{Request, Response, StatusCode};
+use tower::{Layer, Service};
 
 use ethereum_types::H160;
 
+use crate::challenge::{build_challenge, now_unix_secs, ChallengeInputs};
 use crate::error::X402Error;
+use crate::nonce::NonceSource;
 use crate::pricing::PricingStrategy;
 
 /// Fully-configured x402 middleware. Apply to any axum router via
@@ -17,15 +27,14 @@ use crate::pricing::PricingStrategy;
 #[derive(Clone)]
 pub struct X402Layer {
     pub(crate) config: Arc<X402Config>,
+    pub(crate) nonces: Arc<NonceSource>,
 }
 
 /// Internal configuration shared across the tower service.
 ///
-/// `dead_code` allowed during WP-02.1 scaffolding — fields are
-/// consumed by WP-02.2 (pricing, challenge_ttl_secs),
-/// WP-02.3 (facilitator_address, wsalt_address, treasury, rpc_url,
-/// receipt_timeout_secs, chain_id). Remove the attribute once the
-/// service body is implemented.
+/// `dead_code` allowed during WP-02 scaffolding — fields not yet
+/// referenced become live at WP-02.3 (rpc_url, facilitator_address,
+/// treasury, receipt_timeout_secs).
 #[allow(dead_code)]
 pub(crate) struct X402Config {
     /// Chain ID — `40204` for Citrate testnet.
@@ -172,8 +181,167 @@ impl X402LayerBuilder {
                 challenge_ttl_secs: self.challenge_ttl_secs.unwrap_or(300),
                 receipt_timeout_secs: self.receipt_timeout_secs.unwrap_or(10),
             }),
+            nonces: Arc::new(NonceSource::new()),
         })
     }
+}
+
+// ── Tower middleware glue ──────────────────────────────────────────
+
+impl<S> Layer<S> for X402Layer {
+    type Service = X402Service<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        X402Service {
+            inner,
+            config: self.config.clone(),
+            nonces: self.nonces.clone(),
+        }
+    }
+}
+
+/// Tower service produced by [`X402Layer::layer`]. Clones cheaply
+/// (everything behind it is `Arc`-shared or thin); axum clones the
+/// service once per request, as expected.
+#[derive(Clone)]
+pub struct X402Service<S> {
+    inner: S,
+    config: Arc<X402Config>,
+    nonces: Arc<NonceSource>,
+}
+
+impl<S> Service<Request<Body>> for X402Service<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = Response<Body>;
+    type Error = S::Error;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let config = self.config.clone();
+        let nonces = self.nonces.clone();
+        // Prepare a ready-to-go inner service (see the tower docs'
+        // buffering pattern — swapping inner keeps the service
+        // correct-by-construction w.r.t. ownership).
+        let inner_ready = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, inner_ready);
+
+        Box::pin(async move {
+            // WP-02.3: parse X-PAYMENT, verify, settle. For now, any
+            // header at all gets 501 with a clear reason so integration
+            // tests observe the shape.
+            if req.headers().get("x-payment").is_some() {
+                return Ok(build_501_response());
+            }
+
+            // Price the request first — 400 on unpriceable, 402 on
+            // valid-but-expensive.
+            let price = match config.pricing.price_for(&req).await {
+                Ok(p) => p,
+                Err(e) => return Ok(build_400_response(&e.to_string())),
+            };
+
+            // Choose a payer identity to embed in the challenge.
+            // v1 convention: use the zero address as "unknown payer"
+            // — the client fills in its real address when signing.
+            // On-chain, WrappedSALT will recover the *actual* signer
+            // from ECDSA recovery; the `from` field in the EIP-3009
+            // payload MUST match that recovered address, so the
+            // zero-address placeholder is simply overwritten during
+            // sign. (If we ever want to bind a challenge to a
+            // specific known payer — e.g. for API-key backed
+            // accounts — the pricing strategy can return that
+            // binding. Deferred.)
+            let payer = H160::zero();
+
+            let nonce = nonces.next_nonce();
+            let built = match build_challenge(ChallengeInputs {
+                chain_id: config.chain_id,
+                facilitator: config.facilitator_address,
+                wsalt: config.wsalt_address,
+                recipient: config.treasury,
+                amount_wei: price,
+                payer,
+                nonce,
+                now_unix: now_unix_secs(),
+                ttl_secs: config.challenge_ttl_secs,
+            }) {
+                Ok(b) => b,
+                Err(e) => return Ok(build_500_response(&e.to_string())),
+            };
+
+            // `inner` is captured because the S: Clone bound requires
+            // it for the eventual WP-02.3 paid path; on the 402 path
+            // we drop it explicitly rather than forward.
+            drop(inner);
+            Ok(build_402_response(&built.challenge, None))
+        })
+    }
+}
+
+/// Build a 402 response with the challenge body. Per spec #1.
+fn build_402_response(
+    challenge: &crate::types::PaymentChallenge,
+    reason: Option<&str>,
+) -> Response<Body> {
+    let mut body_map = serde_json::Map::new();
+    body_map.insert(
+        "x402".to_string(),
+        serde_json::to_value(challenge).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(r) = reason {
+        body_map.insert("reason".to_string(), serde_json::Value::String(r.to_string()));
+    }
+    let body = serde_json::Value::Object(body_map).to_string();
+
+    Response::builder()
+        .status(StatusCode::PAYMENT_REQUIRED)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn build_400_response(reason: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": "bad request", "reason": reason }).to_string();
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn build_500_response(reason: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": "internal", "reason": reason }).to_string();
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn build_501_response() -> Response<Body> {
+    // WP-02.3 fills this — returns a clear placeholder so integration
+    // tests and curl users can observe the shape without silent
+    // 500s.
+    let body = serde_json::json!({
+        "error": "not implemented",
+        "reason": "payment verification pending WP-02.3",
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 fn parse_addr(addr: &str) -> Option<H160> {
