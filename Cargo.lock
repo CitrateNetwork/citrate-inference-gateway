@@ -1896,6 +1896,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-inference-gateway"
+version = "0.4.0"
+dependencies = [
+ "axum",
+ "citrate-wallet-core",
+ "ethereum-types",
+ "hex",
+ "http 1.4.0",
+ "http-body-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha3",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.23",
+ "tower 0.5.3",
+ "tower-http 0.6.8",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "x402-axum",
+]
+
+[[package]]
 name = "citrate-learning"
 version = "0.4.0"
 dependencies = [
