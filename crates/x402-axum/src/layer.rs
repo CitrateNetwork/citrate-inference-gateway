@@ -24,6 +24,7 @@ use crate::digest::wsalt_domain_separator;
 use crate::error::X402Error;
 use crate::header::{decode as decode_payment_header, X_PAYMENT_HEADER};
 use crate::nonce::NonceSource;
+use crate::observability::{NoopObservability, ObservabilityHook, RejectedEvent, SettledEvent};
 use crate::pricing::PricingStrategy;
 use crate::receipt::find_payment_settled;
 use crate::types::X402Paid;
@@ -51,6 +52,9 @@ pub(crate) struct X402Config {
     pub pricing: Arc<dyn PricingStrategy>,
     /// Chain client (precompile verify + nonce + raw tx + receipt).
     pub chain: Arc<dyn ChainClient>,
+    /// Observability hook — called on settlement success and rejection.
+    /// Defaults to `NoopObservability` if unset.
+    pub observability: Arc<dyn ObservabilityHook>,
     /// Operator wallet that signs the settlement tx. Secp256k1 key —
     /// stored as raw bytes so we can produce a fresh `SigningKey`
     /// per request (k256's `SigningKey` is not `Sync`).
@@ -111,6 +115,7 @@ pub struct X402LayerBuilder {
     rpc_url: Option<String>,
     pricing: Option<Arc<dyn PricingStrategy>>,
     chain: Option<Arc<dyn ChainClient>>,
+    observability: Option<Arc<dyn ObservabilityHook>>,
     operator_secret: Option<[u8; 32]>,
     gas_price_wei: Option<u64>,
     gas_limit: Option<u64>,
@@ -196,6 +201,15 @@ impl X402LayerBuilder {
         self
     }
 
+    /// Optional: inject an [`ObservabilityHook`]. Defaults to
+    /// [`NoopObservability`] if unset. Use
+    /// [`crate::CountersObservability`] for simple in-memory metrics
+    /// or implement the trait for a custom Prometheus/trail wiring.
+    pub fn observability<H: ObservabilityHook + 'static>(mut self, hook: H) -> Self {
+        self.observability = Some(Arc::new(hook));
+        self
+    }
+
     /// Optional: gas price in wei for the settle tx. Default: 1 gwei.
     pub fn gas_price_wei(mut self, price: u64) -> Self {
         self.gas_price_wei = Some(price);
@@ -242,6 +256,10 @@ impl X402LayerBuilder {
             .chain
             .unwrap_or_else(|| Arc::new(HttpChainClient::new(&rpc_url)));
 
+        let observability = self
+            .observability
+            .unwrap_or_else(|| Arc::new(NoopObservability));
+
         Ok(X402Layer {
             config: Arc::new(X402Config {
                 chain_id,
@@ -250,6 +268,7 @@ impl X402LayerBuilder {
                 treasury,
                 pricing,
                 chain,
+                observability,
                 operator_secret,
                 operator_address,
                 gas_price_wei: self.gas_price_wei.unwrap_or(1_000_000_000), // 1 gwei
@@ -339,22 +358,48 @@ where
             // WP-02.3 paid path.
             let header_value = payment_header.expect("checked above");
             match run_paid_path(&config, &header_value, price, req).await {
-                PaidOutcome::Forward(req_with_paid) => {
+                PaidOutcome::Forward(req_with_paid, settled) => {
+                    // Emit success observability BEFORE invoking the
+                    // inner service — keeps the metric count aligned
+                    // with "we charged and released" even if the
+                    // inner handler panics or returns 5xx.
+                    config.observability.on_settled(&settled).await;
+
                     // Forward to inner service. Only now do we need `inner`.
                     let mut inner = inner;
-                    let fut = inner.call(req_with_paid);
+                    let fut = inner.call(*req_with_paid);
                     fut.await
                 }
                 PaidOutcome::Reject(err) => {
                     drop(inner);
+                    let reason = err.reason();
+                    let status = err.http_status();
+                    config
+                        .observability
+                        .on_rejected(&RejectedEvent {
+                            reason,
+                            http_status: status,
+                            payer: None,
+                        })
+                        .await;
                     let challenge = match make_challenge(&config, &nonces, price) {
                         Ok(c) => c,
                         Err(e) => return Ok(build_500_response(&e.to_string())),
                     };
-                    Ok(build_402_response(&challenge, Some(err.reason())))
+                    Ok(build_402_response(&challenge, Some(reason)))
                 }
                 PaidOutcome::ServerError(err) => {
                     drop(inner);
+                    let reason = err.reason();
+                    let status = err.http_status();
+                    config
+                        .observability
+                        .on_rejected(&RejectedEvent {
+                            reason,
+                            http_status: status,
+                            payer: None,
+                        })
+                        .await;
                     Ok(build_error_response(err))
                 }
             }
@@ -364,9 +409,16 @@ where
 
 /// Intermediate outcome of the paid path — lets us unify the
 /// reject-vs-server-error vs. forward-to-inner branches.
+///
+/// `Forward` is boxed because `Request<Body>` is a multi-hundred-byte
+/// struct and clippy's `large_enum_variant` rightly flags it —
+/// boxing keeps the common `Reject(X402Error)` path's enum size
+/// small.
 enum PaidOutcome {
     /// Forward the (possibly augmented) request to the inner service.
-    Forward(Request<Body>),
+    /// Carries the settlement event so the outer `call()` can fire
+    /// the observability hook before invoking the inner.
+    Forward(Box<Request<Body>>, SettledEvent),
     /// Reject with a 402 response. Server has a fresh challenge ready.
     Reject(X402Error),
     /// Server-side failure — 500 with a reason.
@@ -477,7 +529,16 @@ async fn run_paid_path(
         settle_tx_hash: tx_hash,
     });
 
-    PaidOutcome::Forward(req)
+    let event = SettledEvent {
+        payer: settled.from,
+        amount_wei: settled.value,
+        fee_wei: settled.fee,
+        nonce: settled.nonce,
+        tx_hash,
+        block_number: receipt.block_number,
+    };
+
+    PaidOutcome::Forward(Box::new(req), event)
 }
 
 fn make_challenge(

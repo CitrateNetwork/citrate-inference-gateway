@@ -72,6 +72,7 @@ pub mod header;
 pub mod keys;
 pub mod layer;
 pub mod nonce;
+pub mod observability;
 pub mod pricing;
 pub mod receipt;
 pub mod sign_tx;
@@ -87,6 +88,10 @@ pub use error::X402Error;
 pub use header::{decode as decode_payment_header, encode as encode_payment_header, X_PAYMENT_HEADER};
 pub use layer::{X402Layer, X402LayerBuilder, X402Service};
 pub use nonce::NonceSource;
+pub use observability::{
+    CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent,
+    RejectionBreakdown, SettledEvent,
+};
 pub use pricing::{FixedPricing, PricingError, PricingStrategy};
 pub use receipt::{find_payment_settled, PaymentSettledEvent};
 pub use types::{PaymentChallenge, PaymentPayload, PAYLOAD_BYTES, X402Paid};
