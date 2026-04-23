@@ -37,10 +37,13 @@ base64 = "0.22"
 ethereum-types = "0.14"
 primitive-types = "0.12"
 
-# Cryptography — keccak256 for EIP-712 domain separator & digest.
+# Cryptography — keccak256 for EIP-712 domain separator & digest;
+# secp256k1 for the operator wallet that signs the settlement tx.
 sha3 = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
 hex = "0.4"
 getrandom = "0.3"
+rlp = "0.5"
 
 # Citrate integration — wallet-core gives us the RpcClient, UnifiedKey,
 # and signing primitives the X402Client needs.
