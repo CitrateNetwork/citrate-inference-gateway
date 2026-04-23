@@ -27,6 +27,7 @@ members = [
     "agent-code",
     "gui/citrate_edu_app",
     "gui/citrate_learning_center",
+    "crates/x402-axum",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.
