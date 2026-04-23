@@ -21,6 +21,10 @@ fn any_addr() -> &'static str {
     "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b"
 }
 
+fn test_secret_hex() -> &'static str {
+    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+}
+
 fn build_app() -> Router {
     let layer = X402Layer::builder()
         .chain_id(40204)
@@ -29,6 +33,7 @@ fn build_app() -> Router {
         .treasury(any_addr())
         .rpc_url("http://127.0.0.1:18545")
         .pricing(FixedPricing::new("1000000000000000000")) // 1 SALT
+        .operator_secret_hex(test_secret_hex())
         .build()
         .expect("build layer");
 
@@ -159,27 +164,51 @@ async fn content_type_is_json() {
 }
 
 #[tokio::test]
-async fn request_with_x_payment_header_gets_501_placeholder() {
-    // WP-02.3 implements the paid path. Until then the service
-    // returns 501 with a clear message — better than silently 500
-    // or passing through.
+async fn malformed_x_payment_header_gets_402_with_reason() {
+    // WP-02.3: a header present but unparseable returns 402 with
+    // a fresh challenge AND a reason field naming the fault.
+    // Gherkin scenario #1 + #5 (malformed/invalid variants).
     let app = build_app();
     let req = Request::builder()
         .uri("/gated")
-        .header("x-payment", "anything")
+        .header("x-payment", "not-valid-base64!@#$%")
         .body(Body::empty())
         .expect("build request");
     let (status, body, _) = call(app, req).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let body = json(&body);
-    assert_eq!(body["error"].as_str(), Some("not implemented"));
+    // Fresh challenge still included.
+    assert!(body.get("x402").is_some(), "must include x402 envelope");
+    // Reason surfaces the specific failure.
+    let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or("");
     assert!(
-        body["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("WP-02.3"),
-        "reason should name the next WP, got: {:?}",
-        body["reason"]
+        reason.contains("malformed") || reason.contains("payment"),
+        "reason should describe malformed header, got: {:?}",
+        reason
+    );
+}
+
+#[tokio::test]
+async fn valid_base64_wrong_length_gets_402_malformed() {
+    // Well-formed base64 but payload of wrong length — the more
+    // subtle malformed case.
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let app = build_app();
+    // 100 bytes of zero → valid base64, invalid payload (needs 233).
+    let bad = URL_SAFE_NO_PAD.encode([0u8; 100]);
+    let req = Request::builder()
+        .uri("/gated")
+        .header("x-payment", bad)
+        .body(Body::empty())
+        .expect("build request");
+    let (status, body, _) = call(app, req).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    let body = json(&body);
+    let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    assert!(
+        reason.contains("malformed") || reason.contains("payment"),
+        "reason should indicate malformed, got: {:?}",
+        reason
     );
 }
 
@@ -196,6 +225,7 @@ async fn different_chain_ids_produce_different_challenge_chain_id() {
         .treasury(any_addr())
         .rpc_url("http://127.0.0.1:18545")
         .pricing(FixedPricing::new("100"))
+        .operator_secret_hex(test_secret_hex())
         .build()
         .expect("build");
     let app = Router::new()

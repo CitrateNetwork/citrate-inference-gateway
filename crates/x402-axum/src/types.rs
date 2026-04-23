@@ -83,18 +83,131 @@ pub struct PaymentPayload {
     pub s: H256,
 }
 
+/// Wire size of a [`PaymentPayload`] in bytes:
+/// `from(20) + to(20) + value(32) + validAfter(32) + validBefore(32) + nonce(32) + v(1) + r(32) + s(32)`
+pub const PAYLOAD_BYTES: usize = 20 + 20 + 32 + 32 + 32 + 32 + 1 + 32 + 32;
+
 impl PaymentPayload {
-    /// Serialize to the 265-byte wire format the precompile expects.
-    /// This is the inverse of [`Self::parse`].
+    /// Serialize to the 233-byte wire format. This is what goes into
+    /// the `X-PAYMENT` header (after base64 encoding).
+    ///
+    /// The precompile `0x0201` expects a 265-byte input: this payload
+    /// PREFIXED with the 32-byte EIP-712 domain separator. The server
+    /// supplies the domain separator from its own config — the client
+    /// never has to know about it.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let _ = self;
-        todo!("WP-02.3: emit the 265-byte layout described in module docs")
+        let mut out = Vec::with_capacity(PAYLOAD_BYTES);
+        out.extend_from_slice(self.from.as_bytes());
+        out.extend_from_slice(self.to.as_bytes());
+        let mut buf32 = [0u8; 32];
+        self.value.to_big_endian(&mut buf32);
+        out.extend_from_slice(&buf32);
+        self.valid_after.to_big_endian(&mut buf32);
+        out.extend_from_slice(&buf32);
+        self.valid_before.to_big_endian(&mut buf32);
+        out.extend_from_slice(&buf32);
+        out.extend_from_slice(self.nonce.as_bytes());
+        out.push(self.v);
+        out.extend_from_slice(self.r.as_bytes());
+        out.extend_from_slice(self.s.as_bytes());
+        debug_assert_eq!(out.len(), PAYLOAD_BYTES);
+        out
     }
 
-    /// Parse from the 265-byte wire format. Returns `Err` on length
-    /// mismatch; higher layers decode from base64 first.
-    pub fn parse(_bytes: &[u8]) -> Result<Self, crate::X402Error> {
-        todo!("WP-02.3: parse the 265-byte layout described in module docs")
+    /// Parse from the 233-byte wire format.
+    ///
+    /// Returns [`crate::X402Error::MalformedPaymentHeader`] on length
+    /// mismatch. Higher layers decode from base64 first.
+    pub fn parse(bytes: &[u8]) -> Result<Self, crate::X402Error> {
+        if bytes.len() != PAYLOAD_BYTES {
+            return Err(crate::X402Error::MalformedPaymentHeader(format!(
+                "expected {} bytes, got {}",
+                PAYLOAD_BYTES,
+                bytes.len()
+            )));
+        }
+        let mut cursor = 0;
+        let mut take = |n: usize| {
+            let slice = &bytes[cursor..cursor + n];
+            cursor += n;
+            slice
+        };
+        let from = H160::from_slice(take(20));
+        let to = H160::from_slice(take(20));
+        let value = U256::from_big_endian(take(32));
+        let valid_after = U256::from_big_endian(take(32));
+        let valid_before = U256::from_big_endian(take(32));
+        let nonce = H256::from_slice(take(32));
+        let v = take(1)[0];
+        let r = H256::from_slice(take(32));
+        let s = H256::from_slice(take(32));
+        Ok(PaymentPayload {
+            from,
+            to,
+            value,
+            valid_after,
+            valid_before,
+            nonce,
+            v,
+            r,
+            s,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> PaymentPayload {
+        PaymentPayload {
+            from: H160::from([0xa1; 20]),
+            to: H160::from([0xa2; 20]),
+            value: U256::from(1_000_000_000_000_000_000u128),
+            valid_after: U256::from(1_714_000_000u64),
+            valid_before: U256::from(1_714_000_300u64),
+            nonce: H256::from([0xde; 32]),
+            v: 27,
+            r: H256::from([0xab; 32]),
+            s: H256::from([0xcd; 32]),
+        }
+    }
+
+    #[test]
+    fn payload_round_trip() {
+        let p = sample();
+        let bytes = p.to_bytes();
+        assert_eq!(bytes.len(), PAYLOAD_BYTES);
+        let parsed = PaymentPayload::parse(&bytes).expect("parse");
+        assert_eq!(parsed.from, p.from);
+        assert_eq!(parsed.to, p.to);
+        assert_eq!(parsed.value, p.value);
+        assert_eq!(parsed.valid_after, p.valid_after);
+        assert_eq!(parsed.valid_before, p.valid_before);
+        assert_eq!(parsed.nonce, p.nonce);
+        assert_eq!(parsed.v, p.v);
+        assert_eq!(parsed.r, p.r);
+        assert_eq!(parsed.s, p.s);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length() {
+        let err = PaymentPayload::parse(&[0u8; 100]).expect_err("should fail");
+        assert!(matches!(err, crate::X402Error::MalformedPaymentHeader(_)));
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        let err = PaymentPayload::parse(&[]).expect_err("should fail");
+        assert!(matches!(err, crate::X402Error::MalformedPaymentHeader(_)));
+    }
+
+    #[test]
+    fn payload_size_matches_precompile_minus_domain() {
+        // Precompile 0x0201 (TransferAuthVerify) expects 265 bytes
+        // = 32 (domain separator) + 233 (this payload). Locked here
+        // so any drift in either side surfaces immediately.
+        assert_eq!(PAYLOAD_BYTES, 265 - 32);
     }
 }
 
