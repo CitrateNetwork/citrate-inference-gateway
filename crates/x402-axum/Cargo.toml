@@ -40,6 +40,7 @@ primitive-types = "0.12"
 # Cryptography — keccak256 for EIP-712 domain separator & digest.
 sha3 = { workspace = true }
 hex = "0.4"
+getrandom = "0.3"
 
 # Citrate integration — wallet-core gives us the RpcClient, UnifiedKey,
 # and signing primitives the X402Client needs.
@@ -52,4 +53,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
-axum-test = "17"
+http-body-util = "0.1"

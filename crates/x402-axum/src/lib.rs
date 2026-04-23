@@ -62,15 +62,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod challenge;
 pub mod client;
+pub mod digest;
 pub mod error;
 pub mod layer;
+pub mod nonce;
 pub mod pricing;
 pub mod types;
 
 // Convenience re-exports — the shape a user integrates with.
+pub use challenge::{build_challenge, now_unix_secs, BuiltChallenge, ChallengeInputs};
 pub use client::X402Client;
+pub use digest::{eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator};
 pub use error::X402Error;
-pub use layer::{X402Layer, X402LayerBuilder};
+pub use layer::{X402Layer, X402LayerBuilder, X402Service};
+pub use nonce::NonceSource;
 pub use pricing::{FixedPricing, PricingError, PricingStrategy};
 pub use types::{PaymentChallenge, PaymentPayload, X402Paid};
