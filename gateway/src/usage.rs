@@ -34,6 +34,12 @@ use crate::SharedState;
 pub struct ApiKeyContext {
     /// Opaque key id (the part after `Bearer `).
     pub key_id: String,
+    /// CM-06 WP-06.5 — the unit of `paid.amount_wei` for usage
+    /// accounting. `Salt` means grains-of-SALT; `Credits` means
+    /// PFLOP-hour credits debited from BulkComputeGateway. Usage
+    /// rows record the value as-is; the display layer formats based
+    /// on this hint.
+    pub backing: crate::auth::KeyBacking,
 }
 
 /// One row's worth of per-day aggregate.

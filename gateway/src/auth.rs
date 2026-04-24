@@ -42,20 +42,48 @@ use x402_axum::{PricingStrategy, X402Paid};
 
 // ── Store ───────────────────────────────────────────────────────
 
+/// What the key's `balance_grains` field is denominated in
+/// (CM-06 WP-06.5).
+///
+///   Salt    : grains of SALT (default; existing CM-03 WP-03.4
+///             behavior). Per-request debit equals the SALT price the
+///             pricing strategy returns.
+///   Credits : PFLOP-hour credits (18 decimals) backed by an
+///             institution's BulkComputeGateway balance. Per-request
+///             debit is the credit-equivalent of the SALT price; the
+///             slice-1 layer treats the conversion 1:1 (debits the
+///             same number of "units"), which is fine for tests but
+///             not production-correct. Slice 2 wires an OracleAdapter
+///             that converts via `saltPerPflopHour`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyBacking {
+    /// Default — wSALT-equivalent grains.
+    #[default]
+    Salt,
+    /// PFLOP-hour credits via BulkComputeGateway.
+    Credits,
+}
+
 /// One API key's mutable state.
 #[derive(Debug, Clone)]
 pub struct ApiKeyRecord {
     /// Stable, opaque, operator-assigned label (`"pilot"`, `"ci"`).
     pub label: String,
-    /// Current balance in grains (wei).
+    /// Current balance. Unit is grains of SALT when
+    /// `backing == KeyBacking::Salt` (default); PFLOP-hour credits
+    /// when `backing == KeyBacking::Credits`.
     pub balance_grains: U256,
     /// EOA address the operator allocated for this key's top-ups.
     /// Slice 2 will watch chain transfers to this address and credit
-    /// the key automatically.
+    /// the key automatically. For Credits-backed keys this is the
+    /// institution's address whose BulkComputeGateway balance the
+    /// key represents.
     pub deposit_address: H160,
     /// `true` once the admin revokes the key. Requests with a revoked
     /// key get 401 regardless of balance.
     pub revoked: bool,
+    /// CM-06 WP-06.5 — what the balance is denominated in.
+    pub backing: KeyBacking,
     /// Unix seconds when the key was minted.
     pub created_at: u64,
 }
@@ -118,23 +146,54 @@ pub enum DebitError {
     Insufficient(U256),
 }
 
-/// Admin: mint a new API key.
+/// Admin: mint a new SALT-backed API key.
 ///
 /// Returns the opaque key_id string the holder should send in
 /// `Authorization: Bearer <id>`. Slice-1 ids are UUIDs; slice 2 may
 /// swap in a stronger HMAC-derived format.
+///
+/// Equivalent to `create_key_with_backing(..., KeyBacking::Salt)` —
+/// kept as a separate function so existing callers (and the
+/// integration test suite from CM-03 WP-03.4) don't have to change
+/// their signatures.
 pub async fn create_key(
     store: &ApiKeyStore,
     label: impl Into<String>,
     initial_balance_grains: U256,
     deposit_address: H160,
 ) -> String {
+    create_key_with_backing(
+        store,
+        label,
+        initial_balance_grains,
+        deposit_address,
+        KeyBacking::Salt,
+    )
+    .await
+}
+
+/// Admin: mint a new API key with an explicit backing choice
+/// (CM-06 WP-06.5).
+///
+/// Use `KeyBacking::Credits` for an institution that pre-purchased
+/// compute credits via BulkComputeGateway. The key's balance is
+/// then in PFLOP-hours (18 decimals); the per-request debit logic
+/// in `ApiKeyLayer` is unit-agnostic — slice 2 will wire an
+/// OracleAdapter to convert SALT-priced requests into credit cost.
+pub async fn create_key_with_backing(
+    store: &ApiKeyStore,
+    label: impl Into<String>,
+    initial_balance: U256,
+    deposit_address: H160,
+    backing: KeyBacking,
+) -> String {
     let key_id = format!("cgk_{}", Uuid::new_v4().simple());
     let record = ApiKeyRecord {
         label: label.into(),
-        balance_grains: initial_balance_grains,
+        balance_grains: initial_balance,
         deposit_address,
         revoked: false,
+        backing,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -269,6 +328,7 @@ where
                     });
                     req.extensions_mut().insert(crate::usage::ApiKeyContext {
                         key_id: key_id.clone(),
+                        backing: record.backing,
                     });
                     let mut inner = inner;
                     inner.call(req).await
@@ -367,6 +427,60 @@ async fn attach_deposit_hint(resp: Response<Body>, deposit: H160) -> Response<Bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CM-06 WP-06.5 — KeyBacking ─────────────────────────────
+
+    #[tokio::test]
+    async fn create_key_defaults_to_salt_backing() {
+        let store = ApiKeyStore::new();
+        let id = create_key(&store, "default", U256::from(100u64), H160::zero()).await;
+        let r = store.get(&id).await.expect("exists");
+        assert_eq!(r.backing, KeyBacking::Salt);
+    }
+
+    #[tokio::test]
+    async fn create_key_with_credits_backing_records_it() {
+        let store = ApiKeyStore::new();
+        let id = create_key_with_backing(
+            &store,
+            "credits-key",
+            U256::from(10u64) * U256::from(1_000_000_000_000_000_000u128),
+            H160::from([0xcc; 20]),
+            KeyBacking::Credits,
+        )
+        .await;
+        let r = store.get(&id).await.expect("exists");
+        assert_eq!(r.backing, KeyBacking::Credits);
+    }
+
+    #[tokio::test]
+    async fn debit_works_for_credits_backed_key() {
+        // Slice 1 — debit logic is unit-agnostic; same code path as
+        // SALT-backed. Slice 2 will introduce a unit conversion via
+        // an OracleAdapter.
+        let store = ApiKeyStore::new();
+        let id = create_key_with_backing(
+            &store,
+            "credits-key",
+            U256::from(100u64),
+            H160::zero(),
+            KeyBacking::Credits,
+        )
+        .await;
+        let new_bal = store.debit(&id, U256::from(30u64)).await.expect("debit");
+        assert_eq!(new_bal, U256::from(70u64));
+        let r = store.get(&id).await.expect("exists");
+        assert_eq!(r.backing, KeyBacking::Credits);  // unchanged
+    }
+
+    #[tokio::test]
+    async fn key_backing_default_impl() {
+        // Documented default-trait behaviour for downstream consumers.
+        let kb: KeyBacking = Default::default();
+        assert_eq!(kb, KeyBacking::Salt);
+    }
+
+    // ── Existing tests (unchanged) ─────────────────────────────
 
     #[tokio::test]
     async fn create_then_get_roundtrip() {
