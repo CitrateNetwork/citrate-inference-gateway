@@ -2198,13 +2198,21 @@ dependencies = [
 name = "citrate-training-worker"
 version = "0.4.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
+ "axum",
+ "ctr",
  "ethereum-types",
  "hex",
+ "k256",
  "parking_lot 0.12.5",
+ "pbkdf2 0.12.2",
+ "reqwest 0.12.28",
+ "rlp",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "thiserror 1.0.69",
  "tokio",
