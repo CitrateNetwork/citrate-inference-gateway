@@ -32,7 +32,8 @@ http = "1.1"
 
 # Async + HTTP client (for outbound provider calls + chain RPC)
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"
 
 # Serialization
 serde = { workspace = true }

@@ -1903,6 +1903,7 @@ dependencies = [
  "axum",
  "citrate-wallet-core",
  "ethereum-types",
+ "futures-util",
  "hex",
  "http 1.4.0",
  "http-body-util",
