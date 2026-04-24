@@ -41,12 +41,13 @@ pub mod openai;
 pub mod pricing;
 pub mod provider;
 pub mod queries;
+pub mod selection;
 pub mod usage;
 
 pub use config::GatewayConfig;
 pub use error::GatewayError;
 pub use provider::{ProviderProtocolRequest, ProviderProtocolResponse};
-pub use queries::{ChainQueries, HttpChainQueries, ProviderInfo};
+pub use queries::{ChainQueries, HttpChainQueries, PoolEntry, ProviderInfo};
 
 use x402_axum::{ChainClient, X402Layer};
 
