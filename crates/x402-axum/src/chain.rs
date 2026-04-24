@@ -79,6 +79,33 @@ pub trait ChainClient: Send + Sync {
     ) -> Result<TxReceipt, X402Error>;
 }
 
+/// Blanket impl so `Arc<dyn ChainClient>` works seamlessly with
+/// any builder that takes `C: ChainClient + 'static`. Lets the
+/// gateway construct the chain client once and share it across
+/// the X402Layer plus the gateway's own state.
+#[async_trait]
+impl<T: ChainClient + ?Sized> ChainClient for std::sync::Arc<T> {
+    async fn verify_offline(
+        &self,
+        precompile_input: &[u8],
+    ) -> Result<Option<H160>, X402Error> {
+        (**self).verify_offline(precompile_input).await
+    }
+    async fn get_nonce(&self, address: H160) -> Result<u64, X402Error> {
+        (**self).get_nonce(address).await
+    }
+    async fn send_raw_tx(&self, raw_tx: &[u8]) -> Result<H256, X402Error> {
+        (**self).send_raw_tx(raw_tx).await
+    }
+    async fn wait_for_receipt(
+        &self,
+        tx_hash: H256,
+        timeout: Duration,
+    ) -> Result<TxReceipt, X402Error> {
+        (**self).wait_for_receipt(tx_hash, timeout).await
+    }
+}
+
 /// Precompile address `0x0000…0201` — TransferAuthVerify.
 pub const TRANSFER_AUTH_VERIFY_PRECOMPILE: H160 = H160(const_addr_0201());
 
