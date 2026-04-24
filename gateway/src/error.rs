@@ -40,6 +40,14 @@ pub enum GatewayError {
     /// Internal bug.
     #[error("internal: {0}")]
     Internal(String),
+
+    /// CM-05 WP-05.4 slice 1 marker: dispatch selection picked a
+    /// pool, but on-chain `requestPoolCompute` requires a gateway
+    /// wallet that lands in slice 2. The pool name is included so
+    /// operators / dashboards can flag which pool is currently
+    /// "selectable but not dispatchable."
+    #[error("pool dispatch not implemented yet (slice 2): {0}")]
+    PoolDispatchUnimplemented(String),
 }
 
 impl GatewayError {
@@ -48,7 +56,11 @@ impl GatewayError {
         use GatewayError::*;
         match self {
             UnknownModel(_) | BadRequest(_) => 400,
-            NoProviders | ProviderUnavailable(_) | ChainUnavailable(_) | PricingUnavailable(_) => 503,
+            NoProviders
+            | ProviderUnavailable(_)
+            | ChainUnavailable(_)
+            | PricingUnavailable(_)
+            | PoolDispatchUnimplemented(_) => 503,
             Internal(_) => 500,
         }
     }

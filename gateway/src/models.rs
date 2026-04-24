@@ -21,6 +21,7 @@
 
 use axum::extract::State;
 use axum::Json;
+use ethereum_types::H256;
 use serde::Serialize;
 
 use crate::SharedState;
@@ -48,20 +49,51 @@ pub struct ModelsResponse {
 }
 
 /// `GET /v1/models` handler.
+///
+/// Lists individual provider-backed models AND ComputePool entries.
+/// Pool entries appear with `id` prefixed by `"pool-"` so SDK
+/// callers can target them like any other model id (CM-05 WP-05.4).
+/// Falls through to an empty list on any chain failure — see the
+/// resilience note at the top of this module.
 pub async fn models_handler(
     State(state): State<SharedState>,
 ) -> Json<ModelsResponse> {
-    // WP-03.1 ships an empty list — the chain query implementation
-    // is part of WP-03.2 (chat path needs to look up modelHash by
-    // name, so we'll implement together for code reuse). For now
-    // the endpoint exists with the right shape so the smoke test
-    // passes and SDK auto-discovery doesn't break.
-    let _ = &state.config; // wire-up sanity: state is reachable
+    let _ = &state.config;
     let _ = &state.http;
+
+    // The on-chain ModelRegistry doesn't expose a name→hash listing
+    // yet, so individual-model discovery from this endpoint is
+    // empty pending an off-chain index (or a slice-2 ABI extension).
+    // Pools, however, we can list directly via list_pools — the
+    // pool's name is its display id.
+    let pools = state
+        .queries
+        .list_pools(H256::zero())
+        .await
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pool_entries: Vec<ModelEntry> = pools
+        .into_iter()
+        .map(|p| ModelEntry {
+            id: format!("pool-{}", strip_pool_prefix(&p.name)),
+            object: "model",
+            owned_by: format!("pool:{}", p.pool_id),
+            created: now,
+        })
+        .collect();
     Json(ModelsResponse {
         object: "list",
-        data: Vec::new(),
+        data: pool_entries,
     })
+}
+
+/// `pool-llama-70b` → `llama-70b` (avoid the double-prefix
+/// `pool-pool-llama-70b`).
+fn strip_pool_prefix(name: &str) -> &str {
+    name.strip_prefix("pool-").unwrap_or(name)
 }
 
 #[cfg(test)]

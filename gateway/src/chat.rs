@@ -129,13 +129,41 @@ pub(crate) async fn run_dispatch(
         .await
         .map_err(|_| GatewayError::UnknownModel(req.model.clone()))?;
 
-    // List providers.
+    // List both individual providers and pools, then let the
+    // selection layer (CM-05 WP-05.4) score them on a comparable
+    // axis. Pool wins when its min_member_reputation × stake
+    // exceeds any individual's reputation × capacity.
     let mut providers = state
         .queries
         .list_providers(model_hash)
         .await
         .map_err(|e| GatewayError::ChainUnavailable(e.to_string()))?;
+    let pools = state
+        .queries
+        .list_pools(model_hash)
+        .await
+        .unwrap_or_else(|_| Vec::new());
 
+    if providers.is_empty() && pools.is_empty() {
+        return Err(GatewayError::NoProviders);
+    }
+
+    // Cross-class dispatch decision. If a pool wins, slice 1
+    // returns 503 with the slice-2 marker so callers don't have a
+    // dangling success path. Slice 2 will route through the
+    // gateway wallet via `requestPoolCompute` + `JobCompleted` poll.
+    if let Some(crate::selection::DispatchTarget::Pool(pl)) =
+        crate::selection::select_dispatch_target(&providers, &pools)
+    {
+        return Err(GatewayError::PoolDispatchUnimplemented(pl.name));
+    }
+
+    // Selection picked an individual provider OR there were no
+    // pools at all. Fall through to the existing failover loop
+    // below using the providers list. (Note: we don't NARROW the
+    // list to just the winning provider; the failover loop will
+    // re-pick from the full set on each attempt, which preserves
+    // the existing behaviour.)
     if providers.is_empty() {
         return Err(GatewayError::NoProviders);
     }

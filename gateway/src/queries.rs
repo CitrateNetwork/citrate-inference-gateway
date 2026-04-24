@@ -77,6 +77,42 @@ pub trait ChainQueries: Send + Sync {
         &self,
         model_hash: H256,
     ) -> Result<Vec<ProviderInfo>, GatewayError>;
+
+    /// List ComputePool entries that can serve `model_hash` (CM-05
+    /// WP-05.4). Default impl returns empty so HttpChainQueries
+    /// (which doesn't yet read ComputePool) compiles unchanged; the
+    /// real on-chain ABI call lands in WP-05.4 slice 2 alongside
+    /// the gateway wallet for `requestPoolCompute` tx submission.
+    /// Mock implementations override this to drive integration tests.
+    async fn list_pools(
+        &self,
+        _model_hash: H256,
+    ) -> Result<Vec<PoolEntry>, GatewayError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One ComputePool entry returned by `list_pools` (CM-05 WP-05.4).
+///
+/// Pools are scored against individual providers by
+/// `pool_score = min_member_reputation_bps × total_stake_grains` so a
+/// pool only wins when its weakest member is reputable AND the
+/// pool's collective stake is large enough to cover the buyer's
+/// risk. See `select_dispatch_target` for the comparison.
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolEntry {
+    /// On-chain ComputePool.pools[poolId].id.
+    pub pool_id: u64,
+    /// Pool's display name. Surfaced in `/v1/models` prefixed with
+    /// `pool-` so SDK users can target it like any other model id.
+    pub name: String,
+    /// Sum of all members' bonded stake, in grains.
+    pub total_stake_grains: U256,
+    /// Member count — informational; not used in the score.
+    pub member_count: u32,
+    /// Minimum across the pool's members. A buyer is exposed to the
+    /// weakest member, so this caps the pool's reliability score.
+    pub min_member_reputation_bps: u32,
 }
 
 // ── HttpChainQueries — real ABI calls via eth_call ───────────────
