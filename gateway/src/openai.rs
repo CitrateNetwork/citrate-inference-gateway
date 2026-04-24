@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Incoming `/v1/chat/completions` request body. Matches a useful
 /// subset of OpenAI's shape — extra fields the SDK sends (top_p,
 /// presence_penalty, etc.) are tolerated by serde's default.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Model name (e.g. "llama-3.1-8b") or pinned hash
     /// ("llama-3.1-8b@0xabcd..."). Resolved via ModelRegistry.
@@ -40,7 +40,7 @@ pub struct ChatMessage {
 
 /// `/v1/chat/completions` response body. OpenAI shape:
 /// `{ id, object: "chat.completion", created, model, choices, usage }`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionResponse {
     /// Server-generated unique ID for this completion.
     pub id: String,
@@ -57,7 +57,7 @@ pub struct ChatCompletionResponse {
 }
 
 /// One choice in a chat completion response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Choice {
     /// Position in the choices list (always 0 for n=1).
     pub index: u32,
@@ -68,7 +68,7 @@ pub struct Choice {
 }
 
 /// Token-count breakdown.
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Usage {
     /// Input tokens consumed.
     pub prompt_tokens: u32,

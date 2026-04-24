@@ -79,16 +79,16 @@ pub async fn chat_completions_handler(
 /// Bundles together what the dispatch path produced — provider
 /// output + token counts + the prompt we built (for empty-token
 /// fallback in the SSE path).
-struct DispatchOutcome {
-    output: String,
-    prompt: String,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+pub(crate) struct DispatchOutcome {
+    pub(crate) output: String,
+    pub(crate) prompt: String,
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
 }
 
 /// Resolve model + provider + dispatch with failover. Returns the
 /// raw provider output + token counts.
-async fn run_dispatch(
+pub(crate) async fn run_dispatch(
     state: &SharedState,
     req: &ChatCompletionRequest,
 ) -> Result<DispatchOutcome, GatewayError> {
@@ -170,7 +170,7 @@ async fn run_dispatch(
     Err(last_err.unwrap_or(GatewayError::NoProviders))
 }
 
-fn json_response(req: ChatCompletionRequest, d: DispatchOutcome) -> ChatCompletionResponse {
+pub(crate) fn json_response(req: ChatCompletionRequest, d: DispatchOutcome) -> ChatCompletionResponse {
     let _ = d.prompt; // not needed in JSON path
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),

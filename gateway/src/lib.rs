@@ -29,6 +29,7 @@ use axum::{routing::{get, post}, Router};
 use ethereum_types::H160;
 use tower_http::trace::TraceLayer;
 
+pub mod batch;
 pub mod chat;
 pub mod config;
 pub mod error;
@@ -73,6 +74,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
             config,
             http: reqwest::Client::new(),
             queries,
+            batches: Arc::new(batch::BatchStore::new()),
         }))
 }
 
@@ -90,6 +92,7 @@ pub async fn build_router_with(
         config: config.clone(),
         http: reqwest::Client::new(),
         queries: queries.clone(),
+        batches: Arc::new(batch::BatchStore::new()),
     });
 
     let pricing = pricing::TokenBasedPricing::new(queries, "llama-3.1-8b");
@@ -109,21 +112,34 @@ pub async fn build_router_with(
         .build()
         .expect("X402Layer build (smoke config valid)");
 
-    let chat_router = Router::new()
+    // Both /v1/chat/completions and /v1/batch sit behind the same
+    // X402Layer — one settlement covers each route's payment.
+    // /v1/batch/{id} (poll) and /v1/batch/{id}/output are FREE: the
+    // payment was made at submit time; subsequent polls are public
+    // reads of state the payer already owns.
+    let paid_router = Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions_handler))
+        .route("/v1/batch", post(batch::submit_batch_handler))
         .layer(layer)
+        .with_state(state.clone());
+
+    let free_batch_reads = Router::new()
+        .route("/v1/batch/:id", get(batch::get_batch_handler))
+        .route("/v1/batch/:id/output", get(batch::get_batch_output_handler))
         .with_state(state.clone());
 
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
         .with_state(state)
-        .merge(chat_router)
+        .merge(paid_router)
+        .merge(free_batch_reads)
         .layer(TraceLayer::new_for_http())
 }
 
 mod state {
     use std::sync::Arc;
+    use crate::batch::BatchStore;
     use crate::config::GatewayConfig;
     use crate::queries::ChainQueries;
 
@@ -132,6 +148,7 @@ mod state {
         pub config: GatewayConfig,
         pub http: reqwest::Client,
         pub queries: Arc<dyn ChainQueries>,
+        pub batches: Arc<BatchStore>,
     }
 }
 
