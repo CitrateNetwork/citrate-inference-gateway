@@ -251,6 +251,7 @@ pub async fn submit_batch_handler(
     };
 
     let arc = state.batches.insert(record).await;
+    metrics::counter!("gateway_batch_submissions_total", 1);
     let initial = build_status(&*arc.read().await);
 
     // Spawn the processor task. It runs detached; status polls read

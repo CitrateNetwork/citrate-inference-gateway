@@ -72,7 +72,16 @@ pub async fn chat_completions_handler(
         return Err(GatewayError::BadRequest("messages must be non-empty".into()));
     }
 
-    let dispatch = run_dispatch(&state, &req).await?;
+    let dispatch = match run_dispatch(&state, &req).await {
+        Ok(d) => {
+            metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "success");
+            d
+        }
+        Err(e) => {
+            metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "error");
+            return Err(e);
+        }
+    };
 
     // WP-03.5: successful, API-key-authenticated requests emit one
     // usage row. Anonymous x402 requests (no ApiKeyContext) are NOT
@@ -87,6 +96,7 @@ pub async fn chat_completions_handler(
                 pay.amount_wei,
             )
             .await;
+        metrics::counter!("gateway_usage_rows_emitted_total", 1);
     }
 
     if req.stream {
@@ -175,6 +185,7 @@ pub(crate) async fn run_dispatch(
                     error = %e,
                     "provider dispatch failed, trying next"
                 );
+                metrics::counter!("gateway_provider_dispatch_failures_total", 1);
                 last_err = Some(e);
                 // Remove the failed provider from the pool; selector
                 // picks the next-best on the next iteration.
