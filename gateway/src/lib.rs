@@ -56,14 +56,15 @@ use x402_axum::{ChainClient, X402Layer};
 /// queries, prefer building directly with `build_router_with` and
 /// supplying your own implementation.
 pub async fn build_router(config: GatewayConfig) -> Router {
-    // For the production code path we need an operator wallet and
-    // facilitator address — these live in env vars / TOML. For
-    // WP-03.1 + smoke this binary doesn't actually serve x402-gated
-    // endpoints; we ship without them and the chat path errors
-    // gracefully if invoked. Operators wire the full
-    // build_router_with path.
-    let queries: Arc<dyn ChainQueries> =
-        Arc::new(HttpChainQueries::new(&config.rpc_url, config.chain_id));
+    // Production path: free endpoints only (`/health`, `/v1/models`).
+    // Operators who want to expose `/v1/chat/completions` MUST call
+    // `build_router_with` and supply their operator wallet secret +
+    // x402 facilitator address — those live in env vars and aren't
+    // safe defaults.
+    let queries: Arc<dyn ChainQueries> = Arc::new(HttpChainQueries::new(
+        &config.rpc_url,
+        config.contracts.clone(),
+    ));
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))

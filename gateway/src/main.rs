@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fmt().with_env_filter(filter).init();
     }
 
+    use citrate_gateway::config::ContractAddresses;
     let config = GatewayConfig {
         chain_id: env::var("CITRATE_GATEWAY_CHAIN_ID")
             .ok()
@@ -34,6 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "http://127.0.0.1:18545".to_string()),
         listen_addr: env::var("CITRATE_GATEWAY_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:9800".to_string()),
+        contracts: ContractAddresses {
+            model_registry: env::var("CITRATE_GATEWAY_MODEL_REGISTRY")
+                .unwrap_or_else(|_| ContractAddresses::default().model_registry),
+            pricing_oracle: env::var("CITRATE_GATEWAY_PRICING_ORACLE")
+                .unwrap_or_else(|_| ContractAddresses::default().pricing_oracle),
+            inference_router: env::var("CITRATE_GATEWAY_INFERENCE_ROUTER")
+                .unwrap_or_else(|_| ContractAddresses::default().inference_router),
+        },
     };
 
     tracing::info!(
