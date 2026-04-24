@@ -34,6 +34,7 @@ fn config_with_unreachable_chain() -> GatewayConfig {
         // gateway doesn't depend on chain reachability for /health.
         rpc_url: "http://127.0.0.1:1".to_string(),
         listen_addr: "127.0.0.1:0".to_string(),
+        contracts: citrate_gateway::config::ContractAddresses::default(),
     }
 }
 

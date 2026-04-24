@@ -219,6 +219,7 @@ async fn spawn_gateway(providers: Vec<ProviderInfo>) -> SocketAddr {
         chain_id: 40204,
         rpc_url: "http://unused-mock".to_string(),
         listen_addr: "127.0.0.1:0".to_string(),
+        contracts: citrate_gateway::config::ContractAddresses::default(),
     };
     let app = build_router_with(config, queries, chain, operator_secret(), facilitator).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gw");
