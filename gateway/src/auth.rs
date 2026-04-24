@@ -225,9 +225,11 @@ where
             // Look up the key up-front so we can route cleanly.
             let record = store.get(&key_id).await;
             let Some(record) = record else {
+                metrics::counter!("gateway_api_key_requests_total", 1, "outcome" => "unknown");
                 return Ok(build_401("unknown api key"));
             };
             if record.revoked {
+                metrics::counter!("gateway_api_key_requests_total", 1, "outcome" => "revoked");
                 return Ok(build_401("api key revoked"));
             }
 
@@ -241,6 +243,7 @@ where
                 // Exhausted (or too-small balance). Fall through to
                 // X402Layer so the challenge body is authentically
                 // built, then post-process to attach a deposit hint.
+                metrics::counter!("gateway_api_key_requests_total", 1, "outcome" => "exhausted");
                 let deposit = record.deposit_address;
                 let mut inner = inner;
                 let resp = inner.call(req).await?;
@@ -252,6 +255,7 @@ where
             // fall through to the same exhausted path.
             match store.debit(&key_id, price).await {
                 Ok(_new_balance) => {
+                    metrics::counter!("gateway_api_key_requests_total", 1, "outcome" => "funded");
                     // Attach synthetic X402Paid so X402Layer's bypass
                     // short-circuits its challenge flow, plus an
                     // `ApiKeyContext` so downstream handlers (chat,

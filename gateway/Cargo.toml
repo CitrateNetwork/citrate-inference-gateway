@@ -60,6 +60,10 @@ uuid = { version = "1", features = ["v4"] }
 # Needed to collect the inner service's Response body so the API-key
 # auth layer can post-process 402 challenges (adds deposit hint).
 http-body-util = "0.1"
+# Prometheus metrics — same versions the node uses
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+once_cell = "1.19"
 
 [dev-dependencies]
 tokio = { workspace = true }

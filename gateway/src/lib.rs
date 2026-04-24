@@ -35,6 +35,7 @@ pub mod chat;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod metrics;
 pub mod models;
 pub mod openai;
 pub mod pricing;
@@ -64,6 +65,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
     // `build_router_with` and supply their operator wallet secret +
     // x402 facilitator address — those live in env vars and aren't
     // safe defaults.
+    metrics::install_recorder();
     let queries: Arc<dyn ChainQueries> = Arc::new(HttpChainQueries::new(
         &config.rpc_url,
         config.contracts.clone(),
@@ -71,6 +73,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
+        .route("/metrics", get(metrics::metrics_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state::AppState {
             config,
@@ -92,6 +95,7 @@ pub async fn build_router_with(
     operator_secret: [u8; 32],
     facilitator_address: H160,
 ) -> Router {
+    metrics::install_recorder();
     let state = Arc::new(state::AppState {
         config: config.clone(),
         http: reqwest::Client::new(),
@@ -138,6 +142,7 @@ pub async fn build_router_with(
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
         .route("/v1/usage", get(usage::usage_handler))
+        .route("/metrics", get(metrics::metrics_handler))
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
@@ -158,6 +163,7 @@ pub async fn build_router_with_auth(
     facilitator_address: H160,
     keys: Arc<auth::ApiKeyStore>,
 ) -> Router {
+    metrics::install_recorder();
     let state = Arc::new(state::AppState {
         config: config.clone(),
         http: reqwest::Client::new(),
@@ -209,6 +215,7 @@ pub async fn build_router_with_auth(
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
         .route("/v1/usage", get(usage::usage_handler))
+        .route("/metrics", get(metrics::metrics_handler))
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
