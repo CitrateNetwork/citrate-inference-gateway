@@ -30,6 +30,7 @@ members = [
     "crates/x402-axum",
     "gateway",
     "pool-coordinator",
+    "training-worker",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.
