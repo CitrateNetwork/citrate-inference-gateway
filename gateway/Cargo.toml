@@ -54,6 +54,8 @@ thiserror = { workspace = true }
 
 # Local config helper
 toml = "0.8"
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
