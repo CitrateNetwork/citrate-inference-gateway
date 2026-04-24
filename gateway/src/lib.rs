@@ -29,6 +29,7 @@ use axum::{routing::{get, post}, Router};
 use ethereum_types::H160;
 use tower_http::trace::TraceLayer;
 
+pub mod auth;
 pub mod batch;
 pub mod chat;
 pub mod config;
@@ -121,6 +122,74 @@ pub async fn build_router_with(
         .route("/v1/chat/completions", post(chat::chat_completions_handler))
         .route("/v1/batch", post(batch::submit_batch_handler))
         .layer(layer)
+        .with_state(state.clone());
+
+    let free_batch_reads = Router::new()
+        .route("/v1/batch/:id", get(batch::get_batch_handler))
+        .route("/v1/batch/:id/output", get(batch::get_batch_output_handler))
+        .with_state(state.clone());
+
+    Router::new()
+        .route("/health", get(health::health_handler))
+        .route("/v1/models", get(models::models_handler))
+        .with_state(state)
+        .merge(paid_router)
+        .merge(free_batch_reads)
+        .layer(TraceLayer::new_for_http())
+}
+
+/// Test/injection router builder with API-key auth layered on top of
+/// x402. The `ApiKeyLayer` sits *in front of* the x402 layer: a valid,
+/// funded Bearer key debits balance and injects a synthetic `X402Paid`
+/// so the x402 layer's bypass forwards directly; an exhausted key
+/// falls through to x402's 402 challenge and the auth layer patches
+/// the body with a `deposit_instructions` pointer.
+pub async fn build_router_with_auth(
+    config: GatewayConfig,
+    queries: Arc<dyn ChainQueries>,
+    chain: Arc<dyn ChainClient>,
+    operator_secret: [u8; 32],
+    facilitator_address: H160,
+    keys: Arc<auth::ApiKeyStore>,
+) -> Router {
+    let state = Arc::new(state::AppState {
+        config: config.clone(),
+        http: reqwest::Client::new(),
+        queries: queries.clone(),
+        batches: Arc::new(batch::BatchStore::new()),
+    });
+
+    // Two pricing instances (cheap; both wrap the same Arc<dyn
+    // ChainQueries>). One drives X402Layer's challenge amount, the
+    // other tells ApiKeyLayer how much to debit from a key — they
+    // must agree, which is why they share queries + default model.
+    let pricing_x402 = pricing::TokenBasedPricing::new(queries.clone(), "llama-3.1-8b");
+    let pricing_key: Arc<dyn x402_axum::PricingStrategy> =
+        Arc::new(pricing::TokenBasedPricing::new(queries, "llama-3.1-8b"));
+
+    let x402 = X402Layer::builder()
+        .chain_id(config.chain_id)
+        .facilitator_address(&format!("0x{}", hex::encode(facilitator_address.as_bytes())))
+        .wsalt_address("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
+        .treasury("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
+        .rpc_url(&config.rpc_url)
+        .pricing(pricing_x402)
+        .operator_secret_bytes(operator_secret)
+        .chain_client(Arc::clone(&chain) as Arc<dyn ChainClient>)
+        .build()
+        .expect("X402Layer build (smoke config valid)");
+
+    let api_key = auth::ApiKeyLayer::new(keys, pricing_key);
+
+    // Layer ordering: api_key OUTSIDE x402. A request first hits the
+    // API-key layer (which may short-circuit 401 / attach synthetic
+    // X402Paid / fall through to x402), then the x402 layer (which
+    // honors the synthetic X402Paid via its extensions bypass).
+    let paid_router = Router::new()
+        .route("/v1/chat/completions", post(chat::chat_completions_handler))
+        .route("/v1/batch", post(batch::submit_batch_handler))
+        .layer(x402)
+        .layer(api_key)
         .with_state(state.clone());
 
     let free_batch_reads = Router::new()

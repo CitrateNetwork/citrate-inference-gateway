@@ -333,6 +333,16 @@ where
         let inner = std::mem::replace(&mut self.inner, inner_ready);
 
         Box::pin(async move {
+            // Bypass: if an upstream layer has already attached
+            // `X402Paid` (e.g. the gateway's API-key middleware
+            // deducted from a pre-funded key), skip the whole
+            // challenge/settle flow and forward directly.
+            if req.extensions().get::<X402Paid>().is_some() {
+                let mut inner = inner;
+                let fut = inner.call(req);
+                return fut.await;
+            }
+
             // Price first — 400 on unpriceable.
             let price = match config.pricing.price_for(&req).await {
                 Ok(p) => p,

@@ -57,8 +57,10 @@ thiserror = { workspace = true }
 toml = "0.8"
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+# Needed to collect the inner service's Response body so the API-key
+# auth layer can post-process 402 challenges (adds deposit hint).
+http-body-util = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
