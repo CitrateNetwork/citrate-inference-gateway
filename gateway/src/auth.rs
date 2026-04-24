@@ -253,13 +253,18 @@ where
             match store.debit(&key_id, price).await {
                 Ok(_new_balance) => {
                     // Attach synthetic X402Paid so X402Layer's bypass
-                    // short-circuits its challenge flow.
+                    // short-circuits its challenge flow, plus an
+                    // `ApiKeyContext` so downstream handlers (chat,
+                    // batch) can emit per-key usage rows.
                     let mut req = req;
                     req.extensions_mut().insert(X402Paid {
                         payer: record.deposit_address,
                         amount_wei: price,
                         nonce: ethereum_types::H256::zero(),
                         settle_tx_hash: ethereum_types::H256::zero(),
+                    });
+                    req.extensions_mut().insert(crate::usage::ApiKeyContext {
+                        key_id: key_id.clone(),
                     });
                     let mut inner = inner;
                     inner.call(req).await
