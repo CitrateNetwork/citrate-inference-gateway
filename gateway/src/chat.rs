@@ -17,16 +17,19 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures_util::stream::{self, Stream};
 use uuid::Uuid;
 
+use x402_axum::X402Paid;
+
 use crate::error::GatewayError;
 use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Usage};
 use crate::provider::{dispatch_to_provider, select_provider, ProviderProtocolRequest};
+use crate::usage::ApiKeyContext;
 use crate::SharedState;
 
 /// Default per-request provider HTTPS timeout.
@@ -61,6 +64,8 @@ impl IntoResponse for GatewayError {
 /// `axum::response::Response` to share one return type.
 pub async fn chat_completions_handler(
     State(state): State<SharedState>,
+    api_key: Option<Extension<ApiKeyContext>>,
+    paid: Option<Extension<X402Paid>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, GatewayError> {
     if req.messages.is_empty() {
@@ -68,6 +73,21 @@ pub async fn chat_completions_handler(
     }
 
     let dispatch = run_dispatch(&state, &req).await?;
+
+    // WP-03.5: successful, API-key-authenticated requests emit one
+    // usage row. Anonymous x402 requests (no ApiKeyContext) are NOT
+    // tracked — usage is a per-identity resource.
+    if let (Some(Extension(ctx)), Some(Extension(pay))) = (&api_key, &paid) {
+        state
+            .usage
+            .record(
+                &ctx.key_id,
+                dispatch.prompt_tokens,
+                dispatch.completion_tokens,
+                pay.amount_wei,
+            )
+            .await;
+    }
 
     if req.stream {
         Ok(stream_response(req, dispatch).into_response())

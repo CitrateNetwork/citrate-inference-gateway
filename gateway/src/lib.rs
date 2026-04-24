@@ -40,6 +40,7 @@ pub mod openai;
 pub mod pricing;
 pub mod provider;
 pub mod queries;
+pub mod usage;
 
 pub use config::GatewayConfig;
 pub use error::GatewayError;
@@ -76,6 +77,8 @@ pub async fn build_router(config: GatewayConfig) -> Router {
             http: reqwest::Client::new(),
             queries,
             batches: Arc::new(batch::BatchStore::new()),
+            keys: Arc::new(auth::ApiKeyStore::new()),
+            usage: Arc::new(usage::UsageStore::new()),
         }))
 }
 
@@ -94,6 +97,8 @@ pub async fn build_router_with(
         http: reqwest::Client::new(),
         queries: queries.clone(),
         batches: Arc::new(batch::BatchStore::new()),
+        keys: Arc::new(auth::ApiKeyStore::new()),
+        usage: Arc::new(usage::UsageStore::new()),
     });
 
     let pricing = pricing::TokenBasedPricing::new(queries, "llama-3.1-8b");
@@ -132,6 +137,7 @@ pub async fn build_router_with(
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
+        .route("/v1/usage", get(usage::usage_handler))
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
@@ -157,6 +163,8 @@ pub async fn build_router_with_auth(
         http: reqwest::Client::new(),
         queries: queries.clone(),
         batches: Arc::new(batch::BatchStore::new()),
+        keys: keys.clone(),
+        usage: Arc::new(usage::UsageStore::new()),
     });
 
     // Two pricing instances (cheap; both wrap the same Arc<dyn
@@ -200,6 +208,7 @@ pub async fn build_router_with_auth(
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
+        .route("/v1/usage", get(usage::usage_handler))
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
@@ -208,9 +217,11 @@ pub async fn build_router_with_auth(
 
 mod state {
     use std::sync::Arc;
+    use crate::auth::ApiKeyStore;
     use crate::batch::BatchStore;
     use crate::config::GatewayConfig;
     use crate::queries::ChainQueries;
+    use crate::usage::UsageStore;
 
     /// Shared state passed to every handler. Cheap to clone (Arc).
     pub struct AppState {
@@ -218,6 +229,8 @@ mod state {
         pub http: reqwest::Client,
         pub queries: Arc<dyn ChainQueries>,
         pub batches: Arc<BatchStore>,
+        pub keys: Arc<ApiKeyStore>,
+        pub usage: Arc<UsageStore>,
     }
 }
 
