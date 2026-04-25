@@ -2414,6 +2414,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "zeroize",
 ]
 
 [[package]]
