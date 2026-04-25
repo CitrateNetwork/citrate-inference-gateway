@@ -2453,6 +2453,7 @@ dependencies = [
 name = "citrate-wallet-sdk"
 version = "0.4.0"
 dependencies = [
+ "argon2",
  "citrate-wallet-core",
  "getrandom 0.2.17",
  "js-sys",
