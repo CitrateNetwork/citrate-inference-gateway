@@ -13,6 +13,7 @@ members = [
     "core/marketplace",
     "core/learning",
     "core/bridge",
+    "core/security",
     "node",
     "node-app",
     "wallet",
