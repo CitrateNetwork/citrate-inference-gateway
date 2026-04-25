@@ -477,6 +477,20 @@ async fn run_paid_path(
         return PaidOutcome::Reject(X402Error::InvalidSignature);
     }
 
+    // RM-B1 / WP-D2.3 (audit F-1): treasury bind. Pre-fix the
+    // gateway accepted any well-signed payload, regardless of who
+    // the payer authorized as the recipient. An attacker could
+    // re-broadcast a valid signature originally addressed to a
+    // different gateway's treasury — the operator would settle it
+    // on-chain under THIS gateway's facilitator, the funds would
+    // land at the attacker-chosen recipient, and the gateway would
+    // unlock paid service for the attacker free of charge.
+    // Post-fix the recipient is bound to this gateway's configured
+    // treasury; cross-gateway replay returns 402.
+    if payload.to != config.treasury {
+        return PaidOutcome::Reject(X402Error::RecipientNotTreasury);
+    }
+
     // 5. Build settlement calldata + get operator nonce.
     let calldata = encode_settle_payment(&payload);
     let op_nonce = match config.chain.get_nonce(config.operator_address).await {
@@ -532,9 +546,15 @@ async fn run_paid_path(
     };
 
     // 9. Attach X402Paid to request extensions.
+    //
+    // RM-B1 / WP-D2.4 (audit F-2): `amount_wei` carries the GROSS
+    // amount the payer authorized (`net + fee`), not the recipient's
+    // net share. Inner handlers comparing against pricing oracles
+    // need the user-signed total — the fee is internal accounting.
+    let gross = settled.value.saturating_add(settled.fee);
     req.extensions_mut().insert(X402Paid {
         payer: settled.from,
-        amount_wei: settled.value,
+        amount_wei: gross,
         nonce: settled.nonce,
         settle_tx_hash: tx_hash,
     });

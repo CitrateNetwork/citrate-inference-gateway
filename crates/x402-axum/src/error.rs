@@ -42,6 +42,13 @@ pub enum X402Error {
     #[error("payload expired or not yet valid")]
     Expired,
 
+    /// Payment payload's recipient (`to`) does not match this gateway's
+    /// configured treasury. Closes the cross-gateway replay path:
+    /// pre-fix a signature for one gateway's treasury could be reused
+    /// against another gateway. RM-B1 / WP-D2.3 (audit F-1).
+    #[error("recipient does not match gateway treasury")]
+    RecipientNotTreasury,
+
     /// Payer has insufficient wSALT balance at settle time. Tx reverted.
     #[error("insufficient wSALT balance")]
     InsufficientBalance,
@@ -111,6 +118,7 @@ impl X402Error {
             | InvalidSignature
             | NonceReplayed
             | Expired
+            | RecipientNotTreasury
             | InsufficientBalance
             | BudgetExceeded { .. }
             | UnsupportedKeyType => 402,
@@ -134,6 +142,7 @@ impl X402Error {
             InvalidSignature => "signature invalid",
             NonceReplayed => "nonce replayed",
             Expired => "expired",
+            RecipientNotTreasury => "recipient not treasury",
             InsufficientBalance => "insufficient balance",
             BudgetExceeded { .. } => "budget cap exceeded",
             UnsupportedKeyType => "unsupported key type",

@@ -48,6 +48,23 @@ pub enum GatewayError {
     /// "selectable but not dispatchable."
     #[error("pool dispatch not implemented yet (slice 2): {0}")]
     PoolDispatchUnimplemented(String),
+
+    /// The amount the caller authorized via x402 falls short of the
+    /// actual cost computed from `req.max_tokens`. Maps to HTTP 402.
+    /// Pre-fix the gateway priced against assumed defaults (see
+    /// `pricing::ASSUMED_OUTPUT_TOKENS`); a caller could request
+    /// `max_tokens = 65535` while only paying for the default 512,
+    /// receiving up to 128× the work they paid for.
+    /// RM-B1 / WP-D2.4 (audit F-2).
+    #[error("payment underfunded: paid {paid_wei} wei < required {required_wei} wei (max_tokens={max_tokens})")]
+    Underfunded {
+        /// Decimal-string of the amount the caller authorized.
+        paid_wei: String,
+        /// Decimal-string of the cost computed against `max_tokens`.
+        required_wei: String,
+        /// The `max_tokens` value the caller declared.
+        max_tokens: u32,
+    },
 }
 
 impl GatewayError {
@@ -56,6 +73,7 @@ impl GatewayError {
         use GatewayError::*;
         match self {
             UnknownModel(_) | BadRequest(_) => 400,
+            Underfunded { .. } => 402,
             NoProviders
             | ProviderUnavailable(_)
             | ChainUnavailable(_)
