@@ -2470,6 +2470,7 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "web-sys",
+ "zeroize",
 ]
 
 [[package]]
