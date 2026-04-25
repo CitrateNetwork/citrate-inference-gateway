@@ -2428,6 +2428,7 @@ dependencies = [
  "bip39",
  "citrate-consensus",
  "citrate-execution",
+ "criterion",
  "dirs",
  "ed25519-dalek",
  "hex",
