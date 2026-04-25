@@ -1,0 +1,70 @@
+[package]
+name = "citrate-inference-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible HTTP gateway over the Citrate compute marketplace. Translates /v1/chat/completions and /v1/batch into x402-gated InferenceRouter / ComputeMarketplace dispatches."
+
+# See:
+# - .agentile/sprints/active/SPRINT_CM_03_BATCH_INFERENCE_GATEWAY.md
+# - .agentile/formal/specs/compute/GatewayBatchLifecycle.tla — batch state machine
+# - citrate_v0.01.1/specs/gherkin/gateway_inference.feature — behavior contract
+
+# Dual lib + bin so integration tests can call into the router
+# without spawning a separate process.
+
+[lib]
+name = "citrate_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "citrate-inference-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Transport
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+http = "1.1"
+
+# Async + HTTP client (for outbound provider calls + chain RPC)
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Cryptography (for hashing requests, etc.)
+sha3 = { workspace = true }
+hex = "0.4"
+ethereum-types = "0.14"
+
+# Citrate integration
+x402-axum = { path = "../crates/x402-axum" }
+citrate-wallet-core = { path = "../wallet-core" }
+
+# Observability — env-filter + json features needed by main.rs
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = { workspace = true }
+
+# Local config helper
+toml = "0.8"
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+# Needed to collect the inner service's Response body so the API-key
+# auth layer can post-process 402 challenges (adds deposit hint).
+http-body-util = "0.1"
+# Prometheus metrics — same versions the node uses
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+once_cell = "1.19"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

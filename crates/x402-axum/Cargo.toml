@@ -1,0 +1,59 @@
+[package]
+name = "x402-axum"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP 402 Payment Required middleware for axum — issues challenges, verifies EIP-3009 transferWithAuthorization signatures via Citrate precompile 0x0201, and settles on-chain via X402Facilitator."
+
+# See .agentile/formal/specs/compute/X402FacilitatorSettle.tla for the
+# server-side state machine + replay-protection invariants this crate
+# implements. See citrate_v0.01.1/specs/gherkin/x402_payment.feature
+# for the behavior contract. See docs/adr/ADR-005-x402-payment-protocol.md
+# for the architecture decision.
+
+[dependencies]
+# Transport
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1.1"
+http-body-util = "0.1"
+
+# Async + HTTP client (for the X402Client helper)
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+
+# EVM primitives (use workspace ethereum-types if present; otherwise
+# depend directly — we need U256/H160/H256 for EIP-712 struct hashes
+# and address plumbing).
+ethereum-types = "0.14"
+primitive-types = "0.12"
+
+# Cryptography — keccak256 for EIP-712 domain separator & digest;
+# secp256k1 for the operator wallet that signs the settlement tx.
+sha3 = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
+hex = "0.4"
+getrandom = "0.3"
+rlp = "0.5"
+
+# Citrate integration — wallet-core gives us the RpcClient, UnifiedKey,
+# and signing primitives the X402Client needs.
+citrate-wallet-core = { path = "../../wallet-core" }
+
+# Observability
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
