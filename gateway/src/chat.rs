@@ -72,6 +72,40 @@ pub async fn chat_completions_handler(
         return Err(GatewayError::BadRequest("messages must be non-empty".into()));
     }
 
+    // RM-B1 / WP-D2.4 (audit F-2): recharge against the caller's
+    // actual `max_tokens` request. The X402Layer priced this request
+    // at the gateway's *assumed* default (512 output tokens). A
+    // caller can request up to u32::MAX max_tokens for the same
+    // amount. Pre-fix this was a free out-of-policy capacity grant.
+    // Post-fix we recompute the real cost from req.max_tokens and
+    // reject with 402 if the signed amount falls short.
+    if let Some(Extension(pay)) = &paid {
+        let requested_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let model_hash = state
+            .queries
+            .resolve_model_name(&req.model)
+            .await
+            .map_err(|_| GatewayError::UnknownModel(req.model.clone()))?;
+        let actual_cost = state
+            .queries
+            .estimate_cost(
+                model_hash,
+                crate::pricing::ASSUMED_INPUT_TOKENS,
+                requested_tokens,
+                crate::pricing::DEFAULT_VERIFICATION_TIER,
+            )
+            .await
+            .map_err(|e| GatewayError::PricingUnavailable(e.to_string()))?;
+
+        if pay.amount_wei < actual_cost {
+            return Err(GatewayError::Underfunded {
+                paid_wei: pay.amount_wei.to_string(),
+                required_wei: actual_cost.to_string(),
+                max_tokens: requested_tokens,
+            });
+        }
+    }
+
     let dispatch = match run_dispatch(&state, &req).await {
         Ok(d) => {
             metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "success");

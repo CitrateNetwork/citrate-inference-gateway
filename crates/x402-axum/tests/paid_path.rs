@@ -173,6 +173,17 @@ fn any_addr() -> &'static str {
     "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b"
 }
 
+/// The H160 form of `any_addr()` — the configured gateway treasury.
+/// RM-B1 / WP-D2.3 (audit F-1): payloads must address the same
+/// treasury the gateway is bound to, otherwise the bind check
+/// rejects the payment.
+fn treasury_h160() -> H160 {
+    let mut bytes = [0u8; 20];
+    let hex_str = any_addr().trim_start_matches("0x");
+    hex::decode_to_slice(hex_str, &mut bytes).expect("valid treasury hex");
+    H160::from(bytes)
+}
+
 fn test_secret_hex() -> &'static str {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 }
@@ -180,7 +191,7 @@ fn test_secret_hex() -> &'static str {
 fn sample_payload() -> PaymentPayload {
     PaymentPayload {
         from: H160::from([0xb1; 20]),
-        to: H160::from([0xa2; 20]),
+        to: treasury_h160(),
         value: U256::from(1_000_000_000_000_000_000u128), // 1 SALT
         // Pick a valid-now window. now - 100 to now + 100_000.
         valid_after: U256::from(0u64),
@@ -326,6 +337,46 @@ async fn replay_nonce_returns_402_with_reason() {
         "reason should mention replay/nonce, got: {}",
         reason
     );
+}
+
+/// RM-B1 / WP-D2.3 (audit F-1): payment recipient must match the
+/// gateway's configured treasury. A payload signed for a DIFFERENT
+/// gateway's treasury must be rejected — without this check, an
+/// attacker who captures a valid x402 header can replay it across
+/// gateways for free service.
+#[tokio::test]
+async fn test_f1_cross_gateway_replay_rejected() {
+    let mock = MockChain::new(facilitator());
+    let app = build_app_with_mock(mock);
+
+    // Payload addressed to a recipient that is NOT this gateway's
+    // configured treasury.
+    let mut payload = sample_payload();
+    payload.to = H160::from([0xbe; 20]); // attacker / other-gateway treasury
+
+    let (status, body) = call(app, paid_request(&payload)).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYMENT_REQUIRED,
+        "F-1: cross-gateway payload must be rejected"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let reason = body["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("treasury") || reason.contains("recipient"),
+        "F-1 reason should mention treasury/recipient, got: {}",
+        reason
+    );
+}
+
+/// Companion: a payload with the correct treasury still works.
+#[tokio::test]
+async fn test_f1_correct_treasury_accepted() {
+    let mock = MockChain::new(facilitator());
+    let app = build_app_with_mock(mock);
+    // sample_payload()`to` is now bound to treasury_h160() by default.
+    let (status, _) = call(app, paid_request(&sample_payload())).await;
+    assert_eq!(status, StatusCode::OK, "matched-treasury must be accepted");
 }
 
 #[tokio::test]

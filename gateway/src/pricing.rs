@@ -34,7 +34,13 @@ const DEFAULT_TIER: u8 = 0;
 /// The prepay model: charge a generous amount up front; the chain's
 /// settle amount equals what the client signed. If the actual job
 /// is cheaper, the client overpaid; v2 may issue partial refunds.
-const ASSUMED_INPUT_TOKENS: u32 = 256;
+/// Default verification tier exposed for handler-side recharge.
+pub const DEFAULT_VERIFICATION_TIER: u8 = DEFAULT_TIER;
+
+/// Caller-side input-token assumption. Exposed so the chat handler
+/// can recompute the actual cost against the caller's real
+/// `max_tokens` value. RM-B1 / WP-D2.4 (audit F-2).
+pub const ASSUMED_INPUT_TOKENS: u32 = 256;
 const ASSUMED_OUTPUT_TOKENS: u32 = 512;
 
 /// Token-based pricing strategy backed by ComputePricingOracle.

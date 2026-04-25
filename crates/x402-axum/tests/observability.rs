@@ -145,6 +145,16 @@ fn any_addr() -> &'static str {
     "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b"
 }
 
+/// The H160 form of `any_addr()` — the configured gateway treasury.
+/// RM-B1 / WP-D2.3 (audit F-1): payment recipient must equal the
+/// gateway treasury or the bind check rejects.
+fn treasury_h160() -> H160 {
+    let mut bytes = [0u8; 20];
+    let hex_str = any_addr().trim_start_matches("0x");
+    hex::decode_to_slice(hex_str, &mut bytes).expect("valid treasury hex");
+    H160::from(bytes)
+}
+
 fn test_secret_hex() -> &'static str {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 }
@@ -152,7 +162,7 @@ fn test_secret_hex() -> &'static str {
 fn sample_payload() -> PaymentPayload {
     PaymentPayload {
         from: H160::from([0xb1; 20]),
-        to: H160::from([0xa2; 20]),
+        to: treasury_h160(),
         value: U256::from(1_000_000_000_000_000_000u128),
         valid_after: U256::from(0u64),
         valid_before: U256::from(u64::MAX),
