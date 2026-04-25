@@ -1922,6 +1922,7 @@ dependencies = [
  "async-trait",
  "axum",
  "calamine",
+ "citrate-security",
  "citrate-wallet-core",
  "csv",
  "getrandom 0.2.17",
@@ -2285,6 +2286,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-security"
+version = "0.4.0"
+dependencies = [
+ "aes-gcm",
+ "proptest",
+ "subtle",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "citrate-sequencer"
 version = "0.4.0"
 dependencies = [
@@ -2432,6 +2444,7 @@ dependencies = [
  "bip39",
  "citrate-consensus",
  "citrate-execution",
+ "citrate-security",
  "criterion",
  "dirs",
  "ed25519-dalek",
