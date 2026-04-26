@@ -26,8 +26,21 @@
 use std::sync::Arc;
 
 use axum::{routing::{get, post}, Router};
+use axum::http::header;
 use ethereum_types::H160;
+use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
+
+/// RM-G2.3 / audit F-3: every request flowing through the gateway
+/// runs `Authorization: Bearer ...` through this redaction layer
+/// BEFORE the TraceLayer sees it, so structured logs / OTel spans
+/// never carry the bearer token. Pre-fix `TraceLayer::new_for_http`
+/// captured the raw header into the request span; a routed log
+/// drain or a stuck debug build dumping spans was a free credential
+/// leak.
+fn redact_authorization() -> SetSensitiveRequestHeadersLayer {
+    SetSensitiveRequestHeadersLayer::new([header::AUTHORIZATION])
+}
 
 pub mod auth;
 pub mod batch;
@@ -75,6 +88,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
         .route("/metrics", get(metrics::metrics_handler))
+        .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state::AppState {
             config,
@@ -147,6 +161,7 @@ pub async fn build_router_with(
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
+        .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
 }
 
@@ -220,6 +235,7 @@ pub async fn build_router_with_auth(
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
+        .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
 }
 
