@@ -102,6 +102,14 @@ pub struct ApiKeyRecord {
     pub created_at: u64,
 }
 
+/// Downstream handlers attach this to successful responses when the exact
+/// accepted charge differs from the API-key layer's conservative pre-debit.
+#[derive(Debug, Clone, Copy)]
+pub struct ApiKeyCharge {
+    /// Final charge in the key's balance unit.
+    pub amount_grains: U256,
+}
+
 /// In-memory store of API keys. Wrapped in `Arc`.
 #[derive(Default, Debug)]
 pub struct ApiKeyStore {
@@ -126,11 +134,7 @@ impl ApiKeyStore {
     /// on success, or `None` if the key is missing / revoked /
     /// insufficient. Atomic w.r.t. concurrent callers — holds the
     /// write lock through the check-and-deduct.
-    pub async fn debit(
-        &self,
-        key_id: &str,
-        amount: U256,
-    ) -> Result<U256, DebitError> {
+    pub async fn debit(&self, key_id: &str, amount: U256) -> Result<U256, DebitError> {
         let h = hash_key_id(key_id);
         let mut guard = self.inner.write().await;
         let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
@@ -141,6 +145,17 @@ impl ApiKeyStore {
             return Err(DebitError::Insufficient(record.balance_grains));
         }
         record.balance_grains -= amount;
+        Ok(record.balance_grains)
+    }
+
+    /// Credit a key after a downstream rejection, over-estimate adjustment, or
+    /// batch slot failure. Refunds intentionally bypass `revoked`; revocation
+    /// stops future spending but must not trap already-debited buyer funds.
+    pub async fn refund(&self, key_id: &str, amount: U256) -> Result<U256, DebitError> {
+        let h = hash_key_id(key_id);
+        let mut guard = self.inner.write().await;
+        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
+        record.balance_grains = record.balance_grains.saturating_add(amount);
         Ok(record.balance_grains)
     }
 
@@ -355,7 +370,8 @@ where
                         backing: record.backing,
                     });
                     let mut inner = inner;
-                    inner.call(req).await
+                    let resp = inner.call(req).await?;
+                    Ok(settle_api_key_response(store, key_id, price, resp).await)
                 }
                 Err(_) => {
                     // Race with concurrent drain — same fallthrough.
@@ -370,6 +386,52 @@ where
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
+
+async fn settle_api_key_response(
+    store: Arc<ApiKeyStore>,
+    key_id: String,
+    debited: U256,
+    resp: Response<Body>,
+) -> Response<Body> {
+    if resp.status().is_success() {
+        if let Some(charge) = resp.extensions().get::<ApiKeyCharge>() {
+            if charge.amount_grains < debited {
+                let refund = debited - charge.amount_grains;
+                if let Err(err) = store.refund(&key_id, refund).await {
+                    tracing::warn!(
+                        key_id = %key_id,
+                        refund = %refund,
+                        error = ?err,
+                        "api key over-estimate refund failed"
+                    );
+                } else {
+                    metrics::counter!("gateway_api_key_refunds_total", 1, "reason" => "overestimate");
+                }
+            } else if charge.amount_grains > debited {
+                tracing::error!(
+                    key_id = %key_id,
+                    debited = %debited,
+                    charged = %charge.amount_grains,
+                    "api key handler accepted a charge larger than the pre-debit"
+                );
+            }
+        }
+        return resp;
+    }
+
+    if let Err(err) = store.refund(&key_id, debited).await {
+        tracing::warn!(
+            key_id = %key_id,
+            refund = %debited,
+            status = %resp.status(),
+            error = ?err,
+            "api key rejection refund failed"
+        );
+    } else {
+        metrics::counter!("gateway_api_key_refunds_total", 1, "reason" => "downstream_error");
+    }
+    resp
+}
 
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
@@ -494,7 +556,7 @@ mod tests {
         let new_bal = store.debit(&id, U256::from(30u64)).await.expect("debit");
         assert_eq!(new_bal, U256::from(70u64));
         let r = store.get(&id).await.expect("exists");
-        assert_eq!(r.backing, KeyBacking::Credits);  // unchanged
+        assert_eq!(r.backing, KeyBacking::Credits); // unchanged
     }
 
     #[tokio::test]
@@ -509,13 +571,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_roundtrip() {
         let store = ApiKeyStore::new();
-        let id = create_key(
-            &store,
-            "test",
-            U256::from(100u64),
-            H160::from([0xab; 20]),
-        )
-        .await;
+        let id = create_key(&store, "test", U256::from(100u64), H160::from([0xab; 20])).await;
         let r = store.get(&id).await.expect("exists");
         assert_eq!(r.label, "test");
         assert_eq!(r.balance_grains, U256::from(100u64));
@@ -558,11 +614,20 @@ mod tests {
     async fn debit_reduces_balance() {
         let store = ApiKeyStore::new();
         let id = create_key(&store, "", U256::from(100u64), H160::zero()).await;
-        let new_bal = store
-            .debit(&id, U256::from(30u64))
-            .await
-            .expect("debit");
+        let new_bal = store.debit(&id, U256::from(30u64)).await.expect("debit");
         assert_eq!(new_bal, U256::from(70u64));
+    }
+
+    #[tokio::test]
+    async fn refund_restores_balance_even_when_key_revoked() {
+        let store = ApiKeyStore::new();
+        let id = create_key(&store, "", U256::from(100u64), H160::zero()).await;
+        let new_bal = store.debit(&id, U256::from(30u64)).await.expect("debit");
+        assert_eq!(new_bal, U256::from(70u64));
+
+        store.revoke(&id).await.expect("revoke");
+        let refunded = store.refund(&id, U256::from(30u64)).await.expect("refund");
+        assert_eq!(refunded, U256::from(100u64));
     }
 
     #[tokio::test]
@@ -588,14 +653,20 @@ mod tests {
     #[tokio::test]
     async fn unknown_key_debit_fails() {
         let store = ApiKeyStore::new();
-        let err = store.debit("nope", U256::from(1u64)).await.expect_err("fail");
+        let err = store
+            .debit("nope", U256::from(1u64))
+            .await
+            .expect_err("fail");
         assert!(matches!(err, DebitError::Unknown));
     }
 
     #[test]
     fn extract_bearer_trims_whitespace() {
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, "Bearer  cgk_abc  ".parse().expect("parse"));
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer  cgk_abc  ".parse().expect("parse"),
+        );
         assert_eq!(extract_bearer(&h).as_deref(), Some("cgk_abc"));
     }
 

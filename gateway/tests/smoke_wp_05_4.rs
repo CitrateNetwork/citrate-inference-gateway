@@ -184,6 +184,7 @@ async fn spawn_gateway(
     pools: Vec<PoolEntry>,
     expose_individual: bool,
 ) -> SocketAddr {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockQueries {
         provider_endpoint: provider.to_string(),

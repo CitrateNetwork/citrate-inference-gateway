@@ -205,6 +205,7 @@ fn any_addr() -> &'static str {
 }
 
 async fn spawn_gateway(provider_addr: SocketAddr) -> SocketAddr {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockChainQueries {
         provider_endpoint: provider_addr.to_string(),

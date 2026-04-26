@@ -212,6 +212,7 @@ fn provider_info(addr_byte: u8, endpoint: SocketAddr, reputation: u32) -> Provid
 }
 
 async fn spawn_gateway(providers: Vec<ProviderInfo>) -> SocketAddr {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockQueries { providers });
     let chain = Arc::new(HonestMockChain::new(facilitator));

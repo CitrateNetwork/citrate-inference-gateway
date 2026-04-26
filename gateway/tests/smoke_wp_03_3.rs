@@ -86,21 +86,23 @@ struct MockChainQueries {
 
 #[async_trait]
 impl ChainQueries for MockChainQueries {
-    async fn resolve_model_name(
-        &self,
-        _name: &str,
-    ) -> Result<H256, citrate_gateway::GatewayError> {
+    async fn resolve_model_name(&self, _name: &str) -> Result<H256, citrate_gateway::GatewayError> {
         Ok(H256::from([0xab; 32]))
     }
 
     async fn estimate_cost(
         &self,
         _model_hash: H256,
-        _input_tokens: u32,
-        _output_tokens: u32,
+        input_tokens: u32,
+        output_tokens: u32,
         _tier: u8,
     ) -> Result<U256, citrate_gateway::GatewayError> {
-        Ok(U256::from(1_000_000_000_000_000_000u128))
+        if input_tokens == citrate_gateway::pricing::ASSUMED_INPUT_TOKENS && output_tokens == 512 {
+            return Ok(U256::from(5_000u64));
+        }
+        let assumed = citrate_gateway::pricing::ASSUMED_INPUT_TOKENS;
+        let input_units = ((input_tokens.saturating_add(assumed - 1)) / assumed).max(1);
+        Ok(U256::from(input_units as u64 * 1_000))
     }
 
     async fn list_providers(
@@ -135,10 +137,7 @@ impl HonestMockChain {
 
 #[async_trait]
 impl ChainClient for HonestMockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if precompile_input.len() != 265 {
             return Ok(None);
         }
@@ -173,8 +172,8 @@ impl ChainClient for HonestMockChain {
 
         let from = H160::from([0xa1; 20]);
         let to = H160::from([0xa2; 20]);
-        let value = U256::from(995_000_000_000_000_000u128);
-        let fee = U256::from(5_000_000_000_000_000u128);
+        let value = U256::from(4_995u64);
+        let fee = U256::from(5u64);
         let mut padded_from = [0u8; 32];
         padded_from[12..32].copy_from_slice(from.as_bytes());
         let mut padded_to = [0u8; 32];
@@ -226,6 +225,7 @@ fn any_addr() -> &'static str {
 }
 
 async fn spawn_gateway(provider_addr: SocketAddr) -> SocketAddr {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockChainQueries {
         provider_endpoint: provider_addr.to_string(),
@@ -246,13 +246,21 @@ async fn spawn_gateway(provider_addr: SocketAddr) -> SocketAddr {
     addr
 }
 
-/// Submit a batch of `n` chat-completion requests and return the
-/// batch_id. Auto-pays via X402Client.
-async fn submit_batch(gateway: SocketAddr, n: usize) -> String {
+/// Submit a concrete batch body. Auto-pays via X402Client.
+async fn submit_batch_requests(gateway: SocketAddr, requests: Vec<Value>) -> reqwest::Response {
     let facilitator = H160::from([0xfa; 20]);
     let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).expect("hex"));
     let client = X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("client");
 
+    let url = format!("http://{}/v1/batch", gateway);
+    let body = serde_json::json!({"requests": requests});
+    let req = reqwest::Client::new().post(&url).json(&body);
+    client.send_paid(req).await.expect("submit")
+}
+
+/// Submit a batch of `n` chat-completion requests and return the
+/// batch_id. Auto-pays via X402Client.
+async fn submit_batch(gateway: SocketAddr, n: usize) -> String {
     let requests: Vec<Value> = (0..n)
         .map(|i| {
             serde_json::json!({
@@ -263,16 +271,50 @@ async fn submit_batch(gateway: SocketAddr, n: usize) -> String {
         })
         .collect();
 
-    let url = format!("http://{}/v1/batch", gateway);
-    let body = serde_json::json!({"requests": requests});
-    let req = reqwest::Client::new().post(&url).json(&body);
-    let resp = client.send_paid(req).await.expect("submit");
+    let resp = submit_batch_requests(gateway, requests).await;
     assert_eq!(resp.status(), 200, "expected 200 from /v1/batch");
     let body: Value = resp.json().await.expect("json");
-    body["batch_id"]
-        .as_str()
-        .expect("batch_id")
-        .to_string()
+    body["batch_id"].as_str().expect("batch_id").to_string()
+}
+
+#[tokio::test]
+async fn batch_underfunded_request_count_rejected_402() {
+    let provider = spawn_stub_provider(HashSet::new()).await;
+    let gateway = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let requests: Vec<Value> = (0..6)
+        .map(|i| {
+            serde_json::json!({
+                "model": "llama-3.1-8b",
+                "messages": [{"role": "user", "content": format!("ping-{}", i)}],
+                "max_tokens": 10
+            })
+        })
+        .collect();
+    let resp = submit_batch_requests(gateway, requests).await;
+    assert_eq!(resp.status(), 402);
+    let body: Value = resp.json().await.expect("json");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("underfunded"), "got: {}", msg);
+}
+
+#[tokio::test]
+async fn batch_underfunded_long_prompt_rejected_402() {
+    let provider = spawn_stub_provider(HashSet::new()).await;
+    let gateway = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let requests = vec![serde_json::json!({
+        "model": "llama-3.1-8b",
+        "messages": [{"role": "user", "content": "A".repeat(32 * 1024)}],
+        "max_tokens": 10
+    })];
+    let resp = submit_batch_requests(gateway, requests).await;
+    assert_eq!(resp.status(), 402);
+    let body: Value = resp.json().await.expect("json");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("underfunded"), "got: {}", msg);
 }
 
 /// Poll until terminal state or timeout.
@@ -288,7 +330,10 @@ async fn wait_terminal(gateway: SocketAddr, batch_id: &str, timeout: Duration) -
             return body;
         }
         if std::time::Instant::now() > deadline {
-            panic!("batch did not reach terminal in {:?}; last={}", timeout, body);
+            panic!(
+                "batch did not reach terminal in {:?}; last={}",
+                timeout, body
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -398,8 +443,7 @@ async fn batch_size_limit_returns_400() {
 
     let facilitator = H160::from([0xfa; 20]);
     let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).expect("hex"));
-    let client =
-        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("client");
+    let client = X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("client");
 
     let requests: Vec<Value> = (0..1001)
         .map(|i| {
