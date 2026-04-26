@@ -2415,6 +2415,7 @@ dependencies = [
  "chrono",
  "citrate-consensus",
  "citrate-execution",
+ "citrate-wallet-core",
  "clap",
  "colored",
  "console",
