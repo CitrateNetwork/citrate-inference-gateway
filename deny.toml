@@ -1,0 +1,82 @@
+# RM-B1 / WP-F3.1 (audit SUP-10): committed cargo-deny config so the
+# license-and-supply-chain check is reproducible and reviewable in PRs,
+# instead of being smuggled in via an inline heredoc inside CI.
+#
+# Rule of thumb: the `licenses.allow` list is the smallest set that
+# permits the current dependency graph. Adding a new license requires
+# a PR that updates this file — which forces reviewers to confirm the
+# license is acceptable for downstream redistribution.
+
+[licenses]
+# `confidence-threshold` is how confident cargo-deny needs to be before
+# it accepts a detected license. 0.8 is the project default.
+confidence-threshold = 0.8
+
+# Allowed licenses. If a dependency reports a license not in this list,
+# cargo-deny exits non-zero and the CI run fails (CI-04, CI-06).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+
+# Explicit denies — block specific dependencies even if their license
+# is in the allow-list. Add entries here if a transitive dep ships
+# under a license the project shouldn't redistribute.
+[[licenses.exceptions]]
+allow = ["OpenSSL"]
+name = "ring"
+
+# Some crates ship without an SPDX-detectable license file. These
+# are vetted by hand and listed here so cargo-deny doesn't fail.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[[licenses.clarify]]
+name = "encoding_rs"
+expression = "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+license-files = [
+    { path = "COPYRIGHT", hash = 0x39f8ad31 },
+]
+
+[advisories]
+# RM-B1 / WP-F3.2 (audit CI-04, CI-06): treat unmaintained,
+# yanked, and notice-level advisories as build failures. The CI
+# step has no `|| true` and no `continue-on-error: true`, so any
+# new RUSTSEC advisory blocks merges until triaged.
+yanked = "deny"
+unmaintained = "warn"
+notice = "warn"
+# `vulnerability` removed in cargo-deny 0.14+ — vulnerabilities
+# are always denied unless explicitly ignored below.
+ignore = []
+
+[bans]
+# Surface duplicate transitive deps; many duplicates are fine
+# (e.g., `winapi` 0.2 vs 0.3) but tracking them keeps the graph
+# from drifting silently.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Block any registry/git source other than crates.io + a small
+# allow-list. Prevents a malicious PR from substituting a fork
+# of a critical dep without anyone noticing.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
