@@ -57,11 +57,25 @@ license-files = [
 # yanked, and notice-level advisories as build failures. The CI
 # step has no `|| true` and no `continue-on-error: true`, so any
 # new RUSTSEC advisory blocks merges until triaged.
+#
+# RM-I / WP-I2.5 (re-audit Stream 7 doc-drift fix):
+#   The header comment promised "treat unmaintained, yanked, and
+#   notice-level advisories as build failures" but the config below
+#   had `unmaintained = "warn"` and `notice = "warn"`. The 2026-04-25
+#   re-audit caught the inconsistency. Now actually denied. Any
+#   transitive dep that becomes unmaintained or carries a notice-level
+#   advisory blocks merges until triaged or explicitly ignored below
+#   with rationale.
 yanked = "deny"
-unmaintained = "warn"
-notice = "warn"
+unmaintained = "deny"
+notice = "deny"
 # `vulnerability` removed in cargo-deny 0.14+ — vulnerabilities
 # are always denied unless explicitly ignored below.
+#
+# Inline exceptions (each requires a one-line justification):
+#   None currently. If/when SUP-07 (`bincode 1.3` deprecation) lands a
+#   notice-level advisory, add an `RUSTSEC-XXXX-XXXX` ignore here with
+#   a link to the migration WP.
 ignore = []
 
 [bans]
