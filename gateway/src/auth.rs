@@ -34,11 +34,25 @@ use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use ethereum_types::{H160, U256};
 use http_body_util::BodyExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
 
 use x402_axum::{PricingStrategy, X402Paid};
+
+/// RM-G2.3 / WP-G2.5 (audit F-3): hash the bearer key before
+/// storing or looking up. Pre-fix we keyed `ApiKeyStore` by the
+/// plaintext UUID, so a memory dump or RocksDB-snapshot leak
+/// surfaced live keys an attacker could replay verbatim.
+/// Post-fix the store only holds `sha256(key_id)`; the live key
+/// material exists only on the holder's side.
+fn hash_key_id(key_id: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(key_id.as_bytes());
+    let out = h.finalize();
+    hex::encode(out)
+}
 
 // ── Store ───────────────────────────────────────────────────────
 
@@ -100,9 +114,12 @@ impl ApiKeyStore {
         Self::default()
     }
 
-    /// Read a key's current record.
+    /// Read a key's current record. The argument is the bearer
+    /// token the caller supplied; the store hashes it before
+    /// looking up (audit F-3).
     pub async fn get(&self, key_id: &str) -> Option<ApiKeyRecord> {
-        self.inner.read().await.get(key_id).cloned()
+        let h = hash_key_id(key_id);
+        self.inner.read().await.get(&h).cloned()
     }
 
     /// Try to debit `amount` from `key_id`. Returns the new balance
@@ -114,8 +131,9 @@ impl ApiKeyStore {
         key_id: &str,
         amount: U256,
     ) -> Result<U256, DebitError> {
+        let h = hash_key_id(key_id);
         let mut guard = self.inner.write().await;
-        let record = guard.get_mut(key_id).ok_or(DebitError::Unknown)?;
+        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
         if record.revoked {
             return Err(DebitError::Revoked);
         }
@@ -128,8 +146,9 @@ impl ApiKeyStore {
 
     /// Revoke a key. Returns `Err(Unknown)` if no such key.
     pub async fn revoke(&self, key_id: &str) -> Result<(), DebitError> {
+        let h = hash_key_id(key_id);
         let mut guard = self.inner.write().await;
-        let record = guard.get_mut(key_id).ok_or(DebitError::Unknown)?;
+        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
         record.revoked = true;
         Ok(())
     }
@@ -187,7 +206,12 @@ pub async fn create_key_with_backing(
     deposit_address: H160,
     backing: KeyBacking,
 ) -> String {
+    // RM-G2.3 / audit F-3: the holder receives `key_id` (plaintext
+    // UUID prefixed with `cgk_`); the store keys by `sha256(key_id)`
+    // so the underlying map never holds material an attacker could
+    // replay.
     let key_id = format!("cgk_{}", Uuid::new_v4().simple());
+    let key_hash = hash_key_id(&key_id);
     let record = ApiKeyRecord {
         label: label.into(),
         balance_grains: initial_balance,
@@ -199,7 +223,7 @@ pub async fn create_key_with_backing(
             .map(|d| d.as_secs())
             .unwrap_or(0),
     };
-    store.inner.write().await.insert(key_id.clone(), record);
+    store.inner.write().await.insert(key_hash, record);
     key_id
 }
 
@@ -496,6 +520,38 @@ mod tests {
         assert_eq!(r.label, "test");
         assert_eq!(r.balance_grains, U256::from(100u64));
         assert!(!r.revoked);
+    }
+
+    /// RM-G2.3 / audit F-3: storage holds sha256(key_id), not the
+    /// plaintext token. Even if the inner map is dumped, the
+    /// attacker can't replay the keys without preimage.
+    #[tokio::test]
+    async fn store_holds_hashed_key_not_plaintext() {
+        let store = ApiKeyStore::new();
+        let id = create_key(&store, "f3", U256::from(1u64), H160::zero()).await;
+        let inner = store.inner.read().await;
+        // The map MUST NOT contain the plaintext id.
+        assert!(
+            !inner.contains_key(&id),
+            "storage must not key by plaintext id (audit F-3)"
+        );
+        // The map MUST contain the sha256 hash.
+        let h = hash_key_id(&id);
+        assert!(
+            inner.contains_key(&h),
+            "storage must key by sha256(id) (audit F-3)"
+        );
+        // sha256 hex is 64 chars.
+        assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn hash_key_id_is_deterministic_and_collision_resistant() {
+        let h1 = hash_key_id("cgk_abc");
+        let h2 = hash_key_id("cgk_abc");
+        let h3 = hash_key_id("cgk_xyz");
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
     }
 
     #[tokio::test]
