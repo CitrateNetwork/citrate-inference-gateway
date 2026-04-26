@@ -38,9 +38,11 @@ use uuid::Uuid;
 
 use x402_axum::X402Paid;
 
-use crate::chat::{json_response, run_dispatch};
+use crate::auth::ApiKeyCharge;
+use crate::chat::{json_response, quote_chat_request_cost, run_dispatch, DEFAULT_MAX_TOKENS};
 use crate::error::GatewayError;
 use crate::openai::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::usage::ApiKeyContext;
 use crate::SharedState;
 
 /// Max requests per batch. Mirrors WP-03.3 spec.
@@ -67,10 +69,7 @@ pub enum BatchStatus {
 impl BatchStatus {
     /// True once the batch is in a final state.
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::PartialFailure | Self::Failed
-        )
+        matches!(self, Self::Completed | Self::PartialFailure | Self::Failed)
     }
 }
 
@@ -93,6 +92,7 @@ pub enum RequestStatus {
 struct RequestSlot {
     state: RequestStatus,
     request: ChatCompletionRequest,
+    quoted_cost_grains: U256,
     response: Option<ChatCompletionResponse>,
     error: Option<String>,
 }
@@ -106,6 +106,7 @@ struct BatchRecord {
     paid_escrow_grains: U256,
     released_grains: U256,
     refunded_grains: U256,
+    payer_api_key_id: Option<String>,
     slots: Vec<RequestSlot>,
     created_at: u64,
 }
@@ -188,12 +189,12 @@ pub struct BatchStatusResponse {
     pub errored_count: usize,
     /// Unix seconds when the batch was created.
     pub created_at: u64,
-    /// Total amount the client paid into escrow, in grains (wei).
+    /// Total exact quote accepted for this batch, in grains (wei).
     /// Stringified to keep U256 lossless across JSON.
     pub paid_escrow_grains: String,
-    /// Amount released to providers, in grains. Grows as requests
-    /// complete; sums with `refunded_grains` to `paid_escrow_grains`
-    /// on terminal.
+    /// Amount released to providers, in grains. On terminal, exact
+    /// per-slot released quotes plus `refunded_grains` sum to
+    /// `paid_escrow_grains`.
     pub released_grains: String,
     /// Amount refunded to client (one share per errored request).
     pub refunded_grains: String,
@@ -208,10 +209,13 @@ pub struct BatchStatusResponse {
 pub async fn submit_batch_handler(
     State(state): State<SharedState>,
     Extension(paid): Extension<X402Paid>,
+    api_key: Option<Extension<ApiKeyContext>>,
     Json(req): Json<BatchSubmitRequest>,
 ) -> Result<Response, GatewayError> {
     if req.requests.is_empty() {
-        return Err(GatewayError::BadRequest("requests must be non-empty".into()));
+        return Err(GatewayError::BadRequest(
+            "requests must be non-empty".into(),
+        ));
     }
     if req.requests.len() > MAX_BATCH_SIZE {
         return Err(GatewayError::BadRequest(format!(
@@ -229,23 +233,46 @@ pub async fn submit_batch_handler(
         }
     }
 
-    let id = format!("batch_{}", Uuid::new_v4());
-    let slots: Vec<RequestSlot> = req
-        .requests
-        .into_iter()
-        .map(|request| RequestSlot {
+    let mut total_required = U256::zero();
+    let mut largest_requested_tokens = DEFAULT_MAX_TOKENS;
+    let mut slots = Vec::with_capacity(req.requests.len());
+    for request in req.requests {
+        let (quoted_cost_grains, requested_tokens) =
+            quote_chat_request_cost(&state, &request).await?;
+        let (next_total, overflow) = total_required.overflowing_add(quoted_cost_grains);
+        if overflow {
+            return Err(GatewayError::PricingUnavailable(
+                "batch quote overflow".to_string(),
+            ));
+        }
+        total_required = next_total;
+        largest_requested_tokens = largest_requested_tokens.max(requested_tokens);
+        slots.push(RequestSlot {
             state: RequestStatus::Pending,
             request,
+            quoted_cost_grains,
             response: None,
             error: None,
-        })
-        .collect();
+        });
+    }
+
+    if paid.amount_wei < total_required {
+        return Err(GatewayError::Underfunded {
+            paid_wei: paid.amount_wei.to_string(),
+            required_wei: total_required.to_string(),
+            max_tokens: largest_requested_tokens,
+        });
+    }
+
+    let id = format!("batch_{}", Uuid::new_v4());
+    let payer_api_key_id = api_key.as_ref().map(|Extension(ctx)| ctx.key_id.clone());
     let record = BatchRecord {
         id: id.clone(),
         status: BatchStatus::Submitted,
-        paid_escrow_grains: paid.amount_wei,
+        paid_escrow_grains: total_required,
         released_grains: U256::zero(),
         refunded_grains: U256::zero(),
+        payer_api_key_id,
         slots,
         created_at: now_unix_secs(),
     };
@@ -262,7 +289,13 @@ pub async fn submit_batch_handler(
         process_batch(state_for_task, arc_for_task).await;
     });
 
-    Ok((StatusCode::OK, Json(initial)).into_response())
+    let mut response = (StatusCode::OK, Json(initial)).into_response();
+    if api_key.is_some() {
+        response.extensions_mut().insert(ApiKeyCharge {
+            amount_grains: total_required,
+        });
+    }
+    Ok(response)
 }
 
 /// `GET /v1/batch/{id}` — poll batch status.
@@ -402,8 +435,7 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
     let errs = record.errored_count();
     debug_assert!(record.all_terminal(), "all slots must be terminal here");
 
-    let (released, refunded) =
-        split_escrow(record.paid_escrow_grains, total, dones, errs);
+    let (released, refunded) = split_quoted_escrow(&record.slots);
     record.released_grains = released;
     record.refunded_grains = refunded;
     record.status = if dones == total {
@@ -426,23 +458,46 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
         record.released_grains,
         record.refunded_grains
     );
+    let api_refund = record
+        .payer_api_key_id
+        .clone()
+        .map(|key_id| (key_id, record.refunded_grains))
+        .filter(|(_, refund)| *refund > U256::zero());
+    drop(record);
+
+    if let Some((key_id, refund)) = api_refund {
+        if let Err(err) = state.keys.refund(&key_id, refund).await {
+            tracing::warn!(
+                batch_refund = %refund,
+                key_id = %key_id,
+                error = ?err,
+                "batch api key refund failed"
+            );
+        } else {
+            metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+        }
+    }
 }
 
-/// Split the paid escrow into (released_to_providers, refunded).
+/// Split the quoted escrow into (released_to_providers, refunded).
 ///
-/// Proportional split: each successful request earns `paid / total`
-/// grains; each errored request refunds `paid / total`. Integer
-/// division loses up to `total - 1` grains; we sweep that remainder
-/// into `released` so the terminal invariant `released + refunded =
-/// paid` always holds.
-fn split_escrow(paid: U256, total: usize, dones: usize, errs: usize) -> (U256, U256) {
-    debug_assert_eq!(dones + errs, total, "dones+errs must equal total");
-    if total == 0 {
-        return (U256::zero(), U256::zero());
+/// Each successful request releases its exact quote. Each errored request
+/// refunds its exact quote. That avoids the prior proportional split, which
+/// lost per-request pricing information once mixed-cost batches were allowed.
+fn split_quoted_escrow(slots: &[RequestSlot]) -> (U256, U256) {
+    let mut released = U256::zero();
+    let mut refunded = U256::zero();
+    for slot in slots {
+        match slot.state {
+            RequestStatus::Done => {
+                released = released.saturating_add(slot.quoted_cost_grains);
+            }
+            RequestStatus::Errored => {
+                refunded = refunded.saturating_add(slot.quoted_cost_grains);
+            }
+            RequestStatus::Pending | RequestStatus::Dispatched => {}
+        }
     }
-    let per = paid / U256::from(total);
-    let refunded = per * U256::from(errs);
-    let released = paid - refunded; // sweeps remainder into released
     (released, refunded)
 }
 
@@ -472,28 +527,56 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::*;
 
+    fn slot(state: RequestStatus, quoted_cost_grains: u64) -> RequestSlot {
+        RequestSlot {
+            state,
+            request: ChatCompletionRequest {
+                model: "m".to_string(),
+                messages: Vec::new(),
+                max_tokens: None,
+                stream: false,
+            },
+            quoted_cost_grains: U256::from(quoted_cost_grains),
+            response: None,
+            error: None,
+        }
+    }
+
     #[test]
-    fn split_all_done_releases_all() {
-        let (rel, ref_) = split_escrow(U256::from(100u64), 4, 4, 0);
+    fn split_all_done_releases_all_quotes() {
+        let slots = vec![
+            slot(RequestStatus::Done, 10),
+            slot(RequestStatus::Done, 20),
+            slot(RequestStatus::Done, 70),
+        ];
+        let (rel, ref_) = split_quoted_escrow(&slots);
         assert_eq!(rel, U256::from(100u64));
         assert_eq!(ref_, U256::zero());
     }
 
     #[test]
-    fn split_all_errored_refunds_all() {
-        let (rel, ref_) = split_escrow(U256::from(100u64), 4, 0, 4);
+    fn split_all_errored_refunds_all_quotes() {
+        let slots = vec![
+            slot(RequestStatus::Errored, 10),
+            slot(RequestStatus::Errored, 20),
+            slot(RequestStatus::Errored, 70),
+        ];
+        let (rel, ref_) = split_quoted_escrow(&slots);
         assert_eq!(rel, U256::zero());
         assert_eq!(ref_, U256::from(100u64));
     }
 
     #[test]
-    fn split_partial_balances_with_remainder() {
-        // 100 / 3 = 33 remainder 1. 1 errored refunds 33; 2 done get
-        // 100 - 33 = 67. invariant: released + refunded = paid.
-        let (rel, ref_) = split_escrow(U256::from(100u64), 3, 2, 1);
+    fn split_partial_uses_exact_slot_quotes() {
+        let slots = vec![
+            slot(RequestStatus::Done, 10),
+            slot(RequestStatus::Errored, 30),
+            slot(RequestStatus::Done, 60),
+        ];
+        let (rel, ref_) = split_quoted_escrow(&slots);
         assert_eq!(rel + ref_, U256::from(100u64));
-        assert_eq!(ref_, U256::from(33u64));
-        assert_eq!(rel, U256::from(67u64));
+        assert_eq!(ref_, U256::from(30u64));
+        assert_eq!(rel, U256::from(70u64));
     }
 
     #[test]
@@ -504,5 +587,4 @@ mod tests {
         assert!(!BatchStatus::Submitted.is_terminal());
         assert!(!BatchStatus::Running.is_terminal());
     }
-
 }

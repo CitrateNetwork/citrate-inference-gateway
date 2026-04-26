@@ -21,11 +21,13 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
+use ethereum_types::U256;
 use futures_util::stream::{self, Stream};
 use uuid::Uuid;
 
 use x402_axum::X402Paid;
 
+use crate::auth::ApiKeyCharge;
 use crate::error::GatewayError;
 use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Usage};
 use crate::provider::{dispatch_to_provider, select_provider, ProviderProtocolRequest};
@@ -36,7 +38,7 @@ use crate::SharedState;
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default max output tokens when caller doesn't specify.
-const DEFAULT_MAX_TOKENS: u32 = 512;
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 512;
 
 /// How many providers to try before giving up on a request. The
 /// first attempt is the highest-scored provider; each subsequent
@@ -46,8 +48,8 @@ const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// Convert a `GatewayError` into an HTTP response with a JSON body.
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.http_status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = Json(serde_json::json!({
             "error": {
                 "message": self.to_string(),
@@ -69,7 +71,9 @@ pub async fn chat_completions_handler(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, GatewayError> {
     if req.messages.is_empty() {
-        return Err(GatewayError::BadRequest("messages must be non-empty".into()));
+        return Err(GatewayError::BadRequest(
+            "messages must be non-empty".into(),
+        ));
     }
 
     // RM-B1 / WP-D2.4 (audit F-2): recharge against the caller's
@@ -90,24 +94,9 @@ pub async fn chat_completions_handler(
     // recharge calculation. The estimate is conservative — see
     // `estimate_input_tokens` — so the gate is at least as strict as
     // the truth.
+    let mut accepted_charge = None;
     if let Some(Extension(pay)) = &paid {
-        let requested_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let real_input_tokens = estimate_input_tokens(&req.messages);
-        let model_hash = state
-            .queries
-            .resolve_model_name(&req.model)
-            .await
-            .map_err(|_| GatewayError::UnknownModel(req.model.clone()))?;
-        let actual_cost = state
-            .queries
-            .estimate_cost(
-                model_hash,
-                real_input_tokens,
-                requested_tokens,
-                crate::pricing::DEFAULT_VERIFICATION_TIER,
-            )
-            .await
-            .map_err(|e| GatewayError::PricingUnavailable(e.to_string()))?;
+        let (actual_cost, requested_tokens) = quote_chat_request_cost(&state, &req).await?;
 
         if pay.amount_wei < actual_cost {
             return Err(GatewayError::Underfunded {
@@ -116,6 +105,7 @@ pub async fn chat_completions_handler(
                 max_tokens: requested_tokens,
             });
         }
+        accepted_charge = Some(actual_cost);
     }
 
     let dispatch = match run_dispatch(&state, &req).await {
@@ -132,24 +122,57 @@ pub async fn chat_completions_handler(
     // WP-03.5: successful, API-key-authenticated requests emit one
     // usage row. Anonymous x402 requests (no ApiKeyContext) are NOT
     // tracked — usage is a per-identity resource.
-    if let (Some(Extension(ctx)), Some(Extension(pay))) = (&api_key, &paid) {
+    if let (Some(Extension(ctx)), Some(charge)) = (&api_key, accepted_charge) {
         state
             .usage
             .record(
                 &ctx.key_id,
                 dispatch.prompt_tokens,
                 dispatch.completion_tokens,
-                pay.amount_wei,
+                charge,
             )
             .await;
         metrics::counter!("gateway_usage_rows_emitted_total", 1);
     }
 
-    if req.stream {
-        Ok(stream_response(req, dispatch).into_response())
+    let mut response = if req.stream {
+        stream_response(req, dispatch).into_response()
     } else {
-        Ok(Json(json_response(req, dispatch)).into_response())
+        Json(json_response(req, dispatch)).into_response()
+    };
+    if api_key.is_some() {
+        if let Some(amount_grains) = accepted_charge {
+            response
+                .extensions_mut()
+                .insert(ApiKeyCharge { amount_grains });
+        }
     }
+    Ok(response)
+}
+
+/// Quote the exact accepted charge for a parsed chat request.
+pub(crate) async fn quote_chat_request_cost(
+    state: &SharedState,
+    req: &ChatCompletionRequest,
+) -> Result<(U256, u32), GatewayError> {
+    let requested_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let real_input_tokens = estimate_input_tokens(&req.messages);
+    let model_hash = state
+        .queries
+        .resolve_model_name(&req.model)
+        .await
+        .map_err(|_| GatewayError::UnknownModel(req.model.clone()))?;
+    let actual_cost = state
+        .queries
+        .estimate_cost(
+            model_hash,
+            real_input_tokens,
+            requested_tokens,
+            crate::pricing::DEFAULT_VERIFICATION_TIER,
+        )
+        .await
+        .map_err(|e| GatewayError::PricingUnavailable(e.to_string()))?;
+    Ok((actual_cost, requested_tokens))
 }
 
 /// RM-I-3 / WP-I2.1 (audit F-2 input pricing closure):
@@ -319,7 +342,10 @@ pub(crate) async fn run_dispatch(
     Err(last_err.unwrap_or(GatewayError::NoProviders))
 }
 
-pub(crate) fn json_response(req: ChatCompletionRequest, d: DispatchOutcome) -> ChatCompletionResponse {
+pub(crate) fn json_response(
+    req: ChatCompletionRequest,
+    d: DispatchOutcome,
+) -> ChatCompletionResponse {
     let _ = d.prompt; // not needed in JSON path
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),

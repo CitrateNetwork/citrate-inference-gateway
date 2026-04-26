@@ -117,6 +117,7 @@ fn operator_secret() -> [u8; 32] {
 }
 
 async fn spawn_gateway(provider: SocketAddr) -> (SocketAddr, Arc<ApiKeyStore>) {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockChainQueries { provider_endpoint: provider.to_string() });
     let chain = Arc::new(HonestMockChain::new(facilitator));

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::Json as JsonExtractor;
+use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Json as JsonResp;
 use ethereum_types::{H160, H256, U256};
@@ -36,14 +37,36 @@ use x402_axum::{ChainClient, RawLog, TxReceipt, X402Error};
 async fn spawn_stub_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(|JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
-            let prompt = req.prompt.clone();
-            JsonResp(serde_json::json!({
-                "output": format!("STUB-RESPONSE: {}", prompt),
-                "input_tokens": prompt.split_whitespace().count(),
-                "output_tokens": 4,
-            }))
-        }),
+        post(
+            |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
+                let prompt = req.prompt.clone();
+                JsonResp(serde_json::json!({
+                    "output": format!("STUB-RESPONSE: {}", prompt),
+                    "input_tokens": prompt.split_whitespace().count(),
+                    "output_tokens": 4,
+                }))
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("stub serve");
+    });
+    addr
+}
+
+async fn spawn_failing_provider() -> SocketAddr {
+    let app = axum::Router::new().route(
+        "/infer",
+        post(
+            |JsonExtractor(_req): JsonExtractor<ProviderProtocolRequest>| async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResp(serde_json::json!({"error": "stub-fail"})),
+                )
+            },
+        ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
     let addr = listener.local_addr().expect("local_addr");
@@ -68,10 +91,10 @@ impl ChainQueries for MockChainQueries {
         &self,
         _: H256,
         _: u32,
-        _: u32,
+        output_tokens: u32,
         _: u8,
     ) -> Result<U256, citrate_gateway::GatewayError> {
-        Ok(U256::from(1_000_000_000_000_000_000u128))
+        Ok(U256::from(output_tokens as u64))
     }
     async fn list_providers(
         &self,
@@ -119,11 +142,7 @@ impl ChainClient for HonestMockChain {
     async fn send_raw_tx(&self, _tx: &[u8]) -> Result<H256, X402Error> {
         Ok(H256::from([0xab; 32]))
     }
-    async fn wait_for_receipt(
-        &self,
-        _h: H256,
-        _t: Duration,
-    ) -> Result<TxReceipt, X402Error> {
+    async fn wait_for_receipt(&self, _h: H256, _t: Duration) -> Result<TxReceipt, X402Error> {
         let nonce = H256::from([0x77; 32]);
         let mut settled = self.settled.lock().expect("mutex");
         if !settled.insert(nonce) {
@@ -177,9 +196,8 @@ fn operator_secret() -> [u8; 32] {
     ]
 }
 
-async fn spawn_gateway(
-    provider_addr: SocketAddr,
-) -> (SocketAddr, Arc<ApiKeyStore>) {
+async fn spawn_gateway(provider_addr: SocketAddr) -> (SocketAddr, Arc<ApiKeyStore>) {
+    std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
     let queries = Arc::new(MockChainQueries {
         provider_endpoint: provider_addr.to_string(),
@@ -217,6 +235,26 @@ fn chat_body() -> Value {
     })
 }
 
+async fn wait_batch_terminal(gateway: SocketAddr, batch_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let url = format!("http://{}/v1/batch/{}", gateway, batch_id);
+    loop {
+        let resp = reqwest::get(&url).await.expect("poll");
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.expect("json");
+        if matches!(
+            body["status"].as_str(),
+            Some("completed" | "partial_failure" | "failed")
+        ) {
+            return body;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("batch did not become terminal; last={}", body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -241,18 +279,86 @@ async fn valid_key_with_balance_bypasses_x402() {
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
 
-    // Balance should have dropped by exactly the priced amount.
+    // Balance should drop by the exact handler quote, not the
+    // conservative 512-token pre-debit from ApiKeyLayer.
     let record = keys.get(&key_id).await.expect("key still exists");
-    assert!(
-        record.balance_grains < initial,
-        "balance should drop after request; was {} now {}",
-        initial,
-        record.balance_grains
-    );
     let deducted = initial - record.balance_grains;
-    // TokenBasedPricing default estimate is deterministic — must be
-    // non-zero and ≤ initial.
-    assert!(deducted > U256::zero());
+    assert_eq!(deducted, U256::from(10u64));
+}
+
+#[tokio::test]
+async fn api_key_underfunded_chat_refunds_debit() {
+    let provider = spawn_stub_provider().await;
+    let (gateway, keys) = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let initial = U256::from(512u64);
+    let key_id = create_key(&keys, "pilot", initial, H160::from([0xde; 20])).await;
+
+    let url = format!("http://{}/v1/chat/completions", gateway);
+    let body = serde_json::json!({
+        "model": "llama-3.1-8b",
+        "messages": [{"role": "user", "content": "expensive"}],
+        "max_tokens": 65_535
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", key_id))
+        .json(&body)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 402);
+
+    let record = keys.get(&key_id).await.expect("key still exists");
+    assert_eq!(
+        record.balance_grains, initial,
+        "underfunded downstream rejection must refund the pre-debit"
+    );
+}
+
+#[tokio::test]
+async fn api_key_failed_batch_slot_refunds_exact_quote() {
+    let provider = spawn_failing_provider().await;
+    let (gateway, keys) = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let initial = U256::from(512u64);
+    let key_id = create_key(&keys, "pilot", initial, H160::from([0xde; 20])).await;
+
+    let url = format!("http://{}/v1/batch", gateway);
+    let body = serde_json::json!({
+        "requests": [{
+            "model": "llama-3.1-8b",
+            "messages": [{"role": "user", "content": "batch-fail"}],
+            "max_tokens": 10
+        }]
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", key_id))
+        .json(&body)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    let batch_id = body["batch_id"].as_str().expect("batch id");
+
+    let after_submit = keys.get(&key_id).await.expect("key still exists");
+    assert_eq!(
+        initial - after_submit.balance_grains,
+        U256::from(10u64),
+        "submit should retain only the exact batch quote after over-estimate refund"
+    );
+
+    let terminal = wait_batch_terminal(gateway, batch_id).await;
+    assert_eq!(terminal["status"].as_str(), Some("failed"));
+    let record = keys.get(&key_id).await.expect("key still exists");
+    assert_eq!(
+        record.balance_grains, initial,
+        "failed batch slot must refund its exact accepted quote"
+    );
 }
 
 #[tokio::test]
@@ -317,7 +423,11 @@ async fn exhausted_key_falls_through_to_402_with_deposit_hint() {
         .send()
         .await
         .expect("send");
-    assert_eq!(resp.status(), 402, "exhausted key should see x402 challenge");
+    assert_eq!(
+        resp.status(),
+        402,
+        "exhausted key should see x402 challenge"
+    );
     let body: Value = resp.json().await.expect("json");
     assert!(body.get("x402").is_some(), "challenge envelope required");
     let hint = body["deposit_instructions"]
