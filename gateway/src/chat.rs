@@ -79,8 +79,20 @@ pub async fn chat_completions_handler(
     // amount. Pre-fix this was a free out-of-policy capacity grant.
     // Post-fix we recompute the real cost from req.max_tokens and
     // reject with 402 if the signed amount falls short.
+    //
+    // RM-I-3 / WP-I2.1 (re-audit Stream 3 finding F-2 partial): the
+    // input-token side was still pinned to ASSUMED_INPUT_TOKENS=256
+    // even when the actual prompt was orders of magnitude larger. A
+    // caller could ship a 32 KiB prompt + max_tokens=512 and still be
+    // priced as if the input were 256 tokens. Post-fix we estimate
+    // the real input token count from the request messages and use
+    // it (capped at the maximum the model can accept) in the
+    // recharge calculation. The estimate is conservative — see
+    // `estimate_input_tokens` — so the gate is at least as strict as
+    // the truth.
     if let Some(Extension(pay)) = &paid {
         let requested_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let real_input_tokens = estimate_input_tokens(&req.messages);
         let model_hash = state
             .queries
             .resolve_model_name(&req.model)
@@ -90,7 +102,7 @@ pub async fn chat_completions_handler(
             .queries
             .estimate_cost(
                 model_hash,
-                crate::pricing::ASSUMED_INPUT_TOKENS,
+                real_input_tokens,
                 requested_tokens,
                 crate::pricing::DEFAULT_VERIFICATION_TIER,
             )
@@ -137,6 +149,50 @@ pub async fn chat_completions_handler(
         Ok(stream_response(req, dispatch).into_response())
     } else {
         Ok(Json(json_response(req, dispatch)).into_response())
+    }
+}
+
+/// RM-I-3 / WP-I2.1 (audit F-2 input pricing closure):
+/// Conservative input-token estimator over a list of chat messages.
+///
+/// Tokenisation is model-specific (BPE for GPT, SentencePiece for
+/// Llama, etc.) and the precise count is only available after the
+/// provider runs the request. For pricing-gate purposes we want a
+/// *conservative upper bound* — overestimating costs the user a
+/// touch more wei but never lets a caller under-pay; under-
+/// estimating opens a free-capacity grant.
+///
+/// The standard heuristic (used by OpenAI tokenizers in their
+/// guidance) is ~4 bytes per token for English text. We use 3
+/// bytes/token as the floor (more aggressive = larger token count
+/// = higher charge), plus a fixed 4-token overhead per message for
+/// the role + separator wrappers ChatML and similar formats add.
+/// Saturates at u32::MAX so a 4 GiB prompt still produces a finite
+/// price (though the dispatch path will reject it long before).
+pub(crate) fn estimate_input_tokens(messages: &[crate::openai::ChatMessage]) -> u32 {
+    /// Bytes per token (conservative — over-estimates the count).
+    const BYTES_PER_TOKEN: u64 = 3;
+    /// Per-message role + separator overhead.
+    const PER_MESSAGE_OVERHEAD: u64 = 4;
+
+    let mut total: u64 = 0;
+    for m in messages {
+        // role + content are both attacker-controlled; both count.
+        let body_bytes = (m.role.len() as u64) + (m.content.len() as u64);
+        let body_tokens = (body_bytes + BYTES_PER_TOKEN - 1) / BYTES_PER_TOKEN; // ceil_div
+        total = total
+            .saturating_add(body_tokens)
+            .saturating_add(PER_MESSAGE_OVERHEAD);
+    }
+    // Floor at the prior-track ASSUMED constant so an empty-message
+    // edge case still charges something (defence-in-depth; the
+    // empty-messages branch above is the load-bearing reject).
+    let floor = crate::pricing::ASSUMED_INPUT_TOKENS as u64;
+    let estimate = total.max(floor);
+    if estimate > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        estimate as u32
     }
 }
 
@@ -322,4 +378,97 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod input_token_estimation_tests {
+    use super::*;
+    use crate::openai::ChatMessage;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    /// RM-I-3 / WP-I2.1: empty messages list saturates to the
+    /// `ASSUMED_INPUT_TOKENS` floor (defence-in-depth — the empty-
+    /// messages reject in the handler is the load-bearing gate).
+    #[test]
+    fn test_f_2_empty_messages_uses_assumed_floor() {
+        let count = estimate_input_tokens(&[]);
+        assert_eq!(
+            count,
+            crate::pricing::ASSUMED_INPUT_TOKENS,
+            "F-2: empty messages must price at ASSUMED_INPUT_TOKENS floor"
+        );
+    }
+
+    /// A short message produces a count above the per-message
+    /// overhead (4 tokens) and below the floor (which dominates here).
+    #[test]
+    fn test_f_2_short_message_uses_floor() {
+        let count = estimate_input_tokens(&[msg("user", "hi")]);
+        assert_eq!(
+            count,
+            crate::pricing::ASSUMED_INPUT_TOKENS,
+            "F-2: a 2-byte message + role overhead is below the floor; floor wins"
+        );
+    }
+
+    /// A LONG message bypasses the floor and produces a real estimate.
+    /// 32 KiB body / 3 bytes-per-token ≈ 10923 tokens — well above the
+    /// 256 floor that the pre-fix code pinned.
+    #[test]
+    fn test_f_2_long_message_returns_real_estimate() {
+        let payload: String = "A".repeat(32 * 1024);
+        let count = estimate_input_tokens(&[msg("user", &payload)]);
+        // Should be roughly (32768 + 4 [role len]) / 3 + 4 [overhead] ≈ 10928
+        // Allow a wide tolerance — the assertion is "much more than 256".
+        assert!(
+            count >= 10_000,
+            "F-2: 32 KiB message must price at least 10K tokens, got {}",
+            count
+        );
+        assert!(
+            count > crate::pricing::ASSUMED_INPUT_TOKENS,
+            "F-2: 32 KiB message must exceed the assumed floor"
+        );
+    }
+
+    /// Many short messages summed — guards against per-message overhead
+    /// being skipped in the loop.
+    #[test]
+    fn test_f_2_many_messages_summed() {
+        // 1000 messages of role "user" and content "hi"
+        let messages: Vec<ChatMessage> = (0..1000).map(|_| msg("user", "hi")).collect();
+        let count = estimate_input_tokens(&messages);
+        // (4 + 2) bytes / 3 = 2 body tokens + 4 overhead = 6 tokens per
+        // message * 1000 = 6000 total. Well above the 256 floor.
+        assert!(
+            count >= 5_000,
+            "F-2: 1000 short messages must price at least 5K tokens, got {}",
+            count
+        );
+    }
+
+    /// Saturation at u32::MAX guards against a 4-GiB-prompt attack
+    /// causing arithmetic overflow.
+    #[test]
+    fn test_f_2_huge_estimate_saturates_at_u32_max() {
+        // Construct messages totalling ~16 GiB nominal — would overflow
+        // u32 if we summed naively. We use 1 KiB content and pretend
+        // we have many such messages.
+        let msgs: Vec<ChatMessage> = (0..(1u32 << 24))
+            .map(|_| msg("u", &"x".repeat(1024)))
+            .collect();
+        let count = estimate_input_tokens(&msgs);
+        // ((1024 + 1) / 3 + 4) * (1 << 24) ≈ 6.6e9 > u32::MAX (~4.3e9).
+        assert_eq!(
+            count,
+            u32::MAX,
+            "F-2: extremely large prompts must saturate at u32::MAX, not overflow"
+        );
+    }
 }
