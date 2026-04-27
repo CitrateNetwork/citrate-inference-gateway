@@ -121,6 +121,18 @@ anyhow = "1.0"
 proptest = "=1.5.0"
 criterion = "0.5"
 
+# RM-M1b — Halo2-KZG zk-SNARK substrate.
+# Pinned to PSE Halo2 main at commit `198e9ae30d322cd0ad003b6955f91ec095b1490d`
+# (2025-07-07). Includes the multipoint-opening soundness fix (PR #400)
+# that landed after v0.4.0 (2024-09-13). Pin selection is documented
+# in ADR-RM-M1b-1 and enforced by `scripts/ci/check_m1b_halo2_pin.py`.
+# Any pin bump REQUIRES an ADR amendment so the audit trail is honest.
+#
+# Behind core/execution/Cargo.toml's `halo2-substrate` feature flag.
+# OFF by default; enabled when WP-M1b.4 wires the verifier into 0x0108.
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d", default-features = false }
+halo2curves = { version = "0.7.0", default-features = false, features = ["bn256-table", "derive_serde"] }
+
 [profile.release]
 opt-level = 3
 lto = true
