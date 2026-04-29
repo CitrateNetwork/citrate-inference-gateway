@@ -12,6 +12,7 @@ members = [
     "core/economics",
     "core/marketplace",
     "core/learning",
+    "core/learning-daemon",
     "core/bridge",
     "core/security",
     "node",
