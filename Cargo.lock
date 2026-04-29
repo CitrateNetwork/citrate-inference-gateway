@@ -2052,6 +2052,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-experiment-runner"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "citrate-learning",
+ "citrate-learning-daemon",
+ "csv",
+ "futures",
+ "primitives",
+ "proptest",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "citrate-faucet"
 version = "0.4.0"
 dependencies = [
