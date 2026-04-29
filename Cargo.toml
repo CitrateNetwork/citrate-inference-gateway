@@ -13,6 +13,7 @@ members = [
     "core/marketplace",
     "core/learning",
     "core/learning-daemon",
+    "core/experiment-runner",
     "core/bridge",
     "core/security",
     "node",
