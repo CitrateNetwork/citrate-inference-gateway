@@ -1978,6 +1978,7 @@ dependencies = [
  "csv",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "hmac",
  "paste",
  "reqwest 0.12.28",
@@ -2395,15 +2396,21 @@ dependencies = [
 name = "citrate-school-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "citrate-signing",
  "clap",
  "dirs",
+ "hex",
+ "hmac",
+ "http-body-util",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber 0.3.23",
  "uuid",
@@ -2451,9 +2458,11 @@ name = "citrate-signing"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "hex",
  "hmac",
+ "http-body-util",
  "mockito",
  "reqwest 0.12.28",
  "serde",
@@ -2461,6 +2470,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "url",
 ]
