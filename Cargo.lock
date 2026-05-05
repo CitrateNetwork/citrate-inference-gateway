@@ -2396,8 +2396,10 @@ dependencies = [
 name = "citrate-school-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
+ "citrate-edu-app",
  "citrate-signing",
  "clap",
  "dirs",
