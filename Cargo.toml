@@ -34,6 +34,8 @@ members = [
     "gateway",
     "pool-coordinator",
     "training-worker",
+    "core/signing",
+    "cli-school-bootstrap",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.

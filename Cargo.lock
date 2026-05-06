@@ -1973,11 +1973,13 @@ dependencies = [
  "async-trait",
  "axum",
  "calamine",
+ "chrono",
  "citrate-security",
  "citrate-wallet-core",
  "csv",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "hmac",
  "paste",
  "reqwest 0.12.28",
@@ -2199,6 +2201,7 @@ dependencies = [
  "hostname",
  "png 0.17.16",
  "serde_json",
+ "sha2",
  "sha3 0.10.9",
  "slint",
  "slint-build",
@@ -2391,6 +2394,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-school-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "citrate-edu-app",
+ "citrate-signing",
+ "clap",
+ "dirs",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "uuid",
+]
+
+[[package]]
 name = "citrate-security"
 version = "0.4.0"
 dependencies = [
@@ -2425,6 +2457,28 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+]
+
+[[package]]
+name = "citrate-signing"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "mockito",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -7586,6 +7640,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "mockito"
+version = "1.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90820618712cab19cfc46b274c6c22546a82affcb3c3bdf0f29e3db8e1bb92c0"
+dependencies = [
+ "assert-json-diff",
+ "bytes 1.11.1",
+ "colored",
+ "futures-core",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
+ "log",
+ "pin-project-lite",
+ "rand 0.9.4",
+ "regex",
+ "serde_json",
+ "serde_urlencoded",
+ "similar",
+ "tokio",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11276,6 +11355,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simplecss"
