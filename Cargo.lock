@@ -2108,6 +2108,7 @@ dependencies = [
  "chrono",
  "citrate-agent-core",
  "citrate-desktop-app",
+ "citrate-edu-app",
  "citrate-storage",
  "citrate-wallet-core",
  "dirs",
