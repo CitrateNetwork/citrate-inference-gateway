@@ -1825,6 +1825,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-kit"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-bridge"
 version = "0.4.0"
 dependencies = [
