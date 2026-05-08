@@ -1828,6 +1828,7 @@ dependencies = [
 name = "citrate-boeing-kit"
 version = "0.1.0"
 dependencies = [
+ "image",
  "resvg 0.44.0",
  "slint",
  "slint-build",
