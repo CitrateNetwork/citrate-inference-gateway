@@ -2407,6 +2407,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-rbac-bindings"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-wallet-core",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-school-bootstrap"
 version = "0.1.0"
 dependencies = [
