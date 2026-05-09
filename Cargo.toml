@@ -24,6 +24,8 @@ members = [
     "faucet",
     "gui/citrate_desktop_app",
     "gui/citrate_gui_native",
+    "gui/citrate_boeing_kit",
+    "gui/citrate_rbac_bindings",
     "agent-core",
     "agent-chain",
     "agent-cron",
