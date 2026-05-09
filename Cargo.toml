@@ -27,6 +27,7 @@ members = [
     "gui/citrate_boeing_kit",
     "gui/citrate_rbac_bindings",
     "gui/citrate_boeing_overview",
+    "gui/citrate_boeing_overview_proof",
     "agent-core",
     "agent-chain",
     "agent-cron",
