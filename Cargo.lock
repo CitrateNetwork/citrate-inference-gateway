@@ -1856,6 +1856,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-provenance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-rbac-bindings",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-bridge"
 version = "0.4.0"
 dependencies = [
