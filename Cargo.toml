@@ -30,6 +30,7 @@ members = [
     "gui/citrate_boeing_overview_proof",
     "gui/citrate_boeing_provenance",
     "gui/citrate_boeing_provenance_proof",
+    "gui/citrate_boeing_suppliers",
     "agent-core",
     "agent-chain",
     "agent-cron",
