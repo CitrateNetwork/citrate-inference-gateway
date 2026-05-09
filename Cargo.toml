@@ -28,6 +28,7 @@ members = [
     "gui/citrate_rbac_bindings",
     "gui/citrate_boeing_overview",
     "gui/citrate_boeing_overview_proof",
+    "gui/citrate_boeing_provenance",
     "agent-core",
     "agent-chain",
     "agent-cron",
