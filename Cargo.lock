@@ -1887,6 +1887,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-suppliers-proof"
+version = "0.1.0"
+dependencies = [
+ "citrate-boeing-suppliers",
+ "image",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-bridge"
 version = "0.4.0"
 dependencies = [
