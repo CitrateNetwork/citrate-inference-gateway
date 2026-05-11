@@ -2039,6 +2039,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-sponsor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-rbac-bindings",
+ "hex",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-boeing-suppliers"
 version = "0.1.0"
 dependencies = [
