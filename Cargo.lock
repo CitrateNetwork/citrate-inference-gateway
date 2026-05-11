@@ -1908,6 +1908,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-inter-org"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-hkdf-chain",
+ "citrate-rbac-bindings",
+ "hex",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-boeing-kit"
 version = "0.1.0"
 dependencies = [
@@ -2340,6 +2353,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "uuid",
+]
+
+[[package]]
+name = "citrate-hkdf-chain"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hkdf",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
