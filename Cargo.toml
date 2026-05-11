@@ -45,6 +45,7 @@ members = [
     "gui/citrate_boeing_ontology",
     "gui/citrate_boeing_ontology_proof",
     "gui/citrate_boeing_procurement",
+    "gui/citrate_boeing_inter_org",
     "crates/citrate-hkdf-chain",
     "agent-core",
     "agent-chain",
