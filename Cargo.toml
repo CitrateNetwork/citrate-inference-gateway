@@ -36,6 +36,7 @@ members = [
     "gui/citrate_boeing_fl_proof",
     "gui/citrate_boeing_models_compute",
     "gui/citrate_boeing_models_compute_proof",
+    "gui/citrate_boeing_apps_contracts_proof",
     "agent-core",
     "agent-chain",
     "agent-cron",
