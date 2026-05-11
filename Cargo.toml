@@ -48,6 +48,7 @@ members = [
     "gui/citrate_boeing_inter_org",
     "gui/citrate_boeing_compliance",
     "gui/citrate_boeing_sponsor",
+    "gui/citrate_boeing_release",
     "crates/citrate-hkdf-chain",
     "agent-core",
     "agent-chain",
