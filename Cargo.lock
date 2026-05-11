@@ -1825,6 +1825,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-apps-contracts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-rbac-bindings",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-boeing-apps-contracts-proof"
 version = "0.1.0"
 dependencies = [
