@@ -1887,6 +1887,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-boeing-governance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-rbac-bindings",
+ "hex",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "citrate-boeing-governance-proof"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-boeing-kit"
 version = "0.1.0"
 dependencies = [
