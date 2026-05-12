@@ -2065,6 +2065,7 @@ dependencies = [
  "citrate-boeing-provenance",
  "citrate-boeing-suppliers",
  "citrate-rbac-bindings",
+ "citrate-wallet-core",
  "dirs",
  "hex",
  "sha3 0.10.9",
