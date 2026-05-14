@@ -2066,6 +2066,7 @@ dependencies = [
  "citrate-boeing-overview",
  "citrate-boeing-provenance",
  "citrate-boeing-suppliers",
+ "citrate-desktop-app",
  "citrate-rbac-bindings",
  "citrate-wallet-core",
  "dirs",
