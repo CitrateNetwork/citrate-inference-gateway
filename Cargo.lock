@@ -2071,6 +2071,7 @@ dependencies = [
  "citrate-wallet-core",
  "dirs",
  "hex",
+ "k256",
  "serde_json",
  "sha3 0.10.9",
  "slint",
