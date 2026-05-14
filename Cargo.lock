@@ -1720,7 +1720,7 @@ name = "citrate-agent-chain"
 version = "0.4.0"
 dependencies = [
  "async-trait",
- "citrate-agent-core",
+ "citrate-agent-legacy",
  "serde",
  "serde_json",
  "tokio",
@@ -1732,7 +1732,7 @@ name = "citrate-agent-code"
 version = "0.4.0"
 dependencies = [
  "async-trait",
- "citrate-agent-core",
+ "citrate-agent-legacy",
  "serde",
  "serde_json",
  "tempfile",
@@ -1742,6 +1742,33 @@ dependencies = [
 
 [[package]]
 name = "citrate-agent-core"
+version = "0.4.0"
+dependencies = [
+ "citrate-wallet-core",
+ "hex",
+ "k256",
+ "serde_json",
+ "sha3 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "citrate-agent-cron"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "citrate-agent-legacy",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "citrate-agent-legacy"
 version = "0.4.0"
 dependencies = [
  "anyhow",
@@ -1758,20 +1785,6 @@ dependencies = [
  "tokio-util 0.7.18",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "citrate-agent-cron"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "chrono",
- "citrate-agent-core",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2057,6 +2070,7 @@ name = "citrate-boeing-shell"
 version = "0.4.0"
 dependencies = [
  "arboard",
+ "citrate-agent-core",
  "citrate-boeing-apps-contracts",
  "citrate-boeing-assistant",
  "citrate-boeing-fl",
@@ -2202,7 +2216,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "citrate-agent-core",
+ "citrate-agent-legacy",
  "citrate-api",
  "citrate-consensus",
  "citrate-economics",
@@ -2398,7 +2412,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "chrono",
- "citrate-agent-core",
+ "citrate-agent-legacy",
  "citrate-desktop-app",
  "citrate-edu-app",
  "citrate-storage",

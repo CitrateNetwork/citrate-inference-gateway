@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "agent/core",
     "cli",
     "core/consensus",
     "core/sequencer",
@@ -51,7 +52,7 @@ members = [
     "gui/citrate_boeing_release",
     "gui/citrate_boeing_shell",
     "crates/citrate-hkdf-chain",
-    "agent-core",
+    "agent-legacy",
     "agent-chain",
     "agent-cron",
     "agent-code",
