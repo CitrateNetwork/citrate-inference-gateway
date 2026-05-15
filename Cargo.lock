@@ -1846,6 +1846,8 @@ dependencies = [
 name = "citrate-agent-core"
 version = "0.4.0"
 dependencies = [
+ "base64 0.22.1",
+ "ciborium",
  "citrate-wallet-core",
  "ed25519-dalek",
  "hex",
