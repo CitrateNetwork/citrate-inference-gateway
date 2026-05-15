@@ -1747,10 +1747,15 @@ dependencies = [
  "citrate-wallet-core",
  "hex",
  "k256",
+ "serde",
  "serde_json",
+ "sha2",
  "sha3 0.10.9",
+ "tar",
  "tokio",
+ "toml 0.8.23",
  "tracing",
+ "zstd 0.13.3",
 ]
 
 [[package]]
