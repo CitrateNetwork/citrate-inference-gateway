@@ -1860,6 +1860,7 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
  "zstd 0.13.3",
 ]
 
