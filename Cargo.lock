@@ -1830,6 +1830,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-cli"
+version = "0.4.0"
+dependencies = [
+ "citrate-agent-core",
+ "clap",
+ "hex",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "citrate-agent-code"
 version = "0.4.0"
 dependencies = [
