@@ -2211,6 +2211,8 @@ dependencies = [
  "dirs 5.0.1",
  "hex",
  "k256",
+ "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "sha3 0.10.9",
  "slint",
