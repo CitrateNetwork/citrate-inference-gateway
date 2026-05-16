@@ -1875,6 +1875,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "wiremock",
  "zstd 0.13.3",
 ]
 
@@ -1895,6 +1896,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "wiremock",
 ]
 
 [[package]]
@@ -2228,6 +2230,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "wiremock",
 ]
 
 [[package]]
