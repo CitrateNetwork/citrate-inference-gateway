@@ -2195,6 +2195,7 @@ name = "citrate-boeing-shell"
 version = "0.4.0"
 dependencies = [
  "arboard",
+ "async-trait",
  "citrate-agent-core",
  "citrate-boeing-apps-contracts",
  "citrate-boeing-assistant",
