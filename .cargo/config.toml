@@ -1,0 +1,5 @@
+# Use system git for fetches so SSH config host aliases work.
+# Cargo's bundled libgit2 doesn't read ~/.ssh/config; system git does.
+# This repo uses the github-citrate-chain alias mapping to CHAIN_DEPLOY_KEY.
+[net]
+git-fetch-with-cli = true

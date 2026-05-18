@@ -26,10 +26,22 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.CHAIN_DEPLOY_KEY }}
 
-      - name: Trust github.com SSH host key
+      - name: Configure SSH host alias for citrate-chain
         run: |
-          mkdir -p ~/.ssh
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+          umask 077
+          echo "${{ secrets.CHAIN_DEPLOY_KEY }}" > ~/.ssh/citrate-chain-readonly
+          chmod 600 ~/.ssh/citrate-chain-readonly
+          cat > ~/.ssh/config <<'SSHEOF'
+          Host github-citrate-chain
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-chain-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          SSHEOF
+          chmod 600 ~/.ssh/config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

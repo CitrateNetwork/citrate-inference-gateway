@@ -809,7 +809,7 @@ dependencies = [
 [[package]]
 name = "citrate-consensus"
 version = "0.4.0"
-source = "git+ssh://git@github.com/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -834,7 +834,7 @@ dependencies = [
 [[package]]
 name = "citrate-execution"
 version = "0.4.0"
-source = "git+ssh://git@github.com/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -918,7 +918,7 @@ dependencies = [
 [[package]]
 name = "citrate-security"
 version = "0.4.0"
-source = "git+ssh://git@github.com/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
 dependencies = [
  "aes-gcm",
  "subtle",
@@ -929,7 +929,7 @@ dependencies = [
 [[package]]
 name = "citrate-wallet-core"
 version = "0.4.0"
-source = "git+ssh://git@github.com/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4230,9 +4230,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.10"
+version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d6fdd9f81c2819c9a8b0e0cd91660e7746a8e6ea2ba7c6b2b057985f6bcb51"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "bitflags 2.11.1",
  "bytes",
