@@ -47,9 +47,13 @@ sha2 = "0.10"
 hex = "0.4"
 ethereum-types = "0.14"
 
-# Citrate integration
+# Citrate integration — x402-axum stays internal to this workspace.
+# citrate-wallet-core is consumed from CitrateNetwork/citrate-chain via SSH
+# deploy key (federation-transition interim). When citrate-chain publishes
+# to crates.io after its first audited release, swap to a semver dep:
+#     citrate-wallet-core = "0.5"
 x402-axum = { path = "../crates/x402-axum" }
-citrate-wallet-core = { path = "../wallet-core" }
+citrate-wallet-core = { git = "ssh://git@github.com/CitrateNetwork/citrate-chain", branch = "main" }
 
 # Observability — env-filter + json features needed by main.rs
 tracing = { workspace = true }

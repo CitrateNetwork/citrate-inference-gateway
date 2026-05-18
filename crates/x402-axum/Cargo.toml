@@ -46,8 +46,10 @@ getrandom = "0.3"
 rlp = "0.5"
 
 # Citrate integration — wallet-core gives us the RpcClient, UnifiedKey,
-# and signing primitives the X402Client needs.
-citrate-wallet-core = { path = "../../wallet-core" }
+# and signing primitives the X402Client needs. Consumed from
+# CitrateNetwork/citrate-chain via SSH deploy key during the federation
+# transition. Swap to crates.io after the chain's first audited release.
+citrate-wallet-core = { git = "ssh://git@github.com/CitrateNetwork/citrate-chain", branch = "main" }
 
 # Observability
 tracing = { workspace = true }

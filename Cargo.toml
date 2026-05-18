@@ -1,86 +1,15 @@
 [workspace]
+# Gateway + x402-axum workspace. Other crates from the original
+# monorepo (chain, GUIs, agent runtime, compute pool) moved to
+# sibling repos under the CitrateNetwork org during the May 2026
+# federation split. Chain crates are consumed as SSH git deps to
+# CitrateNetwork/citrate-chain (interim) until they publish to
+# crates.io after the chain's first audited release.
 members = [
-    "agent/cli",
-    "agent/core",
-    "cli",
-    "core/consensus",
-    "core/sequencer",
-    "core/execution",
-    "core/storage",
-    "core/primitives",
-    "core/api",
-    "core/network",
-    "core/mcp",
-    "core/economics",
-    "core/marketplace",
-    "core/learning",
-    "core/learning-daemon",
-    "core/experiment-runner",
-    "core/bridge",
-    "core/security",
-    "node",
-    "node-app",
-    "wallet",
-    "wallet-core",
-    "wallet-sdk",
-    "faucet",
-    "gui/citrate_desktop_app",
-    "gui/citrate_gui_native",
-    "gui/citrate_boeing_kit",
-    "gui/citrate_rbac_bindings",
-    "gui/citrate_boeing_overview",
-    "gui/citrate_boeing_overview_proof",
-    "gui/citrate_boeing_provenance",
-    "gui/citrate_boeing_provenance_proof",
-    "gui/citrate_boeing_suppliers",
-    "gui/citrate_boeing_suppliers_proof",
-    "gui/citrate_boeing_fl",
-    "gui/citrate_boeing_fl_proof",
-    "gui/citrate_boeing_models_compute",
-    "gui/citrate_boeing_models_compute_proof",
-    "gui/citrate_boeing_apps_contracts",
-    "gui/citrate_boeing_apps_contracts_proof",
-    "gui/citrate_boeing_assistant",
-    "gui/citrate_boeing_assistant_proof",
-    "gui/citrate_boeing_governance",
-    "gui/citrate_boeing_governance_proof",
-    "gui/citrate_boeing_ontology",
-    "gui/citrate_boeing_ontology_proof",
-    "gui/citrate_boeing_procurement",
-    "gui/citrate_boeing_inter_org",
-    "gui/citrate_boeing_compliance",
-    "gui/citrate_boeing_sponsor",
-    "gui/citrate_boeing_release",
-    "gui/citrate_boeing_shell",
-    "crates/citrate-hkdf-chain",
-    "agent-legacy",
-    "agent-chain",
-    "agent-cron",
-    "agent-code",
-    "gui/citrate_edu_app",
-    "gui/citrate_learning_center",
-    "crates/x402-axum",
     "gateway",
-    "pool-coordinator",
-    "training-worker",
-    "core/signing",
-    "cli-school-bootstrap",
+    "crates/x402-axum",
 ]
-# Default build targets: unified node binary (includes wallet + CLI).
-# Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.
-default-members = [
-    "core/consensus",
-    "core/sequencer",
-    "core/execution",
-    "core/storage",
-    "core/primitives",
-    "core/api",
-    "core/network",
-    "core/mcp",
-    "core/economics",
-    "core/marketplace",
-    "node",
-]
+default-members = ["gateway"]
 resolver = "2"
 
 [workspace.package]
@@ -88,7 +17,7 @@ version = "0.4.0"
 edition = "2021"
 authors = ["Citrate Network"]
 license = "MIT"
-repository = "https://github.com/citrate-network/citrate"
+repository = "https://github.com/CitrateNetwork/citrate-inference-gateway"
 
 [workspace.dependencies]
 # Async runtime
