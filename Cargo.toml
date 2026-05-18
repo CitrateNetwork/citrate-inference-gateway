@@ -95,6 +95,12 @@ criterion = "0.5"
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d", default-features = false }
 halo2curves = { version = "0.7.0", default-features = false, features = ["bn256-table", "derive_serde"] }
 
+# Chain crates consumed from CitrateNetwork/citrate-chain via SSH deploy key
+# (PSL-02: hoisted from per-member declarations into the workspace). When
+# chain publishes to crates.io after its first audited release, replace
+# the git spec with a semver string and bump rev pin to a real version.
+citrate-wallet-core = { git = "ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain", branch = "main" }
+
 [profile.release]
 opt-level = 3
 lto = true
