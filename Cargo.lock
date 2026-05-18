@@ -809,7 +809,7 @@ dependencies = [
 [[package]]
 name = "citrate-consensus"
 version = "0.4.0"
-source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?rev=0f2d16b486a9ec1ed8a0394440dac480075d6942#0f2d16b486a9ec1ed8a0394440dac480075d6942"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -834,7 +834,7 @@ dependencies = [
 [[package]]
 name = "citrate-execution"
 version = "0.4.0"
-source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?rev=0f2d16b486a9ec1ed8a0394440dac480075d6942#0f2d16b486a9ec1ed8a0394440dac480075d6942"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -918,7 +918,7 @@ dependencies = [
 [[package]]
 name = "citrate-security"
 version = "0.4.0"
-source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?rev=0f2d16b486a9ec1ed8a0394440dac480075d6942#0f2d16b486a9ec1ed8a0394440dac480075d6942"
 dependencies = [
  "aes-gcm",
  "subtle",
@@ -929,7 +929,7 @@ dependencies = [
 [[package]]
 name = "citrate-wallet-core"
 version = "0.4.0"
-source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?branch=main#9c054621275e9ca3acc3db42dda362f24d2883a6"
+source = "git+ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain?rev=0f2d16b486a9ec1ed8a0394440dac480075d6942#0f2d16b486a9ec1ed8a0394440dac480075d6942"
 dependencies = [
  "aes-gcm",
  "anyhow",
