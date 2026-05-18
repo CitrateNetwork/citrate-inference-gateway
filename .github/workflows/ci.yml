@@ -52,4 +52,5 @@ jobs:
       - name: cargo test
         env:
           CARGO_INCREMENTAL: 0
-        run: cargo test --workspace --locked
+          CARGO_BUILD_JOBS: 2
+        run: cargo test --workspace --locked --jobs 2 -- --test-threads=2
