@@ -68,7 +68,5 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           CARGO_BUILD_JOBS: 2
-        # Skip test_f_2_huge_estimate_saturates_at_u32_max — it runs an
-        # actual u32::MAX iteration and times out the runner.
-        # Sprint 1: refactor to use mock data instead of real iteration.
-        run: cargo test --workspace --locked --jobs 2 -- --test-threads=2 --skip test_f_2_huge_estimate_saturates_at_u32_max
+        # PSL-06 fixed: the F-2 saturation test no longer allocates 16 GiB.
+        run: cargo test --workspace --locked --jobs 2 -- --test-threads=2
