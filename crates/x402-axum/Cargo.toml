@@ -49,7 +49,7 @@ rlp = "0.5"
 # and signing primitives the X402Client needs. Consumed from
 # CitrateNetwork/citrate-chain via SSH deploy key during the federation
 # transition. Swap to crates.io after the chain's first audited release.
-citrate-wallet-core = { git = "ssh://git@github.com/CitrateNetwork/citrate-chain", branch = "main" }
+citrate-wallet-core = { git = "ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain", branch = "main" }
 
 # Observability
 tracing = { workspace = true }
