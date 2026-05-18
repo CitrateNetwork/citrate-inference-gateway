@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH agent (deploy key for citrate-chain)
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CHAIN_DEPLOY_KEY }}
+
+      - name: Trust github.com SSH host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true  # surface fmt drift but don't block
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+        continue-on-error: true  # pre-existing warnings — sprint follow-up
+
+      - name: cargo test
+        env:
+          CARGO_INCREMENTAL: 0
+        run: cargo test --workspace --locked
