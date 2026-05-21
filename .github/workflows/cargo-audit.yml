@@ -1,0 +1,40 @@
+name: cargo audit (tripwire)
+
+# REM-16 tripwire (2026-05-20 federation-split audit):
+# Runs cargo-audit per-PR + weekly. Per the SOP at
+# citrate-agentile-archive/sops/vulnerability-scanning.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: 0 8 * * 1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-audit-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        # REM-16b (arkworks bump needed):
+        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI injection
+        #   via ark-relations 0.4 transitive. See audit.toml.
+        run: |
+          cargo audit \
+            --color always \
+            --ignore RUSTSEC-2025-0055
