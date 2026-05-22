@@ -1,0 +1,178 @@
+name: Release (inference-gateway)
+
+# Cross-platform release for inference-gateway binary.
+# See release ceremony prep audit (2026-05-21).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish or rebuild'
+        required: true
+        type: string
+      publish_release:
+        description: 'Publish immediately instead of draft'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build gateway binary
+        shell: bash
+        run: |
+          set -e
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --locked --target ${{ matrix.target }} -p gateway
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p gateway
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          STAGE="citrate-inference-gateway-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$TARGET_DIR/gateway.exe" "dist/$STAGE/" 2>/dev/null || true
+          else
+            cp "$TARGET_DIR/gateway" "dist/$STAGE/" 2>/dev/null || true
+          fi
+          cp LICENSE README.md "dist/$STAGE/" 2>/dev/null || true
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a -tzip "${STAGE}.zip" "$STAGE/"
+          else
+            tar -czf "${STAGE}.tar.gz" "$STAGE/"
+          fi
+      - name: SHA256
+        shell: bash
+        run: |
+          cd dist
+          for f in citrate-inference-gateway-${{ matrix.target }}.*; do
+            if [[ -f "$f" ]]; then
+              if [[ "${{ runner.os }}" == "macOS" ]]; then
+                shasum -a 256 "$f" > "$f.sha256"
+              else
+                sha256sum "$f" > "$f.sha256"
+              fi
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citrate-inference-gateway-${{ matrix.target }}
+          path: dist/citrate-inference-gateway-${{ matrix.target }}.*
+          retention-days: 30
+
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-cyclonedx
+      - run: cargo cyclonedx --format json --override-filename citrate-inference-gateway-sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citrate-inference-gateway-sbom
+          path: 'citrate-inference-gateway-sbom*.json'
+          retention-days: 90
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build, sbom]
+    permissions:
+      contents: write
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name '*.json' \) -exec cp {} release-files/ \;
+      - id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: citrate-inference-gateway ${{ steps.tag.outputs.tag }}
+          draft: ${{ !github.event.inputs.publish_release }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          files: release-files/*
+          body: |
+            ## citrate-inference-gateway ${{ steps.tag.outputs.tag }}
+
+            Inference gateway binary — external boundary for AI inference
+            requests with auth + rate-limiting + per-model routing.
+
+            See `citrate-compliance/runbooks/releases/inference-gateway.md`
+            for install + run.
+
+            **Status**: unsigned-pre-release.
