@@ -39,10 +39,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            archive: tar.gz
-            cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tar.gz
@@ -65,6 +61,32 @@ jobs:
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked
+
+      # REM-22 — inference-gateway requires SSH alias `github-citrate-chain`
+      # to resolve citrate-wallet-core. Same fix as agent-runtime /
+      # boeing-shell. CI must provision this alias before cargo can fetch.
+      - name: Configure SSH host alias (REM-22)
+        env:
+          CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "$CHAIN_DEPLOY_KEY" ]; then
+            echo "$CHAIN_DEPLOY_KEY" > ~/.ssh/chain_deploy
+            chmod 600 ~/.ssh/chain_deploy
+            cat >> ~/.ssh/config <<EOF
+          Host github-citrate-chain
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/chain_deploy
+            StrictHostKeyChecking accept-new
+          EOF
+            ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          else
+            echo "::error::CHAIN_DEPLOY_KEY secret not set — cargo will fail to fetch citrate-wallet-core. See REM-22."
+            exit 1
+          fi
+        shell: bash
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -128,6 +150,28 @@ jobs:
         with:
           ref: ${{ github.event.inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+      # REM-22 — sbom job also fetches deps via cargo; needs the chain ssh alias.
+      - name: Configure SSH host alias (REM-22)
+        env:
+          CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "$CHAIN_DEPLOY_KEY" ]; then
+            echo "$CHAIN_DEPLOY_KEY" > ~/.ssh/chain_deploy
+            chmod 600 ~/.ssh/chain_deploy
+            cat >> ~/.ssh/config <<EOF
+          Host github-citrate-chain
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/chain_deploy
+            StrictHostKeyChecking accept-new
+          EOF
+            ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          else
+            echo "::error::CHAIN_DEPLOY_KEY secret not set — cargo cyclonedx will fail to fetch citrate-wallet-core. See REM-22."
+            exit 1
+          fi
+        shell: bash
       - run: cargo install --locked cargo-cyclonedx
       - run: cargo cyclonedx --format json --override-filename citrate-inference-gateway-sbom
       - uses: actions/upload-artifact@v4
