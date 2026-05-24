@@ -99,9 +99,9 @@ jobs:
         run: |
           set -e
           if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --locked --target ${{ matrix.target }} -p gateway
+            cross build --release --locked --target ${{ matrix.target }} -p citrate-inference-gateway
           else
-            cargo build --release --locked --target ${{ matrix.target }} -p gateway
+            cargo build --release --locked --target ${{ matrix.target }} -p citrate-inference-gateway
           fi
       - name: Package
         shell: bash
@@ -111,9 +111,9 @@ jobs:
           mkdir -p "dist/$STAGE"
           TARGET_DIR="target/${{ matrix.target }}/release"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "$TARGET_DIR/gateway.exe" "dist/$STAGE/" 2>/dev/null || true
+            cp "$TARGET_DIR/citrate-inference-gateway.exe" "dist/$STAGE/" 2>/dev/null || true
           else
-            cp "$TARGET_DIR/gateway" "dist/$STAGE/" 2>/dev/null || true
+            cp "$TARGET_DIR/citrate-inference-gateway" "dist/$STAGE/" 2>/dev/null || true
           fi
           cp LICENSE README.md "dist/$STAGE/" 2>/dev/null || true
           cd dist
