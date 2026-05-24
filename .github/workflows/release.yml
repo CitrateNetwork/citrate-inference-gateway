@@ -227,4 +227,4 @@ jobs:
 
             ### After install
             Configure: `~/.citrate/gateway.toml`. Start: `citrate-inference-gateway --help`.
-            Connects to bootnodes `boot{1,2,3}.citrate.network` (testnet chain id 40204).
+            Connects to bootnodes `boot{1,2,3}.citrate.ai` (testnet chain id 40204).
