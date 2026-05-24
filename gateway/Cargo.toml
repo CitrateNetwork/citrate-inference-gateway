@@ -23,6 +23,51 @@ path = "src/lib.rs"
 name = "citrate-inference-gateway"
 path = "src/main.rs"
 
+# ──────────────────────────────────────────────────────────────────────
+# Native installer packaging (cargo-packager).
+# Produces .deb + .AppImage on Linux, .dmg on macOS, .msi on Windows.
+# Build flow per platform (see .github/workflows/release.yml):
+#
+#   cargo packager --release \
+#     -p citrate-inference-gateway \
+#     --formats deb appimage \
+#     --out-dir dist
+#
+# `before-packaging-command` builds the binary so the packager picks it up.
+# Icon assets in ../packaging/ — placeholder until official Citrate branding lands.
+# ──────────────────────────────────────────────────────────────────────
+[package.metadata.packager]
+name             = "Citrate Inference Gateway"
+product-name     = "Citrate Inference Gateway"
+identifier       = "ai.citrate.inference-gateway"
+description      = "OpenAI-compatible HTTP gateway over the Citrate compute marketplace"
+long-description = """
+The Citrate Inference Gateway exposes an OpenAI-compatible
+/v1/chat/completions API backed by the Citrate compute marketplace.
+Requests are routed through the InferenceRouter contract with x402
+metering. Self-hosted by node operators on the Citrate testnet
+(chain id 40204) or mainnet.
+"""
+homepage     = "https://citrate.ai"
+authors      = ["Mozi Cooperative <partnerships@citrate.ai>"]
+license-file = "../LICENSE"
+category     = "DeveloperTool"
+before-packaging-command = "cargo build --release --bin citrate-inference-gateway"
+icons        = ["../packaging/icon.png", "../packaging/icon.ico"]
+
+# .deb specifics
+[package.metadata.packager.deb]
+section  = "net"
+priority = "optional"
+
+# .dmg specifics
+[package.metadata.packager.dmg]
+window-size = { width = 600, height = 400 }
+
+# .msi (WiX) defaults are fine for pilot. cargo-packager auto-generates
+# the upgrade-code from the identifier; explicit configuration needed only
+# when shipping signed installers (post-pilot).
+
 [dependencies]
 # Transport
 axum = "0.7"
