@@ -1,0 +1,267 @@
+# Tier-2 packaging workflow for citrate-inference-gateway.
+#
+# Generated from citrate-labs/branding/templates/release-tier2.yml.template
+# by apply-tier2.sh. Edit the template (in citrate-labs) rather than the
+# per-repo copy; the per-repo file gets overwritten on next sync.
+#
+# Triggers on tag push `v*-tier2` so a release can ship a Tier-1
+# (raw binary tarball) and a Tier-2 (signed installer) variant
+# independently, e.g.:
+#   git tag v0.5.0-beta2          # → Tier-1 only (release.yml)
+#   git tag v0.5.0-beta2-tier2    # → Tier-2 installers (this workflow)
+#
+# Manual rebuild:
+#   gh workflow run release-tier2.yml --ref main \
+#     -f release_tag=v0.5.0-beta2-tier2
+
+name: Release Tier-2 (citrate-inference-gateway)
+
+on:
+  push:
+    tags:
+      - 'v*-tier2'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to publish or rebuild (e.g. v0.5.0-beta2-tier2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write       # cosign keyless OIDC signing for installer artifacts
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            packager-formats: deb,rpm,appimage
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            packager-formats: deb,rpm,appimage
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            packager-formats: app,dmg
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            packager-formats: app,dmg
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            packager-formats: msi,nsis
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux build deps (.deb/.rpm/.AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev cmake pkg-config \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libfuse2 rpm
+          # libfuse2 is required at AppImage build-time. rpm provides
+          # /usr/bin/rpmbuild which cargo-packager invokes for the .rpm
+          # format. GTK/WebKit pulled in only for repos that need a
+          # webview shell; safe overinclusion for daemon-only repos.
+
+      - name: Windows build deps (Strawberry Perl + NASM for vendored OpenSSL)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:\\Strawberry\\perl\\bin"  >> $GITHUB_PATH
+          echo "C:\\Strawberry\\c\\bin"     >> $GITHUB_PATH
+          echo "OPENSSL_SRC_PERL=C:\\Strawberry\\perl\\bin\\perl.exe" >> $GITHUB_ENV
+          choco install nasm -y --no-progress || true
+          echo "C:\\Program Files\\NASM" >> $GITHUB_PATH
+
+      - name: Import Apple Developer ID cert (macOS)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/citrate.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN
+          security set-keychain-settings -lut 21600 $KEYCHAIN
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 \
+            -k $KEYCHAIN \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN
+          security list-keychain -d user -s $KEYCHAIN
+
+      - name: Import Windows Authenticode cert (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pwd = ConvertTo-SecureString -String "$env:WINDOWS_CERTIFICATE_PASSWORD" -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: tier2-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install cargo-packager
+        run: cargo install --locked cargo-packager
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -e
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p citrate-inference-gateway
+
+      - name: Package installers
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        # cargo-packager 0.11.8 does not auto-detect a standalone
+        # packager.toml at the workspace root (only [package.metadata.packager]
+        # inside a Cargo.toml). Converting our packager.toml to inline JSON
+        # and passing via --config bypasses the auto-detect logic. python3
+        # is preinstalled on every GitHub-hosted runner (Linux, macOS,
+        # Windows) so this stays portable.
+        run: |
+          set -e
+          cd gateway
+          CONFIG_JSON=$(python3 -c "
+          import json
+          try: import tomllib
+          except ImportError: import tomli as tomllib
+          with open('packager.toml','rb') as f: d = tomllib.load(f)
+          print(json.dumps(d))
+          ")
+          cargo packager --release --target ${{ matrix.target }} \
+            --formats ${{ matrix.packager-formats }} \
+            --config "$CONFIG_JSON" \
+            --binaries-dir ../target/${{ matrix.target }}/release \
+            --out-dir ../target/${{ matrix.target }}/release/packages
+
+      - name: Notarize macOS artefacts
+        if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
+        env:
+          APPLE_NOTARY_USER: ${{ secrets.APPLE_NOTARY_USER }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for f in target/${{ matrix.target }}/release/packages/*.dmg \
+                   target/${{ matrix.target }}/release/packages/*.app.zip ; do
+            [[ -f "$f" ]] || continue
+            echo "Notarising $f..."
+            xcrun notarytool submit "$f" \
+              --apple-id "$APPLE_NOTARY_USER" \
+              --password "$APPLE_NOTARY_PASSWORD" \
+              --team-id  "$APPLE_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$f" || true
+          done
+
+      - name: SHA-256 sums
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release/packages
+          for f in * ; do
+            [[ -f "$f" ]] || continue
+            if [[ "${{ runner.os }}" == "macOS" ]]; then
+              shasum -a 256 "$f" > "$f.sha256"
+            else
+              sha256sum "$f" > "$f.sha256"
+            fi
+          done
+          ls -la
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/packages/*
+          retention-days: 30
+
+  publish:
+    name: Publish Tier-2 release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        run: |
+          cd dist
+          cat *.sha256 2>/dev/null | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign installers (keyless OIDC)
+        run: |
+          cd dist
+          shopt -s nullglob
+          for f in *.dmg *.msi *.exe *.deb *.rpm *.AppImage *.app.zip ; do
+            [[ -f "$f" ]] || continue
+            COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" || true
+          done
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-rc.') || contains(steps.tag.outputs.tag, '-beta') || contains(steps.tag.outputs.tag, '-alpha') }}
+          generate_release_notes: true
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
