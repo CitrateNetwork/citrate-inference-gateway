@@ -47,13 +47,11 @@ icons = [
 ]
 
 # Files to bundle alongside the binary inside the app/installer.
-# The .gguf is the bundled default AI model — see branding/models/MODEL_GEMMA_4_E4B.md
-# for provenance + licensing. cargo-packager copies it into the .app /
-# .deb / .msi at build time. The file is fetched fresh from HuggingFace by
-# scripts/fetch-models.sh on every CI run (intentionally NOT in git — 5 GB
-# is too big for a versioned blob).
+# Per-profile in branding/templates/repos.toml. The wallet bundles the
+# Gemma 4 E4B GGUF (see branding/models/MODEL_GEMMA_4_E4B.md) so its chat
+# works out of the box; daemons (chain node, gateway, pool) don't ship the
+# model because they don't run the chat UI.
 resources = [
-  "../branding/models/gemma-4-E4B-it-Q4_K_M.gguf",
 
 ]
 

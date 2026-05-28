@@ -145,6 +145,24 @@ jobs:
         run: |
           set -e
           mkdir -p branding/models
+          # Pick a portable sha256 verifier — Linux/macOS have shasum or
+          # sha256sum, Windows runners have openssl via Git Bash. We try in
+          # order so the same step works on all three matrix legs.
+          verify() {
+            local sha_file="$1"
+            local dir; dir=$(dirname "$sha_file")
+            local base; base=$(basename "$sha_file")
+            ( cd "$dir" && {
+              if command -v shasum     >/dev/null 2>&1 ; then shasum -a 256 -c "$base"
+              elif command -v sha256sum >/dev/null 2>&1 ; then sha256sum -c "$base"
+              else
+                # openssl path — compute and compare manually
+                expected=$(awk '{print $1}' "$base")
+                actual=$(openssl dgst -sha256 "${base%.sha256}" | awk '{print $NF}')
+                [ "$expected" = "$actual" ] || { echo "sha256 mismatch: expected $expected got $actual"; exit 1; }
+              fi
+            } )
+          }
           for sha_file in branding/models/*.gguf.sha256 ; do
             [ -f "$sha_file" ] || continue
             name=$(basename "${sha_file%.sha256}")
@@ -154,7 +172,7 @@ jobs:
             echo "fetching $name…"
             curl -fL --retry 3 --retry-delay 5 -o "branding/models/$name" "$primary" \
               || curl -fL --retry 3 --retry-delay 5 -o "branding/models/$name" "$fallback"
-            ( cd branding/models && shasum -a 256 -c "$(basename "$sha_file")" )
+            verify "$sha_file"
             echo "  ✓ $name verified"
           done
 
@@ -271,6 +289,15 @@ jobs:
               m['signing-identity'] = os.environ['APPLE_SIGNING_IDENTITY']
           elif not m.get('signing-identity'):
               m.pop('signing-identity', None)
+          # Entitlements path. cargo-packager invokes codesign with the cwd set
+          # to its package out-dir on some platforms — a relative entitlements
+          # path then resolves to .../target/<triple>/release/packages/branding/...
+          # which doesn't exist, and codesign aborts with 'cannot read
+          # entitlement data'. Resolve to an absolute path here so it works
+          # regardless of where codesign cd's to.
+          ent = m.get('entitlements')
+          if ent and not os.path.isabs(ent):
+              m['entitlements'] = os.path.abspath(ent)
           print(json.dumps(d))
           ")
           cargo packager --release --target ${{ matrix.target }} \
