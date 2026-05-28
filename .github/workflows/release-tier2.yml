@@ -129,6 +129,35 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Bundled AI model — fetched per build, not stored in git (5 GB+).
+      # cargo-packager's `resources` list embeds it into the installer.
+      # Cached across runs by the .gguf.sha256 + checked against it.
+      - name: Cache bundled models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: branding/models/*.gguf
+          key: gguf-${{ hashFiles('branding/models/*.gguf.sha256') }}
+
+      - name: Fetch bundled models (sha256-verified)
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p branding/models
+          for sha_file in branding/models/*.gguf.sha256 ; do
+            [ -f "$sha_file" ] || continue
+            name=$(basename "${sha_file%.sha256}")
+            # Primary: ggml-org canonical; fallback: bartowski mirror.
+            primary="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/$name"
+            fallback="https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_$name"
+            echo "fetching $name…"
+            curl -fL --retry 3 --retry-delay 5 -o "branding/models/$name" "$primary" \
+              || curl -fL --retry 3 --retry-delay 5 -o "branding/models/$name" "$fallback"
+            ( cd branding/models && shasum -a 256 -c "$(basename "$sha_file")" )
+            echo "  ✓ $name verified"
+          done
+
       - name: Linux build deps (.deb/.rpm/.AppImage)
         if: runner.os == 'Linux'
         run: |
