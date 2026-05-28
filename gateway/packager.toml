@@ -47,8 +47,13 @@ icons = [
 ]
 
 # Files to bundle alongside the binary inside the app/installer.
-# Keep this minimal — large bundled assets break differential updates.
+# The .gguf is the bundled default AI model — see branding/models/MODEL_GEMMA_4_E4B.md
+# for provenance + licensing. cargo-packager copies it into the .app /
+# .deb / .msi at build time. The file is fetched fresh from HuggingFace by
+# scripts/fetch-models.sh on every CI run (intentionally NOT in git — 5 GB
+# is too big for a versioned blob).
 resources = [
+  "../branding/models/gemma-4-E4B-it-Q4_K_M.gguf",
 
 ]
 
