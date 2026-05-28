@@ -35,18 +35,16 @@ copyright = "© 2026 Citrate Labs. BUSL-1.1."
 # in cargo-packager main but isn't in 0.11.x; revisit when we upgrade.)
 formats = ["app", "dmg", "wix", "nsis", "deb", "appimage"]
 
-# Multi-resolution PNG ladder. cargo-packager picks the right size
-# per platform target — the 1024px feeds .icns generation, the
-# 256px feeds .ico, the rest go into .desktop's hicolor theme dirs.
+# Pre-built platform icons + a PNG fallback ladder. cargo-packager picks
+# per target: .icns for macOS (used directly — avoids the lossy PNG→icns
+# generation that aborts with "No matching IconType" on non-icns sizes
+# like 48/64), .ico for Windows, and the PNGs for Linux .desktop hicolor.
 icons = [
-  "../branding/icons/icon-1024.png",
+  "../branding/icons/citrate.icns",
+  "../branding/icons/citrate.ico",
   "../branding/icons/icon-512.png",
   "../branding/icons/icon-256.png",
   "../branding/icons/icon-128.png",
-  "../branding/icons/icon-64.png",
-  "../branding/icons/icon-48.png",
-  "../branding/icons/icon-32.png",
-  "../branding/icons/icon-16.png",
 ]
 
 # Files to bundle alongside the binary inside the app/installer.

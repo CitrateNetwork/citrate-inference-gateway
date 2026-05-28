@@ -44,10 +44,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            packager-formats: deb,rpm,appimage
+            packager-formats: deb,appimage
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            packager-formats: deb,rpm,appimage
+            packager-formats: deb,appimage
           - target: x86_64-apple-darwin
             runner: macos-latest
             packager-formats: app,dmg
@@ -56,12 +56,73 @@ jobs:
             packager-formats: app,dmg
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            packager-formats: msi,nsis
+            packager-formats: wix,nsis
+    env:
+      # Exposed so the SSH-setup steps below can self-skip on repos that have
+      # no cross-repo SSH git deps (e.g. citrate-chain). Repos that consume
+      # private sibling crates via ssh:// host aliases (gui-native, boeing-shell)
+      # set these deploy-key secrets and the steps activate.
+      CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+      LEARNING_CENTER_DEPLOY_KEY: ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
+      AGENT_RUNTIME_DEPLOY_KEY: ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
+      # Force lzma-sys / xz2 to build liblzma from source and link it
+      # statically. Otherwise the macOS runner's Homebrew xz gets dynamically
+      # linked into the binary (load path `/opt/homebrew/opt/xz/lib/liblzma.5.dylib`)
+      # and the hardened-runtime + Developer-ID-signed app refuses to load it
+      # on user machines because it's signed by a different Team ID — crashing
+      # at launch with "Library not loaded: …liblzma.5.dylib … different Team IDs".
+      LZMA_API_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.release_tag || github.ref }}
           submodules: recursive
+
+      # Cross-repo private git deps (citrate-agent-runtime, citrate-chain,
+      # citrate-learning-center) are pulled via ssh:// host aliases. Set up the
+      # deploy keys + host aliases exactly like the regular CI so `cargo build`
+      # can clone them. Skipped when the deploy-key secrets are absent (chain).
+      - name: Setup SSH agent (cross-repo deploy keys)
+        if: ${{ env.AGENT_RUNTIME_DEPLOY_KEY != '' }}
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.CHAIN_DEPLOY_KEY }}
+            ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
+            ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
+
+      - name: Configure SSH host aliases
+        if: ${{ env.AGENT_RUNTIME_DEPLOY_KEY != '' }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          umask 077
+          echo "${{ secrets.CHAIN_DEPLOY_KEY }}"           > ~/.ssh/citrate-chain-readonly
+          echo "${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}" > ~/.ssh/citrate-learning-center-readonly
+          echo "${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}"   > ~/.ssh/citrate-agent-runtime-readonly
+          chmod 600 ~/.ssh/citrate-*-readonly
+          cat > ~/.ssh/config <<'SSHEOF'
+          Host github-citrate-chain
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-chain-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          Host github-citrate-learning-center
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-learning-center-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          Host github-citrate-agent-runtime
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-agent-runtime-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          SSHEOF
+          chmod 600 ~/.ssh/config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -155,19 +216,38 @@ jobs:
         # Windows) so this stays portable.
         run: |
           set -e
+          # Absolute repo-root target dir — cargo builds the workspace here
+          # regardless of how deep gateway is, so this is correct
+          # for chain (node/), gui (gui/citrate_desktop_app/), and pool (.).
+          TARGET_DIR="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release"
           cd gateway
-          CONFIG_JSON=$(python3 -c "
-          import json
+          CONFIG_JSON=$(CITRATE_TARGET_DIR="$TARGET_DIR" python3 -c "
+          import json, os
           try: import tomllib
           except ImportError: import tomli as tomllib
           with open('packager.toml','rb') as f: d = tomllib.load(f)
+          # The --binaries-dir CLI flag is ignored when --config is a raw JSON
+          # string, so packager defaults to out-dir and the binary copy fails
+          # with 'No such file or directory'. Inject an absolute binaries-dir.
+          d['binaries-dir'] = os.environ['CITRATE_TARGET_DIR']
+          # macOS signing-identity. cargo-packager only signs when the config
+          # has a non-empty signing-identity, so:
+          #   - signed build  (APPLE_SIGNING_IDENTITY env set): inject the real
+          #     identity into the config; without it, codesign runs with "" and
+          #     fails OR (worse) packager silently emits an unsigned .app.
+          #   - unsigned build (env unset, packager.toml has identity = ""):
+          #     drop the empty value entirely so packager skips signing cleanly.
+          m = d.setdefault('macos', {})
+          if os.environ.get('APPLE_SIGNING_IDENTITY'):
+              m['signing-identity'] = os.environ['APPLE_SIGNING_IDENTITY']
+          elif not m.get('signing-identity'):
+              m.pop('signing-identity', None)
           print(json.dumps(d))
           ")
           cargo packager --release --target ${{ matrix.target }} \
             --formats ${{ matrix.packager-formats }} \
             --config "$CONFIG_JSON" \
-            --binaries-dir ../target/${{ matrix.target }}/release \
-            --out-dir ../target/${{ matrix.target }}/release/packages
+            --out-dir "$TARGET_DIR/packages"
 
       - name: Notarize macOS artefacts
         if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
