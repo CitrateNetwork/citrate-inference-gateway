@@ -79,25 +79,49 @@ pub async fn build_router(config: GatewayConfig) -> Router {
     // `build_router_with` and supply their operator wallet secret +
     // x402 facilitator address — those live in env vars and aren't
     // safe defaults.
+    //
+    // PIL-47 / pilot exception: if `CITRATE_GATEWAY_OPEN_CHAT=1`,
+    // also mount `/v1/chat/completions` and `/v1/batch` *without*
+    // x402 auth. The chat handler tolerates `paid: None` by skipping
+    // payment validation entirely, so dispatching just falls through
+    // to provider selection + forward. This is a pilot-stage toggle
+    // for showing end-to-end routing (chatbot → gateway → on-chain
+    // InferenceRouter lookup → DGX shim) without standing up a
+    // facilitator first. Do NOT enable on a public, broadly-exposed
+    // gateway.
     metrics::install_recorder();
     let queries: Arc<dyn ChainQueries> = Arc::new(HttpChainQueries::new(
         &config.rpc_url,
         config.contracts.clone(),
     ));
-    Router::new()
+    let open_chat = std::env::var("CITRATE_GATEWAY_OPEN_CHAT").ok().as_deref() == Some("1");
+    let state = Arc::new(state::AppState {
+        config,
+        http: reqwest::Client::new(),
+        queries,
+        batches: Arc::new(batch::BatchStore::new()),
+        keys: Arc::new(auth::ApiKeyStore::new()),
+        usage: Arc::new(usage::UsageStore::new()),
+    });
+    let mut router = Router::new()
         .route("/health", get(health::health_handler))
         .route("/v1/models", get(models::models_handler))
-        .route("/metrics", get(metrics::metrics_handler))
+        .route("/metrics", get(metrics::metrics_handler));
+    if open_chat {
+        tracing::warn!(
+            "CITRATE_GATEWAY_OPEN_CHAT=1 — exposing /v1/chat/completions without x402 auth. \
+             Acceptable for pilot demo; disable before broad public exposure."
+        );
+        router = router
+            .route("/v1/chat/completions", post(chat::chat_completions_handler))
+            .route("/v1/batch", post(batch::submit_batch_handler))
+            .route("/v1/batch/:id", get(batch::get_batch_handler))
+            .route("/v1/batch/:id/output", get(batch::get_batch_output_handler));
+    }
+    router
         .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(state::AppState {
-            config,
-            http: reqwest::Client::new(),
-            queries,
-            batches: Arc::new(batch::BatchStore::new()),
-            keys: Arc::new(auth::ApiKeyStore::new()),
-            usage: Arc::new(usage::UsageStore::new()),
-        }))
+        .with_state(state)
 }
 
 /// Test-injection router builder. Production callers use
