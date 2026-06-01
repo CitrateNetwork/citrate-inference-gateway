@@ -14,12 +14,27 @@
 
 use async_trait::async_trait;
 use ethereum_types::{H160, H256, U256};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use tokio::sync::RwLock;
 
 use crate::config::ContractAddresses;
 use crate::error::GatewayError;
+
+/// PIL-47c: how long a model-name → hash lookup stays valid before we
+/// re-enumerate ModelRegistry. New models get registered rarely; 30s is
+/// short enough that a freshly-registered model surfaces within one
+/// human-noticeable retry, long enough that bursts of chat traffic
+/// don't hammer the chain.
+const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// PIL-47c: process-wide cache of name → modelHash, populated lazily
+/// on first miss in `resolve_model_name`. Held under a tokio RwLock so
+/// reads are non-blocking when the cache is warm.
+static MODEL_NAME_CACHE: Lazy<RwLock<Option<(std::time::Instant, std::collections::HashMap<String, H256>)>>> =
+    Lazy::new(|| RwLock::new(None));
 
 /// One provider listing returned by `list_providers`.
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +153,29 @@ impl HttpChainQueries {
         }
     }
 
+    /// PIL-47c: look up `name` in the in-memory model-name cache. Returns
+    /// `None` on miss or expiry; the caller is expected to re-populate via
+    /// [`Self::refresh_model_cache`].
+    async fn cached_model_hash(&self, name: &str) -> Option<H256> {
+        let guard = MODEL_NAME_CACHE.read().await;
+        if let Some((fetched_at, ref map)) = *guard {
+            if fetched_at.elapsed() < MODEL_CACHE_TTL {
+                return map.get(name).copied();
+            }
+        }
+        None
+    }
+
+    /// PIL-47c: replace the cache with a freshly-built map. Holds the
+    /// write lock only for the swap.
+    async fn refresh_model_cache(
+        &self,
+        name_to_hash: std::collections::HashMap<String, H256>,
+    ) {
+        let mut guard = MODEL_NAME_CACHE.write().await;
+        *guard = Some((std::time::Instant::now(), name_to_hash));
+    }
+
     async fn eth_call(&self, to: &str, data: &[u8]) -> Result<Vec<u8>, GatewayError> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -177,20 +215,71 @@ impl HttpChainQueries {
 #[async_trait]
 impl ChainQueries for HttpChainQueries {
     async fn resolve_model_name(&self, name: &str) -> Result<H256, GatewayError> {
-        // v1: only pinned hash form — `0x` + 64 hex chars.
+        // Fast path: the caller already pinned the hash. `0x` + 64 hex chars.
         let stripped = name.strip_prefix("0x").unwrap_or(name);
-        if stripped.len() != 64 {
-            return Err(GatewayError::UnknownModel(format!(
-                "{} (v1 requires pinned hex hash; bare names not yet supported)",
-                name
-            )));
+        if stripped.len() == 64 {
+            if let Ok(bytes) = hex::decode(stripped) {
+                if bytes.len() == 32 {
+                    return Ok(H256::from_slice(&bytes));
+                }
+            }
+            // Fell through — looked hashy but didn't decode. Treat as a
+            // friendly name and fall through to the ModelRegistry lookup.
         }
-        let bytes = hex::decode(stripped)
-            .map_err(|_| GatewayError::UnknownModel(name.to_string()))?;
-        if bytes.len() != 32 {
-            return Err(GatewayError::UnknownModel(name.to_string()));
+
+        // PIL-47c: bare name path. The on-chain `modelHash` is
+        // `keccak256(abi.encodePacked(msg.sender, name, block.timestamp,
+        // totalModels))` — not derivable from the name alone. Enumerate
+        // the registry instead: `getAllModelHashes()` returns every
+        // registered hash, then for each we `getModel(hash)` and match
+        // the `name` field.
+        //
+        // Cached on the gateway side via [`MODEL_NAME_CACHE`] so we don't
+        // hammer the chain RPC on every chat request; cache TTL is
+        // `MODEL_CACHE_TTL` (30 s).
+        if let Some(h) = self.cached_model_hash(name).await {
+            return Ok(h);
         }
-        Ok(H256::from_slice(&bytes))
+
+        // Cache miss or expired — repopulate.
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&selector("getAllModelHashes()"));
+        let result = self
+            .eth_call(&self.contracts.model_registry, &data)
+            .await
+            .map_err(|e| GatewayError::UnknownModel(format!("{} ({})", name, e)))?;
+        let hashes = decode_bytes32_array(&result)?;
+
+        let mut name_to_hash: std::collections::HashMap<String, H256> =
+            std::collections::HashMap::with_capacity(hashes.len());
+        for h in hashes {
+            // getModel(bytes32) returns (address, string name, string framework,
+            // string version, string ipfsCID, uint256 inferencePrice,
+            // uint256 totalInferences, bool isActive). The `name` field sits
+            // at word 1's offset in the return tuple.
+            let mut data = Vec::with_capacity(36);
+            data.extend_from_slice(&selector("getModel(bytes32)"));
+            data.extend_from_slice(h.as_bytes());
+            let result = match self
+                .eth_call(&self.contracts.model_registry, &data)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => continue, // skip; one bad model shouldn't break lookup
+            };
+            if let Ok(model_name) = decode_string_at_offset_word(&result, 1) {
+                // Empty name = uninitialized slot (model deleted / never set).
+                if !model_name.is_empty() {
+                    name_to_hash.insert(model_name, h);
+                }
+            }
+        }
+
+        self.refresh_model_cache(name_to_hash.clone()).await;
+        name_to_hash
+            .get(name)
+            .copied()
+            .ok_or_else(|| GatewayError::UnknownModel(name.to_string()))
     }
 
     async fn estimate_cost(
@@ -307,6 +396,94 @@ fn decode_address_array(bytes: &[u8]) -> Result<Vec<H160>, GatewayError> {
         out.push(H160::from_slice(&word[12..32]));
     }
     Ok(out)
+}
+
+/// PIL-47c: ABI-decode a `bytes32[]` return tuple. Layout:
+/// `[offset_word=0x20, length, b0, b1, ...]` (each 32 bytes).
+fn decode_bytes32_array(bytes: &[u8]) -> Result<Vec<H256>, GatewayError> {
+    if bytes.len() < 64 {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "bytes32[] return too short: {} bytes",
+            bytes.len()
+        )));
+    }
+    let len = U256::from_big_endian(&bytes[32..64]).as_usize();
+    let expected = 64 + len * 32;
+    if bytes.len() < expected {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "bytes32[] truncated: said len={} need {} have {}",
+            len,
+            expected,
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let start = 64 + i * 32;
+        out.push(H256::from_slice(&bytes[start..start + 32]));
+    }
+    Ok(out)
+}
+
+/// PIL-47c: ABI-decode the dynamic `string` sitting at the `word_idx`-th
+/// word of a returndata tuple. The word at `word_idx * 32` contains the
+/// *offset* (relative to the start of returndata) to the string's
+/// length-prefixed payload.
+///
+/// Used to pull the `name` field out of `ModelRegistry.getModel(...)`'s
+/// 8-tuple return without decoding the whole struct.
+fn decode_string_at_offset_word(bytes: &[u8], word_idx: usize) -> Result<String, GatewayError> {
+    let off_start = word_idx * 32;
+    if bytes.len() < off_start + 32 {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "string-at-word: offset word {} out of range ({} bytes)",
+            word_idx,
+            bytes.len()
+        )));
+    }
+    // Guard against giant offsets: U256::as_usize() panics on overflow,
+    // so route through a bounded conversion.
+    let offset_u256 = U256::from_big_endian(&bytes[off_start..off_start + 32]);
+    let offset = usize::try_from(offset_u256.low_u128()).ok().and_then(|v| {
+        // Reject anything that doesn't fit in the low 64 bits — no
+        // ABI string offset will exceed the buffer length anyway.
+        if offset_u256 > U256::from(u64::MAX) {
+            None
+        } else {
+            Some(v)
+        }
+    }).ok_or_else(|| {
+        GatewayError::ChainUnavailable(format!(
+            "string-at-word: offset overflows usize at word {}",
+            word_idx
+        ))
+    })?;
+    if bytes.len() < offset.saturating_add(32) || bytes.len() < offset + 32 {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "string-at-word: length at {} out of range ({} bytes)",
+            offset,
+            bytes.len()
+        )));
+    }
+    let len_u256 = U256::from_big_endian(&bytes[offset..offset + 32]);
+    let len = if len_u256 > U256::from(u32::MAX) {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "string-at-word: declared length too large ({:?})",
+            len_u256
+        )));
+    } else {
+        len_u256.as_u64() as usize
+    };
+    if bytes.len() < offset + 32 + len {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "string-at-word: declared {} bytes at offset {}, have {}",
+            len,
+            offset + 32,
+            bytes.len()
+        )));
+    }
+    String::from_utf8(bytes[offset + 32..offset + 32 + len].to_vec())
+        .map_err(|e| GatewayError::ChainUnavailable(format!("non-utf8 string: {}", e)))
 }
 
 /// Intermediate decode struct for `getProviderInfo` return.
@@ -473,6 +650,69 @@ mod tests {
         buf[31] = 0x20;
         buf[63] = 2;
         let err = decode_address_array(&buf).expect_err("should fail");
+        assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    /// PIL-47c: `bytes32[]` is one tighter than `address[]` (no
+    /// padding within each element). Round-trip a 3-element array.
+    #[test]
+    fn decode_bytes32_array_three_hashes() {
+        let mut buf = vec![0u8; 32 + 32 + 3 * 32];
+        buf[31] = 0x20; // offset
+        buf[63] = 3; // length
+        buf[64..96].copy_from_slice(&[0xaa; 32]);
+        buf[96..128].copy_from_slice(&[0xbb; 32]);
+        buf[128..160].copy_from_slice(&[0xcc; 32]);
+        let hashes = decode_bytes32_array(&buf).expect("decode");
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes[0], H256::from([0xaa; 32]));
+        assert_eq!(hashes[2], H256::from([0xcc; 32]));
+    }
+
+    #[test]
+    fn decode_bytes32_array_rejects_truncated() {
+        // length says 2 but we only have 1 element
+        let mut buf = vec![0u8; 96];
+        buf[31] = 0x20;
+        buf[63] = 2;
+        let err = decode_bytes32_array(&buf).expect_err("should fail");
+        assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    /// PIL-47c: pull the `name` string out of a fake `getModel(bytes32)`
+    /// return tuple where word 1 points at the name's payload.
+    #[test]
+    fn decode_string_at_offset_word_extracts_name() {
+        // Pretend layout: word 0 = address, word 1 = offset to name,
+        // word 2..N = other static fields filled with zeros, then name.
+        // Static head = 8 words (address + 4 string-offsets + 3 statics
+        // = 8 × 32 = 256 bytes). Name string offset = 0x100 (256).
+        let name = "gemma-4-E4B-it-Q4_K_M";
+        let mut buf = vec![0u8; 256];
+        // word 1: offset to name = 256 (0x100)
+        buf[32 + 30] = 0x01;
+        buf[32 + 31] = 0x00;
+        // length-prefixed name at offset 256
+        let mut len_word = [0u8; 32];
+        len_word[31] = name.len() as u8;
+        buf.extend_from_slice(&len_word);
+        // Pad name to multiple of 32 bytes
+        let mut name_bytes = name.as_bytes().to_vec();
+        while name_bytes.len() % 32 != 0 {
+            name_bytes.push(0);
+        }
+        buf.extend_from_slice(&name_bytes);
+
+        let decoded = decode_string_at_offset_word(&buf, 1).expect("decode");
+        assert_eq!(decoded, name);
+    }
+
+    #[test]
+    fn decode_string_at_offset_word_rejects_out_of_range_offset() {
+        // Offset word points way past the buffer.
+        let mut buf = vec![0u8; 64];
+        buf[32..64].copy_from_slice(&[0xff; 32]);
+        let err = decode_string_at_offset_word(&buf, 1).expect_err("should fail");
         assert!(matches!(err, GatewayError::ChainUnavailable(_)));
     }
 
