@@ -44,7 +44,9 @@ impl Default for ContractAddresses {
         // any other chain.
         Self {
             model_registry: "0x077fbc3338a9e6bad90a3a041e6b7425689754ef".to_string(),
-            pricing_oracle: "0x46773aeca885be65cd313b7d9bce9625767d40b5".to_string(),
+            // FIX: 0x46773…d40b5 is the HeartbeatMonitor, not the oracle.
+            // ComputePricingOracle is 0xa1eed6…f4647 per DEPLOYED_ADDRESSES.md.
+            pricing_oracle: "0xa1eed6ae021504e2a1e310e6c0f7c1a0c5bf4647".to_string(),
             inference_router: "0xad7c3135c1b9b3189208fd617b6b058c1c0469f3".to_string(),
         }
     }
