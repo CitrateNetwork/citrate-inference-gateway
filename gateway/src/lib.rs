@@ -26,10 +26,22 @@
 use std::sync::Arc;
 
 use axum::{routing::{get, post}, Router};
-use axum::http::header;
+use axum::http::{header, Method};
 use ethereum_types::H160;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
+
+/// Permissive CORS for the public gateway so browser SPAs (e.g. the
+/// buyer webapp) can call /v1/* cross-origin. Allows any origin, the
+/// REST methods we serve, and any request header (covers the x402
+/// `x-payment` header). No credentials are used, so `Any` is safe.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+}
 
 /// RM-G2.3 / audit F-3: every request flowing through the gateway
 /// runs `Authorization: Bearer ...` through this redaction layer
@@ -119,6 +131,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
             .route("/v1/batch/:id/output", get(batch::get_batch_output_handler));
     }
     router
+        .layer(cors_layer())
         .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -185,6 +198,7 @@ pub async fn build_router_with(
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
+        .layer(cors_layer())
         .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
 }
@@ -259,6 +273,7 @@ pub async fn build_router_with_auth(
         .with_state(state)
         .merge(paid_router)
         .merge(free_batch_reads)
+        .layer(cors_layer())
         .layer(redact_authorization())
         .layer(TraceLayer::new_for_http())
 }
