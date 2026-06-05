@@ -25,6 +25,7 @@
 //! Specs: `citrate_v0.01.1/specs/gherkin/gateway_api_key.feature`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -33,11 +34,15 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use ethereum_types::{H160, U256};
 use http_body_util::BodyExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
+
+mod keystore;
+pub use keystore::KeystoreError;
+use keystore::RocksKeystore;
 
 use x402_axum::{PricingStrategy, X402Paid};
 
@@ -69,7 +74,7 @@ fn hash_key_id(key_id: &str) -> String {
 ///             same number of "units"), which is fine for tests but
 ///             not production-correct. Slice 2 wires an OracleAdapter
 ///             that converts via `saltPerPflopHour`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum KeyBacking {
     /// Default — wSALT-equivalent grains.
     #[default]
@@ -79,7 +84,7 @@ pub enum KeyBacking {
 }
 
 /// One API key's mutable state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
     /// Stable, opaque, operator-assigned label (`"pilot"`, `"ci"`).
     pub label: String,
@@ -110,16 +115,42 @@ pub struct ApiKeyCharge {
     pub amount_grains: U256,
 }
 
-/// In-memory store of API keys. Wrapped in `Arc`.
+/// Store of API keys. Wrapped in `Arc`.
+///
+/// `inner` is always the authoritative in-memory mirror (keyed by
+/// `sha256(key_id)` — audit F-3). When `backend` is `Some`, every
+/// mutation (create / debit / refund / revoke) is *also* written
+/// through to a persistent RocksDB column family **while the `inner`
+/// write lock is held**, so the on-disk WAL and the in-memory mirror
+/// can never diverge and a committed debit is durable exactly once
+/// (INFER WP-B). When `backend` is `None` the store is pure in-memory
+/// — the slice-1 behaviour used by tests and dev.
 #[derive(Default, Debug)]
 pub struct ApiKeyStore {
     inner: RwLock<HashMap<String, ApiKeyRecord>>,
+    backend: Option<RocksKeystore>,
 }
 
 impl ApiKeyStore {
-    /// Empty store.
+    /// Empty in-memory store. No persistence — used by tests / dev and
+    /// by callers that select the in-memory backend explicitly.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open (or create) a RocksDB-backed store at `path` and load all
+    /// previously persisted records into the in-memory mirror (INFER
+    /// WP-B). The directory is created with `0700` perms and the DB
+    /// files locked down to `0600` so a snapshot leak can't be read by
+    /// other local users. Records are keyed by `sha256(key_id)`; no
+    /// plaintext token is ever written to disk.
+    pub fn open_rocksdb(path: impl AsRef<Path>) -> Result<Self, KeystoreError> {
+        let backend = RocksKeystore::open(path.as_ref())?;
+        let loaded = backend.load_all()?;
+        Ok(Self {
+            inner: RwLock::new(loaded),
+            backend: Some(backend),
+        })
     }
 
     /// Read a key's current record. The argument is the bearer
@@ -130,10 +161,27 @@ impl ApiKeyStore {
         self.inner.read().await.get(&h).cloned()
     }
 
+    /// Insert a freshly minted record (already keyed by `sha256(id)`).
+    /// Persists through to RocksDB atomically when a backend is set.
+    async fn insert_hashed(&self, key_hash: String, record: ApiKeyRecord) {
+        let mut guard = self.inner.write().await;
+        if let Some(backend) = &self.backend {
+            // Persist FIRST while holding the lock: if the WAL write
+            // fails we leave the mirror untouched and surface nothing
+            // worse than a lost create (the holder never sees the key).
+            if let Err(err) = backend.put(&key_hash, &record) {
+                tracing::error!(error = ?err, "api key create persist failed; key not durable");
+                return;
+            }
+        }
+        guard.insert(key_hash, record);
+    }
+
     /// Try to debit `amount` from `key_id`. Returns the new balance
     /// on success, or `None` if the key is missing / revoked /
     /// insufficient. Atomic w.r.t. concurrent callers — holds the
-    /// write lock through the check-and-deduct.
+    /// write lock through the check-deduct-and-persist, so a committed
+    /// debit lands in the WAL exactly once.
     pub async fn debit(&self, key_id: &str, amount: U256) -> Result<U256, DebitError> {
         let h = hash_key_id(key_id);
         let mut guard = self.inner.write().await;
@@ -145,7 +193,19 @@ impl ApiKeyStore {
             return Err(DebitError::Insufficient(record.balance_grains));
         }
         record.balance_grains -= amount;
-        Ok(record.balance_grains)
+        let new_balance = record.balance_grains;
+        if let Some(backend) = &self.backend {
+            let snapshot = record.clone();
+            if let Err(err) = backend.put(&h, &snapshot) {
+                // Roll the mirror back so memory and disk stay in lock-
+                // step; report the debit as failed rather than charge a
+                // buyer for a debit we couldn't make durable.
+                record.balance_grains = record.balance_grains.saturating_add(amount);
+                tracing::error!(error = ?err, "api key debit persist failed; rolled back");
+                return Err(DebitError::Persist);
+            }
+        }
+        Ok(new_balance)
     }
 
     /// Credit a key after a downstream rejection, over-estimate adjustment, or
@@ -156,7 +216,16 @@ impl ApiKeyStore {
         let mut guard = self.inner.write().await;
         let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
         record.balance_grains = record.balance_grains.saturating_add(amount);
-        Ok(record.balance_grains)
+        let new_balance = record.balance_grains;
+        if let Some(backend) = &self.backend {
+            let snapshot = record.clone();
+            if let Err(err) = backend.put(&h, &snapshot) {
+                record.balance_grains = record.balance_grains.saturating_sub(amount);
+                tracing::error!(error = ?err, "api key refund persist failed; rolled back");
+                return Err(DebitError::Persist);
+            }
+        }
+        Ok(new_balance)
     }
 
     /// Revoke a key. Returns `Err(Unknown)` if no such key.
@@ -165,6 +234,14 @@ impl ApiKeyStore {
         let mut guard = self.inner.write().await;
         let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
         record.revoked = true;
+        if let Some(backend) = &self.backend {
+            let snapshot = record.clone();
+            if let Err(err) = backend.put(&h, &snapshot) {
+                record.revoked = false;
+                tracing::error!(error = ?err, "api key revoke persist failed; rolled back");
+                return Err(DebitError::Persist);
+            }
+        }
         Ok(())
     }
 }
@@ -178,6 +255,11 @@ pub enum DebitError {
     Revoked,
     /// Current balance in grains was less than the requested amount.
     Insufficient(U256),
+    /// The mutation could not be made durable in the persistent
+    /// keystore (WP-B). The in-memory mirror was rolled back so it
+    /// stays consistent with disk; the caller must treat the operation
+    /// as not having happened.
+    Persist,
 }
 
 /// Admin: mint a new SALT-backed API key.
@@ -238,7 +320,7 @@ pub async fn create_key_with_backing(
             .map(|d| d.as_secs())
             .unwrap_or(0),
     };
-    store.inner.write().await.insert(key_hash, record);
+    store.insert_hashed(key_hash, record).await;
     key_id
 }
 
@@ -433,7 +515,10 @@ async fn settle_api_key_response(
     resp
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+/// Extract the `cgk_` token from a `Authorization: Bearer <token>`
+/// header. `pub(crate)` so the local-proxy wall (WP-A) reuses the exact
+/// same parse the x402 `ApiKeyLayer` uses.
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

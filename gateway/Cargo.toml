@@ -105,6 +105,13 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = { workspace = true }
 
+# INFER WP-B: persistent RocksDB-backed ApiKeyStore. Backend selected at
+# runtime by CITRATE_GATEWAY_KEYSTORE_PATH (set → RocksDB, unset → in-memory
+# for tests/dev). snappy-only build (see workspace dep note).
+rocksdb = { workspace = true }
+# WP-B: deterministic record (de)serialization for the keystore CF.
+bincode = { workspace = true }
+
 # Local config helper
 toml = "0.8"
 async-trait = { workspace = true }
@@ -120,3 +127,8 @@ once_cell = "1.19"
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# INFER WP-B: scratch dir for the RocksDB persistence/atomicity tests.
+tempfile = "3"
+# INFER WP-A: the mock upstream SSE server streams chunks to assert the
+# proxy preserves streaming end-to-end.
+futures-util = "0.3"

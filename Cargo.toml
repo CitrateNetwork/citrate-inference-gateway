@@ -59,7 +59,12 @@ libp2p = "0.54"
 quinn = "0.11"
 
 # Storage
-rocksdb = "0.22"
+# INFER WP-B: persistent API-key keystore. Default features pull
+# lz4/zstd/zlib/bzip2 compression -sys crates; the keystore stores a
+# handful of small CF records, so we drop to `snappy` only (vendored in
+# librocksdb-sys) to keep the C build footprint minimal and the offline
+# build self-contained.
+rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
 sled = "0.34"
 
 # Time

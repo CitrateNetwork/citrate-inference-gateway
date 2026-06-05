@@ -50,7 +50,7 @@ fn cors_layer() -> CorsLayer {
 /// captured the raw header into the request span; a routed log
 /// drain or a stuck debug build dumping spans was a free credential
 /// leak.
-fn redact_authorization() -> SetSensitiveRequestHeadersLayer {
+pub(crate) fn redact_authorization() -> SetSensitiveRequestHeadersLayer {
     SetSensitiveRequestHeadersLayer::new([header::AUTHORIZATION])
 }
 
@@ -65,12 +65,14 @@ pub mod models;
 pub mod openai;
 pub mod pricing;
 pub mod provider;
+pub mod proxy;
 pub mod queries;
 pub mod selection;
 pub mod usage;
 
 pub use config::GatewayConfig;
 pub use error::GatewayError;
+pub use proxy::build_local_proxy_router;
 pub use provider::{ProviderProtocolRequest, ProviderProtocolResponse};
 pub use queries::{ChainQueries, HttpChainQueries, PoolEntry, ProviderInfo};
 
