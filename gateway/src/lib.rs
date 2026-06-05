@@ -60,6 +60,8 @@ pub mod chat;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod keystore;
+pub mod local_proxy;
 pub mod metrics;
 pub mod models;
 pub mod openai;

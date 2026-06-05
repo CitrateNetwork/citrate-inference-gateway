@@ -1,0 +1,65 @@
+# WP-6 of 2026-06-04 planset — Caddyfile block for infer.citrate.ai.
+#
+# Drop-in replacement for the existing block (which currently load-balances
+# DGX primary / CPU fallback directly to llama-server with NO auth). After
+# this change:
+#
+#   /healthz       — Caddy-handled (200 "ok"); unchanged.
+#   /provider/*    — on-chain marketplace provider-protocol shim on :9000;
+#                    unauth'd by design (callers are the on-chain
+#                    InferenceRouter); unchanged.
+#   /v1/*          — NEW: routed through the local-proxy gateway on
+#                    :9800 which enforces cgk_ API-key auth + quota.
+#                    Multi-upstream failover (DGX→CPU) lives inside the
+#                    gateway now, so Caddy points at a single upstream.
+#
+# Caddy keeps owning TLS for infer.citrate.ai.
+
+https://infer.citrate.ai {
+	encode gzip
+
+	@health path /healthz
+	respond @health "ok" 200
+
+	# Provider-protocol shim for the on-chain marketplace gateway path.
+	# Unchanged from pre-cutover: shim listens on 127.0.0.1:9000 and
+	# adapts ProviderProtocolRequest → OpenAI on the DGX upstream.
+	@provider path /provider/*
+	reverse_proxy @provider 127.0.0.1:9000 {
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+			dial_timeout 10s
+			keepalive 5m
+		}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+
+	# OpenAI surface — gated by the local-proxy gateway.
+	# The gateway enforces cgk_ Bearer auth + per-key rate-limit + daily
+	# quota, then forwards to whichever upstream is healthy (DGX over
+	# Tailscale primary, CPU fallback) per its
+	# CITRATE_GATEWAY_UPSTREAM_URL list.
+	reverse_proxy 127.0.0.1:9800 {
+		# CRITICAL: forward Authorization. Caddy does this by default;
+		# being explicit so a future Caddyfile edit can't quietly
+		# strip the bearer.
+		header_up Authorization {http.request.header.Authorization}
+
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto https
+		header_up Host {host}
+
+		transport http {
+			# Long-tail SSE generation (chatbot's 300s maxDuration).
+			read_timeout 300s
+			write_timeout 300s
+			dial_timeout 5s
+			keepalive 5m
+		}
+
+		# Flush SSE chunks immediately — no buffering.
+		flush_interval -1
+	}
+}
