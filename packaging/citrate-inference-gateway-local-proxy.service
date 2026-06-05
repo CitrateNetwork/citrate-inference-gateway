@@ -1,0 +1,52 @@
+[Unit]
+# WP-6 of 2026-06-04 planset — local-proxy systemd unit.
+#
+# Distinct from citrate-inference-gateway.service (which keeps serving
+# gateway.citrate.ai in marketplace mode on 127.0.0.1:8082). This unit
+# runs the same binary in CITRATE_GATEWAY_MODE=local-proxy on
+# 127.0.0.1:9800 and fronts infer.citrate.ai through Caddy.
+Description=Citrate Inference Gateway — local-proxy mode (infer.citrate.ai)
+Documentation=https://github.com/CitrateNetwork/citrate-inference-gateway
+Wants=network-online.target
+After=network-online.target citrate-llama.service
+# Don't pin Requires=citrate-llama — health/probe must stay up even if
+# llama-server is restarting; the gateway returns 502 in that window
+# rather than getting taken out of rotation. Same for the DGX upstream
+# over Tailscale.
+
+[Service]
+Type=simple
+User=citrate
+Group=citrate
+
+# Drop privileges + sandbox the process. RocksDB only needs read/write
+# under /var/lib/citrate-gateway.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/citrate-gateway
+
+# Mode selector.
+Environment=CITRATE_GATEWAY_MODE=local-proxy
+# Comma-separated, tried in order (matches the existing Caddy LB shape
+# for infer.citrate.ai: DGX over Tailscale primary, droplet CPU fallback).
+Environment=CITRATE_GATEWAY_UPSTREAM_URL=http://100.68.173.64:8181,http://127.0.0.1:8181
+Environment=CITRATE_GATEWAY_KEYSTORE_PATH=/var/lib/citrate-gateway/keystore
+# Loopback only — Caddy terminates TLS publicly and forwards over loopback.
+Environment=CITRATE_GATEWAY_LISTEN_ADDR=127.0.0.1:9800
+Environment=LOG_FORMAT=json
+Environment=RUST_LOG=info,citrate_gateway=info
+
+ExecStart=/usr/local/bin/citrate-inference-gateway
+
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
