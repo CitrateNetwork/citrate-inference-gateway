@@ -78,6 +78,24 @@ pub enum KeyBacking {
     Credits,
 }
 
+impl KeyBacking {
+    /// Persisted discriminant for the durable [`crate::keystore::BalanceRecord`].
+    fn as_u8(self) -> u8 {
+        match self {
+            KeyBacking::Salt => 0,
+            KeyBacking::Credits => 1,
+        }
+    }
+
+    /// Inverse of [`KeyBacking::as_u8`]; unknown values default to `Salt`.
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => KeyBacking::Credits,
+            _ => KeyBacking::Salt,
+        }
+    }
+}
+
 /// One API key's mutable state.
 #[derive(Debug, Clone)]
 pub struct ApiKeyRecord {
@@ -110,62 +128,169 @@ pub struct ApiKeyCharge {
     pub amount_grains: U256,
 }
 
-/// In-memory store of API keys. Wrapped in `Arc`.
-#[derive(Default, Debug)]
+/// Store of API keys. Wrapped in `Arc`.
+///
+/// `Memory` is the in-process map (unit/integration tests + the test/injection
+/// boot paths). `Persistent` is the RocksDB-backed, crash-atomic store used in
+/// production marketplace mode (INFER-S4 / WP-F, TD-22): balances survive a
+/// restart and debit/refund apply exactly once. The async API is identical
+/// across both backends, so the audited x402 / `ApiKeyLayer` path never has to
+/// know which one it's talking to.
 pub struct ApiKeyStore {
-    inner: RwLock<HashMap<String, ApiKeyRecord>>,
+    backend: Backend,
+}
+
+enum Backend {
+    Memory(RwLock<HashMap<String, ApiKeyRecord>>),
+    Persistent(Arc<crate::keystore::PersistentKeyStore>),
+}
+
+impl std::fmt::Debug for ApiKeyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.backend {
+            Backend::Memory(_) => "memory",
+            Backend::Persistent(_) => "persistent",
+        };
+        f.debug_struct("ApiKeyStore").field("backend", &kind).finish()
+    }
+}
+
+impl Default for ApiKeyStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ApiKeyStore {
-    /// Empty store.
+    /// In-memory store (tests + the test/injection boot path).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            backend: Backend::Memory(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Durable, RocksDB-backed store at `path` (production marketplace boot).
+    /// Balances and revocations survive a restart; debit/refund are
+    /// crash-atomic (WP-F).
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, crate::keystore::StoreError> {
+        Ok(Self {
+            backend: Backend::Persistent(crate::keystore::PersistentKeyStore::open(path)?),
+        })
     }
 
     /// Read a key's current record. The argument is the bearer
     /// token the caller supplied; the store hashes it before
     /// looking up (audit F-3).
     pub async fn get(&self, key_id: &str) -> Option<ApiKeyRecord> {
-        let h = hash_key_id(key_id);
-        self.inner.read().await.get(&h).cloned()
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                m.read().await.get(&h).cloned()
+            }
+            Backend::Persistent(p) => {
+                p.get_balance_record(key_id).ok().flatten().map(record_from_balance)
+            }
+        }
     }
 
     /// Try to debit `amount` from `key_id`. Returns the new balance
-    /// on success, or `None` if the key is missing / revoked /
-    /// insufficient. Atomic w.r.t. concurrent callers — holds the
-    /// write lock through the check-and-deduct.
+    /// on success. Atomic w.r.t. concurrent callers — holds the
+    /// write lock (Memory) or per-key lock + synced commit (Persistent)
+    /// through the check-and-deduct.
     pub async fn debit(&self, key_id: &str, amount: U256) -> Result<U256, DebitError> {
-        let h = hash_key_id(key_id);
-        let mut guard = self.inner.write().await;
-        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
-        if record.revoked {
-            return Err(DebitError::Revoked);
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
+                if record.revoked {
+                    return Err(DebitError::Revoked);
+                }
+                if record.balance_grains < amount {
+                    return Err(DebitError::Insufficient(record.balance_grains));
+                }
+                record.balance_grains -= amount;
+                Ok(record.balance_grains)
+            }
+            Backend::Persistent(p) => p.debit_balance(key_id, amount).map_err(DebitError::from_balance),
         }
-        if record.balance_grains < amount {
-            return Err(DebitError::Insufficient(record.balance_grains));
-        }
-        record.balance_grains -= amount;
-        Ok(record.balance_grains)
     }
 
     /// Credit a key after a downstream rejection, over-estimate adjustment, or
     /// batch slot failure. Refunds intentionally bypass `revoked`; revocation
     /// stops future spending but must not trap already-debited buyer funds.
     pub async fn refund(&self, key_id: &str, amount: U256) -> Result<U256, DebitError> {
-        let h = hash_key_id(key_id);
-        let mut guard = self.inner.write().await;
-        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
-        record.balance_grains = record.balance_grains.saturating_add(amount);
-        Ok(record.balance_grains)
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
+                record.balance_grains = record.balance_grains.saturating_add(amount);
+                Ok(record.balance_grains)
+            }
+            Backend::Persistent(p) => p.refund_balance(key_id, amount).map_err(DebitError::from_balance),
+        }
     }
 
     /// Revoke a key. Returns `Err(Unknown)` if no such key.
     pub async fn revoke(&self, key_id: &str) -> Result<(), DebitError> {
-        let h = hash_key_id(key_id);
-        let mut guard = self.inner.write().await;
-        let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
-        record.revoked = true;
-        Ok(())
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
+                record.revoked = true;
+                Ok(())
+            }
+            Backend::Persistent(p) => p.revoke(key_id).map_err(|_| DebitError::Unknown),
+        }
+    }
+
+    /// Mint and insert a fresh record, returning the plaintext `cgk_` token.
+    /// Backend-agnostic home for [`create_key_with_backing`].
+    async fn insert(&self, label: String, balance: U256, deposit: H160, backing: KeyBacking) -> String {
+        match &self.backend {
+            Backend::Memory(m) => {
+                let key_id = format!("cgk_{}", Uuid::new_v4().simple());
+                let record = ApiKeyRecord {
+                    label,
+                    balance_grains: balance,
+                    deposit_address: deposit,
+                    revoked: false,
+                    backing,
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                };
+                m.write().await.insert(hash_key_id(&key_id), record);
+                key_id
+            }
+            Backend::Persistent(p) => p
+                .create_balance_key(label, balance, deposit, backing.as_u8())
+                .expect("persistent keystore create_balance_key"),
+        }
+    }
+
+    /// Test-only: does the in-memory backend hold this map key?
+    #[cfg(test)]
+    async fn memory_contains_key(&self, map_key: &str) -> bool {
+        match &self.backend {
+            Backend::Memory(m) => m.read().await.contains_key(map_key),
+            Backend::Persistent(_) => false,
+        }
+    }
+}
+
+/// Build an [`ApiKeyRecord`] view from a persisted [`crate::keystore::BalanceRecord`].
+fn record_from_balance(br: crate::keystore::BalanceRecord) -> ApiKeyRecord {
+    ApiKeyRecord {
+        label: br.label,
+        balance_grains: U256::from_big_endian(&br.balance_be),
+        deposit_address: H160(br.deposit_address),
+        revoked: br.revoked,
+        backing: KeyBacking::from_u8(br.backing),
+        created_at: br.created_at,
     }
 }
 
@@ -178,6 +303,22 @@ pub enum DebitError {
     Revoked,
     /// Current balance in grains was less than the requested amount.
     Insufficient(U256),
+}
+
+impl DebitError {
+    /// Map a durable-store [`crate::keystore::BalanceError`] onto the layer's
+    /// `DebitError`. A transient store/encode error maps to `Unknown` — the
+    /// `ApiKeyLayer` treats that as "couldn't debit" and falls through to the
+    /// x402 challenge, so no buyer is charged on a backend hiccup.
+    fn from_balance(e: crate::keystore::BalanceError) -> Self {
+        use crate::keystore::BalanceError;
+        match e {
+            BalanceError::Unknown => DebitError::Unknown,
+            BalanceError::Revoked => DebitError::Revoked,
+            BalanceError::Insufficient(bal) => DebitError::Insufficient(bal),
+            BalanceError::Store(_) | BalanceError::Encode(_) => DebitError::Unknown,
+        }
+    }
 }
 
 /// Admin: mint a new SALT-backed API key.
@@ -225,21 +366,9 @@ pub async fn create_key_with_backing(
     // UUID prefixed with `cgk_`); the store keys by `sha256(key_id)`
     // so the underlying map never holds material an attacker could
     // replay.
-    let key_id = format!("cgk_{}", Uuid::new_v4().simple());
-    let key_hash = hash_key_id(&key_id);
-    let record = ApiKeyRecord {
-        label: label.into(),
-        balance_grains: initial_balance,
-        deposit_address,
-        revoked: false,
-        backing,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
-    store.inner.write().await.insert(key_hash, record);
-    key_id
+    store
+        .insert(label.into(), initial_balance, deposit_address, backing)
+        .await
 }
 
 // ── Layer ───────────────────────────────────────────────────────
@@ -585,16 +714,15 @@ mod tests {
     async fn store_holds_hashed_key_not_plaintext() {
         let store = ApiKeyStore::new();
         let id = create_key(&store, "f3", U256::from(1u64), H160::zero()).await;
-        let inner = store.inner.read().await;
         // The map MUST NOT contain the plaintext id.
         assert!(
-            !inner.contains_key(&id),
+            !store.memory_contains_key(&id).await,
             "storage must not key by plaintext id (audit F-3)"
         );
         // The map MUST contain the sha256 hash.
         let h = hash_key_id(&id);
         assert!(
-            inner.contains_key(&h),
+            store.memory_contains_key(&h).await,
             "storage must key by sha256(id) (audit F-3)"
         );
         // sha256 hex is 64 chars.

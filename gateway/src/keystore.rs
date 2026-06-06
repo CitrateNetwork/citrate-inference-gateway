@@ -23,8 +23,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{Datelike, NaiveTime, Utc};
+use ethereum_types::{H160, U256};
 use parking_lot::Mutex;
-use rocksdb::{Options, DB};
+use rocksdb::{Options, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -50,6 +51,49 @@ pub struct KeyRecord {
     pub quota_rps: u32,
     /// Max requests per UTC day for this key. `0` disables the quota.
     pub daily_quota: u64,
+}
+
+/// One balance-bearing API key's durable state (INFER-S4 / WP-F).
+///
+/// Stored under the `bal:<sha256_hex>` namespace, **additive** to the
+/// `record:`/`quota:` schema so existing local-proxy DBs deserialize
+/// unchanged (bincode is positional — folding new fields into [`KeyRecord`]
+/// would break already-deployed records). This is the converged home for the
+/// marketplace money store (TD-22 / TD-23): one durable store, balance in it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BalanceRecord {
+    /// Operator-supplied label.
+    pub label: String,
+    /// Unix seconds at mint.
+    pub created_at: u64,
+    /// `true` once revoked. Revoked keys cannot spend, but can still be refunded.
+    pub revoked: bool,
+    /// `KeyBacking` discriminant: 0 = Salt, 1 = Credits (mirrors `auth::KeyBacking`).
+    pub backing: u8,
+    /// Deposit EOA (20 bytes); zero for keys without an allocated top-up address.
+    pub deposit_address: [u8; 20],
+    /// Current balance in grains, big-endian 32 bytes.
+    pub balance_be: [u8; 32],
+}
+
+/// Why a durable balance operation failed (INFER-S4 / WP-F).
+#[derive(Debug, thiserror::Error)]
+pub enum BalanceError {
+    /// No balance record for this bearer.
+    #[error("unknown key")]
+    Unknown,
+    /// Key is revoked — spending is blocked (refunds are still allowed).
+    #[error("api key revoked")]
+    Revoked,
+    /// Balance was less than the requested debit; carries the current balance.
+    #[error("insufficient balance")]
+    Insufficient(U256),
+    /// Underlying RocksDB error.
+    #[error("keystore unavailable: {0}")]
+    Store(#[from] rocksdb::Error),
+    /// bincode round-trip failure.
+    #[error("encode: {0}")]
+    Encode(String),
 }
 
 /// Result of [`PersistentKeyStore::try_consume`] on success — what the
@@ -105,6 +149,10 @@ pub enum StoreError {
 pub struct PersistentKeyStore {
     db: DB,
     rate: Mutex<HashMap<String, RateWindow>>,
+    /// Per-key serialization for the balance read-modify-write (WP-F). A debit
+    /// must read, check, deduct, and durably commit as one critical section so
+    /// concurrent debits cannot lose an update or overspend.
+    bal_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -126,7 +174,111 @@ impl PersistentKeyStore {
         Ok(Arc::new(Self {
             db,
             rate: Mutex::new(HashMap::new()),
+            bal_locks: Mutex::new(HashMap::new()),
         }))
+    }
+
+    // ── Durable balances (INFER-S4 / WP-F) ──────────────────────────
+
+    /// Mint a fresh `cgk_<uuid>` balance key. Returns the plaintext token —
+    /// print once and discard (not recoverable). The plaintext bearer is never
+    /// persisted; the record is keyed by `sha256(bearer)`.
+    pub fn create_balance_key(
+        &self,
+        label: impl Into<String>,
+        balance: U256,
+        deposit_address: H160,
+        backing: u8,
+    ) -> Result<String, StoreError> {
+        let id = format!("cgk_{}", Uuid::new_v4().simple());
+        let h = hash_key_id(&id);
+        let mut balance_be = [0u8; 32];
+        balance.to_big_endian(&mut balance_be);
+        let rec = BalanceRecord {
+            label: label.into(),
+            created_at: now_secs(),
+            revoked: false,
+            backing,
+            deposit_address: deposit_address.0,
+            balance_be,
+        };
+        let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
+        // Synced write: the record is durable before we hand the caller a token.
+        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+        Ok(id)
+    }
+
+    /// Fetch a balance record by plaintext bearer.
+    pub fn get_balance_record(&self, key_id: &str) -> Result<Option<BalanceRecord>, StoreError> {
+        let h = hash_key_id(key_id);
+        match self.db.get(bal_key(&h).as_bytes())? {
+            Some(b) => Ok(Some(
+                bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Current balance in grains, if the key exists.
+    pub fn get_balance(&self, key_id: &str) -> Result<Option<U256>, StoreError> {
+        Ok(self
+            .get_balance_record(key_id)?
+            .map(|r| U256::from_big_endian(&r.balance_be)))
+    }
+
+    /// Debit `amount` from `key_id`. Returns the new balance. Atomic and
+    /// crash-safe: the read-check-deduct runs under a per-key lock and the new
+    /// balance is committed with a **synced** write, so a debit that returns
+    /// `Ok` has survived to disk and applies exactly once across a restart.
+    pub fn debit_balance(&self, key_id: &str, amount: U256) -> Result<U256, BalanceError> {
+        let h = hash_key_id(key_id);
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+
+        let mut rec = match self.db.get(bal_key(&h).as_bytes())? {
+            Some(b) => bincode::deserialize::<BalanceRecord>(&b)
+                .map_err(|e| BalanceError::Encode(e.to_string()))?,
+            None => return Err(BalanceError::Unknown),
+        };
+        if rec.revoked {
+            return Err(BalanceError::Revoked);
+        }
+        let bal = U256::from_big_endian(&rec.balance_be);
+        if bal < amount {
+            return Err(BalanceError::Insufficient(bal));
+        }
+        let new = bal - amount;
+        new.to_big_endian(&mut rec.balance_be);
+        let bytes = bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
+        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?; // commit point
+        Ok(new)
+    }
+
+    /// Credit `amount` to `key_id` (saturating). Intentionally bypasses the
+    /// `revoked` flag — revocation stops future spending but must never trap
+    /// already-debited buyer funds. Same per-key lock + synced commit.
+    pub fn refund_balance(&self, key_id: &str, amount: U256) -> Result<U256, BalanceError> {
+        let h = hash_key_id(key_id);
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+
+        let mut rec = match self.db.get(bal_key(&h).as_bytes())? {
+            Some(b) => bincode::deserialize::<BalanceRecord>(&b)
+                .map_err(|e| BalanceError::Encode(e.to_string()))?,
+            None => return Err(BalanceError::Unknown),
+        };
+        let bal = U256::from_big_endian(&rec.balance_be);
+        let new = bal.saturating_add(amount);
+        new.to_big_endian(&mut rec.balance_be);
+        let bytes = bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
+        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+        Ok(new)
+    }
+
+    /// Per-key lock handle for the balance RMW. Cloned out of the map so the
+    /// map mutex is held only briefly.
+    fn lock_for(&self, hash: &str) -> Arc<Mutex<()>> {
+        self.bal_locks.lock().entry(hash.to_owned()).or_default().clone()
     }
 
     /// Mint a fresh `cgk_<uuid>` token. Returns the plaintext token —
@@ -163,18 +315,31 @@ impl PersistentKeyStore {
         }
     }
 
-    /// Mark a key revoked. Takes effect on the next request.
+    /// Mark a key revoked. Takes effect on the next request. Handles both the
+    /// quota-keyed (`record:`, local-proxy) and balance-keyed (`bal:`, WP-F
+    /// marketplace) namespaces.
     pub fn revoke(&self, key_id: &str) -> Result<(), StoreError> {
         let h = hash_key_id(key_id);
-        let raw = self.db.get(record_key(&h).as_bytes())?;
-        let mut rec: KeyRecord = match raw {
-            Some(b) => bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?,
-            None => return Err(StoreError::Unknown),
-        };
-        rec.revoked = true;
-        let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-        self.db.put(record_key(&h).as_bytes(), bytes)?;
-        Ok(())
+        if let Some(b) = self.db.get(record_key(&h).as_bytes())? {
+            let mut rec: KeyRecord =
+                bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
+            rec.revoked = true;
+            let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
+            self.db.put(record_key(&h).as_bytes(), bytes)?;
+            return Ok(());
+        }
+        // Balance key — revoke under the per-key lock so it can't race a debit.
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+        if let Some(b) = self.db.get(bal_key(&h).as_bytes())? {
+            let mut rec: BalanceRecord =
+                bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
+            rec.revoked = true;
+            let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
+            self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+            return Ok(());
+        }
+        Err(StoreError::Unknown)
     }
 
     /// List all records as `(hash, record)`. The plaintext bearer isn't
@@ -263,6 +428,18 @@ impl PersistentKeyStore {
 
 fn record_key(hash: &str) -> String {
     format!("record:{}", hash)
+}
+
+fn bal_key(hash: &str) -> String {
+    format!("bal:{}", hash)
+}
+
+/// Write options that fsync the WAL before returning — used for every balance
+/// mutation so an acknowledged debit/refund is durable (WP-F crash-atomicity).
+fn synced() -> WriteOptions {
+    let mut w = WriteOptions::default();
+    w.set_sync(true);
+    w
 }
 
 fn quota_key(hash: &str, day: &str) -> String {
@@ -412,6 +589,51 @@ mod tests {
             store.try_consume(&id),
             Err(ConsumeError::RateLimited { .. })
         ));
+    }
+
+    /// WP-F: a balance key's on-disk schema holds only `sha256(bearer)` —
+    /// never the plaintext `cgk_` token (audit F-3, balance namespace).
+    #[test]
+    fn balance_store_never_holds_plaintext_bearer() {
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let id = store
+            .create_balance_key("buyer", U256::from(100u64), H160::zero(), 0)
+            .unwrap();
+
+        // The plaintext id MUST NOT be a key in the DB (under bal: or record:).
+        assert!(store.db.get(bal_key(&id).as_bytes()).unwrap().is_none());
+        assert!(store.db.get(format!("bal:{id}").as_bytes()).unwrap().is_none());
+        // The hashed key MUST be.
+        let h = hash_key_id(&id);
+        assert!(store.db.get(bal_key(&h).as_bytes()).unwrap().is_some());
+    }
+
+    /// WP-F additive schema: quota keys (`record:`) and balance keys (`bal:`)
+    /// coexist in one store without colliding — a balance key is invisible to
+    /// the quota path and vice-versa, and both survive a restart. This is why
+    /// adding balances did NOT require migrating existing local-proxy records.
+    #[test]
+    fn quota_and_balance_namespaces_coexist_across_restart() {
+        let dir = tempdir().unwrap();
+        let (quota_id, bal_id);
+        {
+            let store = PersistentKeyStore::open(dir.path()).unwrap();
+            quota_id = store.create_key("proxy", 0, 5).unwrap();
+            bal_id = store
+                .create_balance_key("buyer", U256::from(42u64), H160::zero(), 0)
+                .unwrap();
+            // A quota key has no balance; a balance key has no quota record.
+            assert!(store.get_balance(&quota_id).unwrap().is_none());
+            assert!(store.get_record(&bal_id).unwrap().is_none());
+        }
+        // restart
+        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        assert_eq!(store.get_record(&quota_id).unwrap().unwrap().daily_quota, 5);
+        assert_eq!(
+            store.get_balance(&bal_id).unwrap().unwrap(),
+            U256::from(42u64)
+        );
     }
 
     #[test]
