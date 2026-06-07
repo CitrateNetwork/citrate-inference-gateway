@@ -12,6 +12,7 @@
 //! `citrate-wallet-core`'s internal types so this crate stays
 //! narrowly scoped to x402 HTTP concerns.
 
+use async_trait::async_trait;
 use ethereum_types::{H160, U256};
 use sha3::{Digest, Keccak256};
 
@@ -27,8 +28,11 @@ pub struct SettlementTx<'a> {
     pub gas_price_wei: u64,
     /// Gas limit.
     pub gas_limit: u64,
-    /// `to` — the X402Facilitator contract.
+    /// `to` — the target contract.
     pub to: H160,
+    /// Native-token value in wei. `0` for settlement calls; non-zero for a
+    /// payable call like `requestPoolCompute` (WP-C pool dispatch).
+    pub value: U256,
     /// ABI-encoded calldata (from [`crate::calldata::encode_settle_payment`]).
     pub data: &'a [u8],
 }
@@ -78,8 +82,7 @@ fn encode_unsigned_rlp(tx: &SettlementTx<'_>) -> Vec<u8> {
     append_u64(&mut stream, tx.gas_price_wei);
     append_u64(&mut stream, tx.gas_limit);
     stream.append(&tx.to.as_bytes());
-    // value = 0 — encoded as empty bytes per RLP convention.
-    append_u256(&mut stream, U256::zero());
+    append_u256(&mut stream, tx.value);
     stream.append(&tx.data);
     append_u64(&mut stream, tx.chain_id);
     // Two empty fields per EIP-155.
@@ -94,7 +97,7 @@ fn encode_signed_rlp(tx: &SettlementTx<'_>, v: u64, r: &[u8], s: &[u8]) -> Vec<u
     append_u64(&mut stream, tx.gas_price_wei);
     append_u64(&mut stream, tx.gas_limit);
     stream.append(&tx.to.as_bytes());
-    append_u256(&mut stream, U256::zero());
+    append_u256(&mut stream, tx.value);
     stream.append(&tx.data);
     append_u64(&mut stream, v);
     // r, s — strip leading zeros per RLP uint convention.
@@ -138,6 +141,107 @@ fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[i..]
 }
 
+// ── Signer abstraction (INFER-S1 / WP-C) ────────────────────────────
+//
+// `sign_settlement_tx` above signs with a LOCAL secret. The operator wallet
+// must NOT keep a plaintext key — production signs via AWS KMS, which holds the
+// key and returns only `(r, s)`. So we split "build the sighash" from "sign it"
+// behind a `Signer` trait: `LocalSigner` (k256, for tests + the anvil e2e) and
+// the gateway's `AwsKmsSigner` (production) both implement it.
+
+/// A recoverable secp256k1 signature over a 32-byte digest. `recovery_id` is 0
+/// or 1; `s` is low-S normalized (EIP-2).
+#[derive(Debug, Clone, Copy)]
+pub struct RecoverableSignature {
+    /// 0 or 1 — the EIP-155 `v` byte before chain binding.
+    pub recovery_id: u8,
+    /// 32-byte `r`.
+    pub r: [u8; 32],
+    /// 32-byte `s` (low-S).
+    pub s: [u8; 32],
+}
+
+/// Produces the operator address and signs a 32-byte hash. Async because the
+/// production impl (AWS KMS) is a network call.
+#[async_trait]
+pub trait Signer: Send + Sync {
+    /// The operator EOA address (derived from the signer's public key).
+    fn address(&self) -> H160;
+    /// Sign a 32-byte digest, returning a recoverable, low-S signature.
+    async fn sign_hash(&self, hash: &[u8; 32]) -> Result<RecoverableSignature, X402Error>;
+}
+
+/// Build + sign a settlement tx with any [`Signer`] (EIP-155). The sighash is
+/// computed here; the `Signer` only signs it, so the key never leaves custody.
+pub async fn sign_settlement_tx_with<S: Signer + ?Sized>(
+    signer: &S,
+    tx: SettlementTx<'_>,
+) -> Result<SignedSettlement, X402Error> {
+    let signable = encode_unsigned_rlp(&tx);
+    let sighash = Keccak256::digest(&signable);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&sighash);
+
+    let sig = signer.sign_hash(&h).await?;
+    let v: u64 = tx.chain_id * 2 + 35 + sig.recovery_id as u64;
+    let raw = encode_signed_rlp(&tx, v, &sig.r, &sig.s);
+    Ok(SignedSettlement { raw })
+}
+
+/// Recover the EOA address from `(hash, r, s, recovery_id)`.
+pub fn ecrecover(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], recovery_id: u8) -> Option<H160> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    let sig = Signature::from_scalars(*r, *s).ok()?;
+    let rec = RecoveryId::from_byte(recovery_id)?;
+    let vk = VerifyingKey::recover_from_prehash(hash, &sig, rec).ok()?;
+    let point = vk.to_encoded_point(false);
+    let bytes = point.as_bytes(); // 65 bytes, 0x04-prefixed uncompressed
+    let digest = Keccak256::digest(&bytes[1..]);
+    Some(H160::from_slice(&digest[12..]))
+}
+
+/// Find the recovery id (0/1) for a signature over `hash` that recovers to
+/// `expected`. Signers that return only `(r, s)` (e.g. AWS KMS) use this to
+/// derive the EIP-155 `v`. Returns `None` if neither id matches (bad sig / key).
+pub fn recover_id(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], expected: H160) -> Option<u8> {
+    [0u8, 1u8]
+        .into_iter()
+        .find(|&id| ecrecover(hash, r, s, id) == Some(expected))
+}
+
+/// Local-secret [`Signer`] (k256) — for tests and the anvil e2e. Production
+/// custody uses AWS KMS, never a local key. The secret is zeroed on drop by
+/// k256 inside the signing call.
+pub struct LocalSigner {
+    secret: [u8; 32],
+    address: H160,
+}
+
+impl LocalSigner {
+    /// Build from a raw 32-byte secret; `None`-equivalent error if out of range.
+    pub fn from_secret(secret: [u8; 32]) -> Result<Self, X402Error> {
+        let address = crate::keys::derive_secp256k1_address(&secret)
+            .ok_or_else(|| X402Error::Internal("invalid operator secret".into()))?;
+        Ok(Self { secret, address })
+    }
+}
+
+#[async_trait]
+impl Signer for LocalSigner {
+    fn address(&self) -> H160 {
+        self.address
+    }
+    async fn sign_hash(&self, hash: &[u8; 32]) -> Result<RecoverableSignature, X402Error> {
+        // keys::sign_digest_secp256k1 returns v = 27 + recovery_id, low-S.
+        let (v27, r, s) = crate::keys::sign_digest_secp256k1(&self.secret, hash)?;
+        Ok(RecoverableSignature {
+            recovery_id: v27 - 27,
+            r,
+            s,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +264,7 @@ mod tests {
             gas_price_wei: 1_000_000_000,
             gas_limit: 200_000,
             to: H160::from([0x42; 20]),
+            value: U256::zero(),
             data: &[0xde, 0xad, 0xbe, 0xef],
         };
         let signed = sign_settlement_tx(tx, &any_secret()).expect("sign");
@@ -168,6 +273,43 @@ mod tests {
         // (long list with length-of-length prefix). Either way the
         // first nibble is 'c' or 'f'.
         assert!(signed.raw[0] >= 0xc0, "not an RLP list");
+    }
+
+    fn sample_tx() -> SettlementTx<'static> {
+        SettlementTx {
+            chain_id: 40204,
+            nonce: 7,
+            gas_price_wei: 1_000_000_000,
+            gas_limit: 200_000,
+            to: H160::from([0x42; 20]),
+            value: U256::zero(),
+            data: &[0xde, 0xad, 0xbe, 0xef],
+        }
+    }
+
+    /// WP-C: the signer-agnostic path (`sign_settlement_tx_with` + `LocalSigner`)
+    /// must produce byte-identical output to the local `sign_settlement_tx`.
+    /// This is the contract the AWS KMS signer must also satisfy.
+    #[tokio::test]
+    async fn signer_trait_path_is_byte_identical_to_local() {
+        let local = sign_settlement_tx(sample_tx(), &any_secret()).expect("local sign");
+        let signer = LocalSigner::from_secret(any_secret()).expect("signer");
+        let via_trait = sign_settlement_tx_with(&signer, sample_tx()).await.expect("trait sign");
+        assert_eq!(local.raw, via_trait.raw, "Signer path must equal local signing byte-for-byte");
+    }
+
+    /// WP-C: `recover_id` (used by the KMS signer, which gets only `(r,s)`)
+    /// derives the same recovery id, and `ecrecover` round-trips to the address.
+    #[tokio::test]
+    async fn recover_id_round_trips_to_signer_address() {
+        let signer = LocalSigner::from_secret(any_secret()).expect("signer");
+        let hash = [0xcd; 32];
+        let sig = signer.sign_hash(&hash).await.expect("sign");
+
+        assert_eq!(ecrecover(&hash, &sig.r, &sig.s, sig.recovery_id), Some(signer.address()));
+        assert_eq!(recover_id(&hash, &sig.r, &sig.s, signer.address()), Some(sig.recovery_id));
+        // A mismatched address recovers nothing.
+        assert_eq!(recover_id(&hash, &sig.r, &sig.s, H160::from([0x99; 20])), None);
     }
 
     #[test]
@@ -179,6 +321,7 @@ mod tests {
             gas_price_wei: 1,
             gas_limit: 21_000,
             to: H160::zero(),
+            value: U256::zero(),
             data: &[],
         };
         let err = sign_settlement_tx(tx, &[0u8; 32]).expect_err("should fail");
@@ -198,6 +341,7 @@ mod tests {
             gas_price_wei: 1_000_000_000,
             gas_limit: 300_000,
             to: H160::from([0x11; 20]),
+            value: U256::zero(),
             data: &data,
         };
         let a = sign_settlement_tx(mk(), &any_secret()).expect("a");
@@ -214,6 +358,7 @@ mod tests {
             gas_price_wei: 1_000_000_000,
             gas_limit: 300_000,
             to: H160::from([0x11; 20]),
+            value: U256::zero(),
             data: &data,
         };
         let a = sign_settlement_tx(mk(0), &any_secret()).expect("a");
