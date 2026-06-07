@@ -74,6 +74,16 @@ pub enum GatewayError {
         /// Decimal-string of the remaining per-epoch allowance.
         remaining_wei: String,
     },
+    /// The key's per-model spend budget for this model is exhausted
+    /// (INFER-S3 / WP-E). The overall balance may still have funds and other
+    /// models still work — only this model's sub-budget is spent.
+    #[error("model budget exhausted for {model}: {remaining_grains} grains remaining")]
+    ModelBudgetExceeded {
+        /// The model whose per-model budget is exhausted.
+        model: String,
+        /// Decimal-string of the remaining budget for this model.
+        remaining_grains: String,
+    },
 }
 
 impl GatewayError {
@@ -82,7 +92,7 @@ impl GatewayError {
         use GatewayError::*;
         match self {
             UnknownModel(_) | BadRequest(_) => 400,
-            Underfunded { .. } | SpendCapExceeded { .. } => 402,
+            Underfunded { .. } | SpendCapExceeded { .. } | ModelBudgetExceeded { .. } => 402,
             NoProviders
             | ProviderUnavailable(_)
             | ChainUnavailable(_)
