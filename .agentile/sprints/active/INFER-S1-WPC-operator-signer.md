@@ -95,6 +95,18 @@ custody-unblocked (only the SELL execution backend gates the full pooled-inferen
   `AwsKmsSigner` (feature build + DER/SPKI vectors) → **anvil e2e GREEN** (sign+submit
   + nonce serialization). `from_env` fail-closed loader + tripwire (validated).
   **WP-C gate met.**
+- 2026-06-07 — Custody **SIGNED OFF** (owner); KMS adapter re-introduced via
+  `aws-sigv4` (audit-clean — vulnerable rustls-webpki absent). Gate CLOSED.
+- 2026-06-07 — **DEV/TESTNET custody path added** to unblock a testnet dry-run
+  without KMS billing: `EncryptedFileSigner` (V3 keystore) + `from_env` opt-in
+  (`CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1`, KMS retains precedence) + admin CLI
+  `operator-keygen`/`operator-dispatch`. Tests RED→GREEN incl. fail-closed-without-
+  opt-in + anvil e2e. Tripwire still GREEN, audit exit 0.
+  **First live testnet pool dispatch (chain 40204):** createPool 0 + joinPool
+  (10 SALT stake) → gateway `operator-dispatch` → `requestPoolCompute` tx
+  `0xc6880093…be3545` **status 1**, `ComputeRequested(pool=0, job=0,
+  requester=operator)`, nonce 0→1. The non-KMS custody path signs + lands a real
+  dispatch; KMS migration is a no-op downstream. Runbook Appendix A documents it.
 
 ## Next (WP-D)
 Wire `dispatch_pool_compute` into the gateway request path (pooled selection), poll

@@ -105,3 +105,85 @@ at a chain**.
 an instance role / IRSA (over env keys) before production scale; document the
 key-rotation procedure; wire low-balance + spend-cap alerting. These are operational
 follow-ups, not custody blockers.
+
+---
+
+## Appendix A — DEV/TESTNET encrypted-file signer (no AWS)
+
+For local dev and **testnet dry-runs** you can defer KMS billing and use an
+**encrypted V3 keystore** (scrypt + AES-128-CTR — the same format `cast wallet`
+writes). It produces byte-identical EIP-155 output to the KMS signer.
+
+> **Mainnet boundary:** this path is testnet-only. `OperatorWallet::from_env`
+> gives **KMS precedence** and only builds the encrypted-file signer behind an
+> explicit `CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1` opt-in (and logs a loud
+> warning). The CI tripwire `scripts/ci/check_no_plaintext_operator_key.py`
+> keeps a plaintext key path out of production. Do **not** set
+> `CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1` on a mainnet deploy.
+
+### A.1 Generate the operator keystore + print the address to fund
+
+```bash
+echo "a-strong-passphrase" > /run/operator.pw      # keep off argv/history
+cargo run -p citrate-inference-gateway --bin citrate-gateway-admin -- \
+  --keystore /tmp/unused \
+  operator-keygen --out ./operator.keystore.json --password-file /run/operator.pw
+# → prints "Operator address (fund this on testnet): 0x…"  (stdout = the address)
+```
+
+### A.2 Configure the gateway (env)
+
+```bash
+export CITRATE_GATEWAY_OPERATOR_KEYSTORE=./operator.keystore.json
+export CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD_FILE=/run/operator.pw
+export CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1            # testnet opt-in (NEVER mainnet)
+export CITRATE_GATEWAY_COMPUTE_POOL=0x8b36c15552394ce44173a29d054dc5ca482e65d3
+export CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI=1000000000000000000   # 1 SALT/epoch
+# (leave CITRATE_GATEWAY_KMS_KEY_ID unset — KMS takes precedence if set)
+```
+
+### A.3 Fund the operator
+
+Send SALT to the address from A.1 (covers `requestPoolCompute`'s `msg.value`
+plus gas). On testnet, fund from the faucet key in `.env.testnet`.
+
+### A.4 Dry-run a pool dispatch
+
+`requestPoolCompute` requires an **active pool with `memberCount >= minProviders`**
+and `msg.value >= pricePerUnit`. If none exists yet, create one + join it
+(`createPool` then `joinPool` with `MIN_STAKE_PER_GPU` = 10 SALT/GPU), then:
+
+```bash
+cargo run -p citrate-inference-gateway --bin citrate-gateway-admin -- \
+  --keystore /tmp/unused \
+  operator-dispatch \
+    --rpc https://rpc.citrate.ai --chain-id 40204 \
+    --pool 0x8b36c15552394ce44173a29d054dc5ca482e65d3 \
+    --keystore ./operator.keystore.json --password-file /run/operator.pw \
+    --pool-id 0 --payment-wei 1000000000000000 --max-price-wei 1000000000000000 \
+    --job-spec "infer-dryrun:llama-3.1-8b"
+# → prints the operator address + the submitted tx hash (stdout = the hash)
+```
+
+### A.5 Worked testnet evidence (2026-06-07, chain 40204)
+
+Run end-to-end against the live testnet ComputePool
+(`0x8b36…65d3`), operator key held only in an encrypted keystore:
+
+| step | tx | result |
+|------|----|--------|
+| createPool `infer-dryrun` (minProviders 1, price 0.001 SALT) | `0xf95dac85…cc9427` | poolId **0**, Active |
+| joinPool(0, 1 GPU) stake 10 SALT | `0x84643e0a…d62928` | memberCount 1, totalGPUs 1 |
+| **gateway operator-dispatch → requestPoolCompute** | `0xc6880093…be3545` | **status 1**, `ComputeRequested(pool=0, job=0, requester=operator, 0.001 SALT)` |
+
+The dispatch tx's `from` and the `ComputeRequested.requester` are the
+encrypted-file operator EOA, and the operator nonce advanced 0 → 1 — proving the
+gateway's non-KMS custody path signs + lands a real pool dispatch on chain.
+
+### A.6 Migrating to KMS later
+
+When AWS billing is ready, follow §§1–4 above and set
+`CITRATE_GATEWAY_KMS_KEY_ID`. KMS takes precedence automatically; drop
+`CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER` and the keystore env. No code change — the
+`Signer` output is byte-identical, so nonce/spend-cap/dispatch behaviour is
+unchanged.
