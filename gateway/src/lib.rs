@@ -78,6 +78,33 @@ pub use queries::{ChainQueries, HttpChainQueries, PoolEntry, ProviderInfo};
 
 use x402_axum::{ChainClient, X402Layer};
 
+/// Build the marketplace API-key (money) store for the production router.
+///
+/// Durable RocksDB store when `CITRATE_GATEWAY_KEYSTORE_PATH` is set —
+/// production MUST set it so balances survive a restart (INFER-S4 / WP-F /
+/// TD-22). If set but unopenable, that's a fatal misconfiguration of a money
+/// store, so we panic rather than silently bill against volatile state. When
+/// unset (dev / tests), falls back to in-memory but warns loudly — the
+/// volatility is never silent.
+fn marketplace_key_store() -> auth::ApiKeyStore {
+    match std::env::var("CITRATE_GATEWAY_KEYSTORE_PATH") {
+        Ok(path) if !path.is_empty() => match auth::ApiKeyStore::open(&path) {
+            Ok(store) => {
+                tracing::info!(keystore = %path, "marketplace API-key store: durable (RocksDB)");
+                store
+            }
+            Err(e) => panic!("failed to open durable API-key store at {path}: {e}"),
+        },
+        _ => {
+            tracing::warn!(
+                "CITRATE_GATEWAY_KEYSTORE_PATH unset — API-key balances are IN-MEMORY and will be \
+                 LOST on restart (INFER-S4/WP-F/TD-22). Set it in production."
+            );
+            auth::ApiKeyStore::new()
+        }
+    }
+}
+
 /// Production router builder. Wires `HttpChainQueries` and
 /// `HttpChainClient` from the configured `rpc_url`.
 ///
@@ -86,7 +113,8 @@ use x402_axum::{ChainClient, X402Layer};
 /// integration with `ModelRegistry` / `ComputePricingOracle` /
 /// `InferenceRouter` is the WP-03.2 follow-up. For real chain
 /// queries, prefer building directly with `build_router_with` and
-/// supplying your own implementation.
+/// supplying your own implementation. The API-key money store is
+/// durable when `CITRATE_GATEWAY_KEYSTORE_PATH` is set (WP-F).
 pub async fn build_router(config: GatewayConfig) -> Router {
     // Production path: free endpoints only (`/health`, `/v1/models`).
     // Operators who want to expose `/v1/chat/completions` MUST call
@@ -114,7 +142,7 @@ pub async fn build_router(config: GatewayConfig) -> Router {
         http: reqwest::Client::new(),
         queries,
         batches: Arc::new(batch::BatchStore::new()),
-        keys: Arc::new(auth::ApiKeyStore::new()),
+        keys: Arc::new(marketplace_key_store()),
         usage: Arc::new(usage::UsageStore::new()),
     });
     let mut router = Router::new()
