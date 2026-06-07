@@ -1,23 +1,26 @@
 //! `/v1/models` endpoint.
 //!
-//! Queries `ModelRegistry.listModels()` via `eth_call` and returns
-//! an OpenAI-compatible model list.
+//! Returns an OpenAI-compatible list of every active model the
+//! gateway knows about, populated from two on-chain sources:
+//!
+//! 1. `ModelRegistry` — every individual model registered via
+//!    `registerModel` (e.g. `gemma-4-E4B-it-Q4_K_M`). One entry per
+//!    active model, with the human-readable on-chain name as the
+//!    OpenAI `id` and the registrar EOA as `owned_by`.
+//! 2. `ComputePool` (CM-05 WP-05.4) — pool entries that aggregate
+//!    multiple member providers. One entry per pool, with `id`
+//!    prefixed `"pool-"` so SDK callers can target them like any
+//!    other model id.
 //!
 //! # Resilience
 //!
-//! If the chain RPC is unreachable or the contract call returns
-//! garbage, we degrade to an empty list rather than 500. Reasoning:
-//! `/v1/models` is hit by SDK auto-discovery code (e.g.
-//! `openai.models.list()`); a 500 there breaks SDK boot. An empty
-//! list is honest ("no models available right now") and lets the
-//! SDK fail later at the actual endpoint with a clearer error.
-//!
-//! # Data source
-//!
-//! `ModelRegistry.listModels()` — Solidity address per chain in
-//! `gui/citrate_gui_native/src/marketplace_client.rs::known_contract`.
-//! For the gateway we'll port that address-book lookup in a future
-//! WP; for WP-03.1 we just stub the empty list and prove the shape.
+//! If either chain query fails (RPC unreachable, decode failure)
+//! that source degrades to an empty list rather than failing the
+//! whole endpoint. `/v1/models` is the first thing SDK auto-
+//! discovery code (`openai.models.list()`) calls; a 500 here breaks
+//! SDK boot. Falling through to an empty (or partial) list is
+//! honest and lets the SDK fail later at the actual endpoint with a
+//! clearer error.
 
 use axum::extract::State;
 use axum::Json;
@@ -29,13 +32,19 @@ use crate::SharedState;
 /// One entry in the `/v1/models` response.
 #[derive(Debug, Serialize)]
 pub struct ModelEntry {
-    /// Stable model identifier (e.g. "llama-3.1-8b").
+    /// Stable model identifier (e.g. "gemma-4-E4B-it-Q4_K_M" or
+    /// "pool-llama-70b"). What the OpenAI SDK sends back as the
+    /// `model` field on subsequent requests.
     pub id: String,
-    /// OpenAI shape required this — always "model".
+    /// OpenAI shape requires this — always "model".
     pub object: &'static str,
-    /// Address that owns the model (creator).
+    /// Owner address as a 0x-prefixed hex string. For individual
+    /// models, the registrar EOA; for pools, a synthetic
+    /// `pool:<id>` so the SDK has something to display.
     pub owned_by: String,
-    /// Unix seconds when the model was registered on-chain.
+    /// Unix seconds. ModelRegistry doesn't expose `createdAt` via a
+    /// view function today, so we fall back to "now" — informational
+    /// only. Tracked as a follow-up to surface the real timestamp.
     pub created: u64,
 }
 
@@ -44,49 +53,57 @@ pub struct ModelEntry {
 pub struct ModelsResponse {
     /// OpenAI shape — always "list".
     pub object: &'static str,
-    /// Models known on this chain.
+    /// Active models known on this chain, individual + pools.
     pub data: Vec<ModelEntry>,
 }
 
 /// `GET /v1/models` handler.
 ///
-/// Lists individual provider-backed models AND ComputePool entries.
-/// Pool entries appear with `id` prefixed by `"pool-"` so SDK
-/// callers can target them like any other model id (CM-05 WP-05.4).
-/// Falls through to an empty list on any chain failure — see the
-/// resilience note at the top of this module.
+/// Concatenates individual models (from `ModelRegistry`) with
+/// `ComputePool` entries. Inactive models are filtered out; failed
+/// chain queries degrade to an empty list per the resilience
+/// contract at the top of this module.
 pub async fn models_handler(
     State(state): State<SharedState>,
 ) -> Json<ModelsResponse> {
-    let _ = &state.config;
-    let _ = &state.http;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
-    // The on-chain ModelRegistry doesn't expose a name→hash listing
-    // yet, so individual-model discovery from this endpoint is
-    // empty pending an off-chain index (or a slice-2 ABI extension).
-    // Pools, however, we can list directly via list_pools — the
-    // pool's name is its display id.
+    // Source 1: individual models from ModelRegistry. Filter to
+    // `isActive == true` so callers don't try to dispatch to a
+    // deactivated model.
+    let models = state.queries.list_models().await.unwrap_or_default();
+    let mut data: Vec<ModelEntry> = models
+        .into_iter()
+        .filter(|m| m.is_active)
+        .map(|m| ModelEntry {
+            id: m.name,
+            object: "model",
+            owned_by: format!("0x{}", hex::encode(m.owner.as_bytes())),
+            created: now,
+        })
+        .collect();
+
+    // Source 2: ComputePool entries. `H256::zero()` asks for every
+    // pool regardless of which model — the gateway's pool listing is
+    // currently a catalogue, not a per-model filter.
     let pools = state
         .queries
         .list_pools(H256::zero())
         .await
         .unwrap_or_default();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let pool_entries: Vec<ModelEntry> = pools
-        .into_iter()
-        .map(|p| ModelEntry {
-            id: format!("pool-{}", strip_pool_prefix(&p.name)),
-            object: "model",
-            owned_by: format!("pool:{}", p.pool_id),
-            created: now,
-        })
-        .collect();
+    data.extend(pools.into_iter().map(|p| ModelEntry {
+        id: format!("pool-{}", strip_pool_prefix(&p.name)),
+        object: "model",
+        owned_by: format!("pool:{}", p.pool_id),
+        created: now,
+    }));
+
     Json(ModelsResponse {
         object: "list",
-        data: pool_entries,
+        data,
     })
 }
 
@@ -103,14 +120,13 @@ mod tests {
     #[test]
     fn model_entry_serializes_with_openai_fields() {
         let e = ModelEntry {
-            id: "llama-3.1-8b".into(),
+            id: "gemma-4-E4B-it-Q4_K_M".into(),
             object: "model",
             owned_by: "0xabcd".into(),
             created: 1_714_000_000,
         };
         let s = serde_json::to_string(&e).expect("ser");
-        // Required OpenAI fields present.
-        assert!(s.contains(r#""id":"llama-3.1-8b""#));
+        assert!(s.contains(r#""id":"gemma-4-E4B-it-Q4_K_M""#));
         assert!(s.contains(r#""object":"model""#));
         assert!(s.contains(r#""owned_by":"0xabcd""#));
         assert!(s.contains(r#""created":1714000000"#));

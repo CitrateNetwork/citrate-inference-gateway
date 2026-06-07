@@ -61,6 +61,30 @@ impl ProviderInfo {
     }
 }
 
+/// One model returned by [`ChainQueries::list_models`]. Shape mirrors
+/// the subset of `ModelRegistry.getModel(bytes32)` that the gateway's
+/// `/v1/models` endpoint needs — name (becomes the OpenAI model id),
+/// owner (becomes `owned_by`), and the active flag so callers can
+/// filter out deactivated entries.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    /// 32-byte on-chain identifier — `keccak256(owner ‖ name ‖
+    /// timestamp ‖ nonce)` per `ModelRegistry.sol`.
+    pub model_hash: H256,
+    /// Human-readable name as registered on chain
+    /// (e.g. `"gemma-4-E4B-it-Q4_K_M"`). What SDK callers send back
+    /// as the OpenAI `model` field. The gateway's
+    /// `resolve_model_name` accepts either this string or a 0x-pinned
+    /// hash.
+    pub name: String,
+    /// EOA that registered the model.
+    pub owner: H160,
+    /// `false` after the owner has called
+    /// `ModelRegistry.updateModelStatus(false)` — caller should skip
+    /// inactive entries when populating user-facing model lists.
+    pub is_active: bool,
+}
+
 /// Read-only chain queries.
 #[async_trait]
 pub trait ChainQueries: Send + Sync {
@@ -103,6 +127,17 @@ pub trait ChainQueries: Send + Sync {
         &self,
         _model_hash: H256,
     ) -> Result<Vec<PoolEntry>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    /// List every model registered on `ModelRegistry`. Powers the
+    /// `/v1/models` endpoint so SDK auto-discovery can target
+    /// individual models by their human-readable on-chain name.
+    ///
+    /// Default impl returns empty so existing mock implementations
+    /// keep compiling — they can opt in by overriding when they want
+    /// to drive `/v1/models` tests.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, GatewayError> {
         Ok(Vec::new())
     }
 }
@@ -342,6 +377,71 @@ impl ChainQueries for HttpChainQueries {
             }
         }
         Ok(providers)
+    }
+
+    /// Enumerate every registered model in `ModelRegistry`.
+    ///
+    /// Implementation walks `getAllModelHashes() -> bytes32[]` then
+    /// pulls each model's `name`, `owner`, and `isActive` flag via
+    /// `getModel(bytes32)`. Sequential — the registry is small enough
+    /// (target: low hundreds of entries at most) that fan-out via
+    /// `join_all` would be overkill; revisit if the chain ever has
+    /// thousands of registered models per gateway scrape.
+    ///
+    /// A failed `getModel(hash)` for any individual entry is skipped
+    /// (one corrupt entry shouldn't blank out the whole listing). A
+    /// failed `getAllModelHashes` bubbles up — the caller decides
+    /// whether to surface 503 or degrade to an empty list.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, GatewayError> {
+        // Step 1: enumerate hashes.
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&selector("getAllModelHashes()"));
+        let result = self
+            .eth_call(&self.contracts.model_registry, &data)
+            .await?;
+        let hashes = decode_bytes32_array(&result)?;
+
+        // Step 2: fetch each model's name + owner + isActive.
+        // `getModel(bytes32)` returns the 8-tuple:
+        //   (address owner, string name, string framework, string version,
+        //    string ipfsCID, uint256 inferencePrice, uint256 totalInferences,
+        //    bool isActive)
+        // Static head = 8 words = 256 bytes. Owner sits at word 0
+        // (left-padded address); isActive at word 7 (last byte of the
+        // 32-byte word); name's payload offset lives at word 1.
+        let mut out = Vec::with_capacity(hashes.len());
+        for h in hashes {
+            let mut data = Vec::with_capacity(36);
+            data.extend_from_slice(&selector("getModel(bytes32)"));
+            data.extend_from_slice(h.as_bytes());
+            let result = match self
+                .eth_call(&self.contracts.model_registry, &data)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => continue, // skip the one bad entry, keep the rest
+            };
+            if result.len() < 256 {
+                continue;
+            }
+            let owner = H160::from_slice(&result[12..32]);
+            let name = match decode_string_at_offset_word(&result, 1) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if name.is_empty() {
+                continue; // uninitialised slot / deleted model
+            }
+            // isActive is the bool at word 7 (bytes 224..256); last byte non-zero = true.
+            let is_active = result[255] != 0;
+            out.push(ModelInfo {
+                model_hash: h,
+                name,
+                owner,
+                is_active,
+            });
+        }
+        Ok(out)
     }
 }
 
