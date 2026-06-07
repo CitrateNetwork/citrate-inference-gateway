@@ -118,6 +118,11 @@ pub struct ApiKeyRecord {
     pub backing: KeyBacking,
     /// Unix seconds when the key was minted.
     pub created_at: u64,
+    /// INFER-S3 / WP-E — per-model remaining budgets (the in-memory backend's
+    /// store; the persistent backend keeps these in its own `mbudget:`
+    /// namespace and leaves this empty). A model absent from the map is
+    /// uncapped. `BTreeMap` for deterministic enumeration.
+    pub model_budgets: std::collections::BTreeMap<String, U256>,
 }
 
 /// Downstream handlers attach this to successful responses when the exact
@@ -254,6 +259,86 @@ impl ApiKeyStore {
         }
     }
 
+    // ── Per-model budgets (INFER-S3 / WP-E) ─────────────────────────
+
+    /// Set (or replace) a key's remaining budget for `model`.
+    pub async fn set_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), DebitError> {
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                let record = guard.get_mut(&h).ok_or(DebitError::Unknown)?;
+                record.model_budgets.insert(model.to_owned(), amount);
+                Ok(())
+            }
+            Backend::Persistent(p) => p.set_model_budget(key_id, model, amount).map_err(|_| DebitError::Unknown),
+        }
+    }
+
+    /// All `(model, remaining)` budgets set for a key.
+    pub async fn get_model_budgets(&self, key_id: &str) -> Vec<(String, U256)> {
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                m.read()
+                    .await
+                    .get(&h)
+                    .map(|r| r.model_budgets.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                    .unwrap_or_default()
+            }
+            Backend::Persistent(p) => p.get_model_budgets(key_id).unwrap_or_default(),
+        }
+    }
+
+    /// Debit a model's budget. **No-op `Ok` if the model is uncapped.** Atomic
+    /// check-and-deduct; `Err(Exceeded(remaining))` if the budget is insufficient.
+    pub async fn debit_model_budget(
+        &self,
+        key_id: &str,
+        model: &str,
+        amount: U256,
+    ) -> Result<(), crate::keystore::ModelBudgetError> {
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                let Some(record) = guard.get_mut(&h) else {
+                    return Ok(()); // unknown key here behaves as uncapped; overall debit already gated it
+                };
+                match record.model_budgets.get_mut(model) {
+                    Some(remaining) => {
+                        if *remaining < amount {
+                            Err(crate::keystore::ModelBudgetError::Exceeded(*remaining))
+                        } else {
+                            *remaining -= amount;
+                            Ok(())
+                        }
+                    }
+                    None => Ok(()), // uncapped
+                }
+            }
+            Backend::Persistent(p) => p.debit_model_budget(key_id, model, amount),
+        }
+    }
+
+    /// Credit a model's budget back. **No-op if uncapped.** Never creates a budget.
+    pub async fn refund_model_budget(&self, key_id: &str, model: &str, amount: U256) {
+        match &self.backend {
+            Backend::Memory(m) => {
+                let h = hash_key_id(key_id);
+                let mut guard = m.write().await;
+                if let Some(record) = guard.get_mut(&h) {
+                    if let Some(remaining) = record.model_budgets.get_mut(model) {
+                        *remaining = remaining.saturating_add(amount);
+                    }
+                }
+            }
+            Backend::Persistent(p) => {
+                let _ = p.refund_model_budget(key_id, model, amount);
+            }
+        }
+    }
+
     /// Mint and insert a fresh record, returning the plaintext `cgk_` token.
     /// Backend-agnostic home for [`create_key_with_backing`].
     async fn insert(&self, label: String, balance: U256, deposit: H160, backing: KeyBacking) -> String {
@@ -270,6 +355,7 @@ impl ApiKeyStore {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
+                    model_budgets: std::collections::BTreeMap::new(),
                 };
                 m.write().await.insert(hash_key_id(&key_id), record);
                 key_id
@@ -299,6 +385,7 @@ fn record_from_balance(br: crate::keystore::BalanceRecord) -> ApiKeyRecord {
         revoked: br.revoked,
         backing: KeyBacking::from_u8(br.backing),
         created_at: br.created_at,
+        model_budgets: std::collections::BTreeMap::new(),
     }
 }
 
@@ -794,6 +881,31 @@ mod tests {
             .await
             .expect_err("fail");
         assert!(matches!(err, DebitError::Unknown));
+    }
+
+    /// WP-E: the in-memory backend (the one the auth test harness uses) enforces
+    /// per-model budgets — capped model exhausts independently, uncapped passes,
+    /// refund restores the right bucket.
+    #[tokio::test]
+    async fn memory_model_budget_exhausts_refunds_and_passes_uncapped() {
+        let store = ApiKeyStore::new();
+        let id = create_key(&store, "k", U256::from(1000u64), H160::zero()).await;
+        store.set_model_budget(&id, "llama", U256::from(5u64)).await.expect("set");
+
+        store.debit_model_budget(&id, "llama", U256::from(5u64)).await.expect("debit");
+        // llama exhausted
+        assert!(matches!(
+            store.debit_model_budget(&id, "llama", U256::from(1u64)).await,
+            Err(crate::keystore::ModelBudgetError::Exceeded(_))
+        ));
+        // an uncapped model is a no-op pass
+        store.debit_model_budget(&id, "mistral", U256::from(999u64)).await.expect("uncapped");
+        // refund restores the llama bucket
+        store.refund_model_budget(&id, "llama", U256::from(5u64)).await;
+        store.debit_model_budget(&id, "llama", U256::from(5u64)).await.expect("debit after refund");
+
+        let budgets = store.get_model_budgets(&id).await;
+        assert_eq!(budgets, vec![("llama".to_string(), U256::zero())]);
     }
 
     #[test]
