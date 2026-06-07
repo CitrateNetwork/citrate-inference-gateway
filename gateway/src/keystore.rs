@@ -96,6 +96,21 @@ pub enum BalanceError {
     Encode(String),
 }
 
+/// Why a per-model budget debit failed (INFER-S3 / WP-E).
+#[derive(Debug, thiserror::Error)]
+pub enum ModelBudgetError {
+    /// The model's remaining budget was less than the requested debit; carries
+    /// the remaining budget.
+    #[error("model budget exceeded")]
+    Exceeded(U256),
+    /// Underlying RocksDB error.
+    #[error("keystore unavailable: {0}")]
+    Store(#[from] rocksdb::Error),
+    /// On-disk budget value was malformed.
+    #[error("encode: {0}")]
+    Encode(String),
+}
+
 /// Result of [`PersistentKeyStore::try_consume`] on success — what the
 /// caller needs to log without leaking the bearer.
 pub struct ConsumedKey {
@@ -367,6 +382,85 @@ impl PersistentKeyStore {
         Ok(new)
     }
 
+    // ── Per-model budgets (INFER-S3 / WP-E) ─────────────────────────
+    //
+    // An orthogonal sub-ledger keyed `mbudget:<hash>:<model> → remaining grains`.
+    // A model with NO entry is uncapped (debit is a no-op). Additive — no change
+    // to `BalanceRecord` or the overall-balance debit path.
+
+    /// Set (or replace) a key's remaining budget for `model`.
+    pub fn set_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), StoreError> {
+        let h = hash_key_id(key_id);
+        let mut be = [0u8; 32];
+        amount.to_big_endian(&mut be);
+        self.db.put_opt(mbudget_key(&h, model).as_bytes(), be, &synced())?;
+        Ok(())
+    }
+
+    /// A key's remaining budget for `model`, if one is set (else uncapped).
+    pub fn get_model_budget(&self, key_id: &str, model: &str) -> Result<Option<U256>, StoreError> {
+        let h = hash_key_id(key_id);
+        Ok(self.db.get(mbudget_key(&h, model).as_bytes())?.and_then(parse_u256_be))
+    }
+
+    /// All `(model, remaining)` budgets set for a key (admin/inspect).
+    pub fn get_model_budgets(&self, key_id: &str) -> Result<Vec<(String, U256)>, StoreError> {
+        let h = hash_key_id(key_id);
+        let prefix = mbudget_prefix(&h);
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(prefix.as_bytes()) {
+            let (k, v) = item?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            // The model name is everything after the fixed-length prefix, so a
+            // `:` inside a model name is unambiguous.
+            let model = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+            if let Some(amt) = parse_u256_be(v) {
+                out.push((model, amt));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Debit a model's budget. **No-op `Ok` if the model is uncapped** (no
+    /// budget set). Atomic check-and-deduct under the per-key lock + synced
+    /// write; `Err(Exceeded(remaining))` if the budget is insufficient.
+    pub fn debit_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), ModelBudgetError> {
+        let h = hash_key_id(key_id);
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+        let mk = mbudget_key(&h, model);
+        let cur = match self.db.get(mk.as_bytes())? {
+            Some(b) => parse_u256_be(b).ok_or_else(|| ModelBudgetError::Encode("bad budget value".into()))?,
+            None => return Ok(()), // uncapped
+        };
+        if cur < amount {
+            return Err(ModelBudgetError::Exceeded(cur));
+        }
+        let mut be = [0u8; 32];
+        (cur - amount).to_big_endian(&mut be);
+        self.db.put_opt(mk.as_bytes(), be, &synced())?;
+        Ok(())
+    }
+
+    /// Credit a model's budget back. **No-op if uncapped.** Same per-key lock +
+    /// synced write. Intentionally never creates a budget where none existed.
+    pub fn refund_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), StoreError> {
+        let h = hash_key_id(key_id);
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+        let mk = mbudget_key(&h, model);
+        let cur = match self.db.get(mk.as_bytes())? {
+            Some(b) => parse_u256_be(b).unwrap_or_default(),
+            None => return Ok(()), // uncapped — nothing to credit
+        };
+        let mut be = [0u8; 32];
+        cur.saturating_add(amount).to_big_endian(&mut be);
+        self.db.put_opt(mk.as_bytes(), be, &synced())?;
+        Ok(())
+    }
+
     /// Per-key lock handle for the balance RMW. Cloned out of the map so the
     /// map mutex is held only briefly.
     fn lock_for(&self, hash: &str) -> Arc<Mutex<()>> {
@@ -524,6 +618,24 @@ fn record_key(hash: &str) -> String {
 
 fn bal_key(hash: &str) -> String {
     format!("bal:{}", hash)
+}
+
+fn mbudget_prefix(hash: &str) -> String {
+    format!("mbudget:{}:", hash)
+}
+
+fn mbudget_key(hash: &str, model: &str) -> String {
+    format!("mbudget:{}:{}", hash, model)
+}
+
+/// Decode a 32-byte big-endian U256 budget value; `None` if malformed.
+fn parse_u256_be(b: impl AsRef<[u8]>) -> Option<U256> {
+    let b = b.as_ref();
+    if b.len() == 32 {
+        Some(U256::from_big_endian(b))
+    } else {
+        None
+    }
 }
 
 fn batch_key(id: &str) -> String {
