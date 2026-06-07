@@ -170,3 +170,21 @@ async fn concurrent_dispatches_serialize_nonces() {
         assert!(receipt_from(&anvil.url, h).await.is_some(), "each dispatch must mine");
     }
 }
+
+/// INFER-S2 / WP-D — the gateway (as the job's requester) signs + submits
+/// `reclaimExpiredJob` on anvil for its refund-on-timeout path.
+#[tokio::test]
+async fn reclaim_expired_job_signs_and_lands_on_anvil() {
+    let Some(anvil) = start_anvil().await else {
+        eprintln!("SKIP: anvil binary not available");
+        return;
+    };
+    let w = wallet(&anvil.url);
+    let operator = w.address();
+
+    let tx = w.reclaim_expired_job(U256::from(7u64)).await.expect("reclaim");
+    let from = receipt_from(&anvil.url, &format!("0x{}", hex::encode(tx.as_bytes())))
+        .await
+        .expect("mined");
+    assert_eq!(from, operator, "reclaim must be signed by the operator (the requester)");
+}
