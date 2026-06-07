@@ -93,7 +93,15 @@ The operator address (from step 4) needs SALT on the target chain to pay
 `requestPoolCompute`'s `msg.value`. Top it up; the per-epoch spend cap
 (`CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI`) bounds the blast radius.
 
-## 6. Before any funded deploy
-Custody review by **citrate-security** (handoff requirement): credential sourcing
-(instance role / IRSA over env keys), key-rotation procedure, the spend cap value,
-and alerting. Only after that sign-off should the signer point at a funded chain.
+## 6. Custody review — ✅ SIGNED OFF (2026-06-07)
+Custody review **signed off by Larry Klosowski (@SaulBuilds), federation owner /
+sole maintainer (= citrate-security authority)** on 2026-06-07, after review of the
+SigV4-over-reqwest adapter (gateway PR #12, audit-clean): the key never leaves KMS,
+`from_env` is fail-closed, the per-epoch spend cap bounds blast radius, and no
+plaintext key path exists (CI tripwire). The operator signer is **cleared to point
+at a chain**.
+
+**Standing hardening (track, not blocking the gate):** move credential sourcing to
+an instance role / IRSA (over env keys) before production scale; document the
+key-rotation procedure; wire low-balance + spend-cap alerting. These are operational
+follow-ups, not custody blockers.

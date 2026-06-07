@@ -65,8 +65,16 @@ KMS's JSON API directly with **`aws-sigv4`** request signing + the gateway's exi
 are **absent** from the lock; `cargo audit` exits **0**. `from_env` now builds the
 `AwsKmsSigner` under the `aws-kms` feature (still fail-closed: configured-but-unbuilt
 → error, never a local-key fallback). Setup + a one-command **live round-trip check**:
-`.agentile/runbooks/AWS_KMS_OPERATOR_SIGNER.md`. The funded-deploy step still gates on
-the **citrate-security custody review**.
+`.agentile/runbooks/AWS_KMS_OPERATOR_SIGNER.md`.
+
+## Custody review — ✅ SIGNED OFF (2026-06-07) — gate CLOSED
+The **citrate-security custody review is signed off** (Larry Klosowski, owner / sole
+maintainer) on 2026-06-07, after the SigV4-over-reqwest adapter merged (PR #12,
+audit-clean). The operator signer is **cleared to point at a chain**. Standing
+operational hardening (instance-role/IRSA credentials, rotation procedure,
+spend-cap/low-balance alerting) is tracked as a follow-up, not a custody blocker.
+See the runbook §6. **WP-C is fully complete.** WP-D's production signer-wiring is now
+custody-unblocked (only the SELL execution backend gates the full pooled-inference e2e).
 
 ## Honest constraints (documented)
 - **Live AWS KMS network signing can't run in CI/sandbox** (no AWS creds). The
