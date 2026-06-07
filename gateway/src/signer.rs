@@ -194,19 +194,18 @@ impl OperatorWallet {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
-        #[cfg(feature = "aws-kms")]
-        {
-            let signer = Arc::new(AwsKmsSigner::new(_key_id).await?);
-            Ok(Some(Self::new(signer, rpc_url, chain_id, _compute_pool, _ceiling, _epoch_blocks)))
-        }
-        #[cfg(not(feature = "aws-kms"))]
-        {
-            let _ = (rpc_url.into(), chain_id);
-            Err(GatewayError::Internal(
-                "CITRATE_GATEWAY_KMS_KEY_ID is set but this gateway was built without the \
-                 `aws-kms` feature — rebuild with `--features aws-kms`".into(),
-            ))
-        }
+        // Fail-closed: the KMS *adapter* (the network client) is not vendored in
+        // this slice — the AWS SDK pulls a vulnerable legacy rustls the audit
+        // gate denies. It lands in the security-reviewed custody slice. A
+        // configured-but-unavailable signer must NOT silently run signer-less or
+        // fall back to a local key — it errors.
+        let _ = (rpc_url.into(), chain_id);
+        Err(GatewayError::Internal(
+            "CITRATE_GATEWAY_KMS_KEY_ID is set but the AWS KMS adapter is not built into this \
+             gateway — it lands in the security-reviewed custody slice (see \
+             INFER-S1-WPC-operator-signer.md). Do not run pool dispatch without it."
+                .into(),
+        ))
     }
 
     /// The operator EOA address (never the key).
@@ -339,11 +338,18 @@ fn parse_addr_env(key: &str) -> Result<H160, GatewayError> {
     Ok(H160::from_slice(&bytes))
 }
 
-// ── AWS KMS signer (production custody) ──────────────────────────────
+// ── KMS signer crypto (the AWS SDK adapter is deferred) ──────────────
+//
+// These KMS-agnostic helpers (DER→(r,s), SPKI→address) are exactly what a
+// future `AwsKmsSigner` uses to turn KMS's `(r, s)` + public key into a
+// recoverable EIP-155 signature — tested here without AWS. The KMS *network
+// client* (`aws-sdk-kms` + `aws-config`) is intentionally NOT vendored in this
+// slice: it transitively pulls a vulnerable legacy rustls
+// (RUSTSEC-2026-0098/0099/0104) the audit gate denies. The adapter lands in the
+// security-reviewed custody slice that gates the funded-testnet deploy.
 
 /// Parse a DER-encoded ECDSA signature (as AWS KMS returns) into low-S `(r, s)`.
 /// Uses k256 so DER decoding + EIP-2 low-S normalization are battle-tested.
-#[cfg(feature = "aws-kms")]
 fn parse_kms_der_signature(der: &[u8]) -> Result<([u8; 32], [u8; 32]), GatewayError> {
     use k256::ecdsa::Signature;
     let sig = Signature::from_der(der)
@@ -360,7 +366,6 @@ fn parse_kms_der_signature(der: &[u8]) -> Result<([u8; 32], [u8; 32]), GatewayEr
 /// Derive the EOA address from a KMS SubjectPublicKeyInfo (SPKI) DER. The
 /// uncompressed secp256k1 point (`0x04 || X || Y`, 65 bytes) is the SPKI's
 /// trailing bytes; address = keccak256(point[1..])[12..].
-#[cfg(any(feature = "aws-kms", test))]
 fn address_from_spki(spki: &[u8]) -> Result<H160, GatewayError> {
     if spki.len() < 65 {
         return Err(GatewayError::Internal("kms SPKI too short".into()));
@@ -373,74 +378,12 @@ fn address_from_spki(spki: &[u8]) -> Result<H160, GatewayError> {
     Ok(H160::from_slice(&digest[12..]))
 }
 
-/// AWS KMS-backed operator signer (production custody). The private key never
-/// leaves KMS; we send the digest and assemble the recoverable signature.
-#[cfg(feature = "aws-kms")]
-pub struct AwsKmsSigner {
-    client: aws_sdk_kms::Client,
-    key_id: String,
-    address: H160,
-}
-
-#[cfg(feature = "aws-kms")]
-impl AwsKmsSigner {
-    /// Load default AWS config (env / instance role / etc.), fetch the public
-    /// key, and derive the operator address. `key_id` is the KMS key ARN/alias.
-    pub async fn new(key_id: impl Into<String>) -> Result<Self, GatewayError> {
-        let key_id = key_id.into();
-        let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = aws_sdk_kms::Client::new(&cfg);
-        let pk = client
-            .get_public_key()
-            .key_id(&key_id)
-            .send()
-            .await
-            .map_err(|e| GatewayError::Internal(format!("kms get_public_key: {e}")))?;
-        let spki = pk
-            .public_key()
-            .ok_or_else(|| GatewayError::Internal("kms returned no public key".into()))?;
-        let address = address_from_spki(spki.as_ref())?;
-        tracing::info!(operator = %format!("0x{}", hex::encode(address.as_bytes())), "AWS KMS operator signer loaded");
-        Ok(Self { client, key_id, address })
-    }
-}
-
-#[cfg(feature = "aws-kms")]
-#[async_trait::async_trait]
-impl Signer for AwsKmsSigner {
-    fn address(&self) -> H160 {
-        self.address
-    }
-
-    async fn sign_hash(
-        &self,
-        hash: &[u8; 32],
-    ) -> Result<x402_axum::sign_tx::RecoverableSignature, x402_axum::error::X402Error> {
-        use aws_sdk_kms::primitives::Blob;
-        use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
-        use x402_axum::error::X402Error;
-        use x402_axum::sign_tx::{recover_id, RecoverableSignature};
-
-        let out = self
-            .client
-            .sign()
-            .key_id(&self.key_id)
-            .message(Blob::new(hash.to_vec()))
-            .message_type(MessageType::Digest)
-            .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
-            .send()
-            .await
-            .map_err(|e| X402Error::Internal(format!("kms sign: {e}")))?;
-        let der = out
-            .signature()
-            .ok_or_else(|| X402Error::Internal("kms returned no signature".into()))?;
-        let (r, s) = parse_kms_der_signature(der.as_ref())
-            .map_err(|e| X402Error::Internal(format!("{e}")))?;
-        let recovery_id = recover_id(hash, &r, &s, self.address)
-            .ok_or_else(|| X402Error::Internal("kms signature did not recover operator".into()))?;
-        Ok(RecoverableSignature { recovery_id, r, s })
-    }
-}
+// NOTE: the `AwsKmsSigner` (the network adapter using `aws-sdk-kms`) lives in
+// the security-reviewed custody slice. It will combine `parse_kms_der_signature`
+// + `address_from_spki` above with `x402_axum::sign_tx::recover_id` to implement
+// `Signer` — the exact assembly the anvil e2e already exercises via `LocalSigner`
+// (byte-identical output, proven). Keeping it out of this PR keeps the build
+// audit-clean (no vulnerable AWS-SDK rustls).
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +450,23 @@ mod tests {
         std::env::remove_var("CITRATE_GATEWAY_KMS_KEY_ID");
         let w = OperatorWallet::from_env("http://127.0.0.1:8545", 31337).await.expect("ok");
         assert!(w.is_none());
+    }
+
+    /// WP-C: the KMS DER-signature decode (DER → low-S `(r,s)`) the future
+    /// adapter will use — verified by signing with k256, DER-encoding, parsing
+    /// back, and recovering the operator address.
+    #[test]
+    fn parse_kms_der_signature_decodes_and_recovers() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+        let sk = SigningKey::from_bytes((&any_secret()).into()).expect("sk");
+        let hash = [0xcd; 32];
+        let sig: Signature = sk.sign_prehash(&hash).expect("sign");
+        let der = sig.to_der();
+        let (r, s) = parse_kms_der_signature(der.as_bytes()).expect("parse");
+        let signer = LocalSigner::from_secret(any_secret()).expect("signer");
+        // The decoded (r,s) recover the operator — proving DER decode + low-S.
+        assert!(x402_axum::sign_tx::recover_id(&hash, &r, &s, signer.address()).is_some());
     }
 
     /// WP-C: the SPKI→address extraction matches the canonical derivation —

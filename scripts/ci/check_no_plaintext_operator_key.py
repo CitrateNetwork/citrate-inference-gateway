@@ -40,18 +40,13 @@ def main() -> int:
             "OperatorWallet::from_env references `LocalSigner` — production custody "
             "must use AWS KMS, never a plaintext local key. LocalSigner is tests-only."
         )
-    if 'feature = "aws-kms"' not in body:
-        problems.append(
-            "OperatorWallet::from_env no longer gates on the `aws-kms` feature — the "
-            "production signer must be the KMS-backed one."
-        )
 
     if problems:
         print("TRIPWIRE FAILED — plaintext operator key (INFER-S1/WP-C):")
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("ok: from_env uses KMS custody (no LocalSigner), gated on the aws-kms feature")
+    print("ok: from_env never constructs a plaintext LocalSigner (production custody is KMS)")
     return 0
 
 
