@@ -178,10 +178,12 @@ impl OperatorWallet {
     /// was built without the `aws-kms` feature, this errors rather than running
     /// the marketplace without a signer.
     pub async fn from_env(rpc_url: impl Into<String>, chain_id: u64) -> Result<Option<Self>, GatewayError> {
-        let Some(key_id) = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID").ok().filter(|s| !s.is_empty())
-        else {
+        let kms = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID").ok().filter(|s| !s.is_empty());
+        let keystore = std::env::var("CITRATE_GATEWAY_OPERATOR_KEYSTORE").ok().filter(|s| !s.is_empty());
+        if kms.is_none() && keystore.is_none() {
             return Ok(None);
-        };
+        }
+
         let compute_pool = parse_addr_env("CITRATE_GATEWAY_COMPUTE_POOL")?;
         let ceiling = std::env::var("CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI")
             .ok()
@@ -194,22 +196,51 @@ impl OperatorWallet {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
-        #[cfg(feature = "aws-kms")]
-        {
-            // Production custody: AWS KMS over SigV4 (the key never leaves KMS).
-            let signer = Arc::new(AwsKmsSigner::from_env(key_id).await?);
-            Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)))
+        // 1. Production custody: AWS KMS (takes precedence; the key never leaves KMS).
+        if let Some(key_id) = kms {
+            #[cfg(feature = "aws-kms")]
+            {
+                let signer = Arc::new(AwsKmsSigner::from_env(key_id).await?);
+                return Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)));
+            }
+            #[cfg(not(feature = "aws-kms"))]
+            {
+                let _ = key_id;
+                return Err(GatewayError::Internal(
+                    "CITRATE_GATEWAY_KMS_KEY_ID is set but this gateway was built without the \
+                     `aws-kms` feature — rebuild with `--features aws-kms`.".into(),
+                ));
+            }
         }
-        #[cfg(not(feature = "aws-kms"))]
-        {
-            // Fail-closed: a configured KMS key with no `aws-kms` build must NOT
-            // run signer-less or fall back to a local key — it errors.
-            let _ = (key_id, compute_pool, ceiling, epoch_blocks, rpc_url.into(), chain_id);
-            Err(GatewayError::Internal(
-                "CITRATE_GATEWAY_KMS_KEY_ID is set but this gateway was built without the \
-                 `aws-kms` feature — rebuild with `--features aws-kms`.".into(),
-            ))
+
+        // 2. DEV/TESTNET custody: encrypted-file signer (explicit opt-in, NEVER
+        //    mainnet — mainnet must use AWS KMS, enforced by precedence above +
+        //    the CI tripwire). Requires `CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1`.
+        let keystore = keystore.expect("keystore present (checked)");
+        if std::env::var("CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER").ok().as_deref() != Some("1") {
+            return Err(GatewayError::Internal(
+                "CITRATE_GATEWAY_OPERATOR_KEYSTORE is set but CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1 \
+                 is required — the encrypted-file signer is DEV/TESTNET only; mainnet must use AWS \
+                 KMS (--features aws-kms).".into(),
+            ));
         }
+        let password = std::env::var("CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD")
+            .ok()
+            .or_else(|| {
+                std::env::var("CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD_FILE")
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.trim().to_string())
+            })
+            .ok_or_else(|| GatewayError::Internal(
+                "set CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD or ..._PASSWORD_FILE".into(),
+            ))?;
+        let signer = std::sync::Arc::new(EncryptedFileSigner::from_keystore(&keystore, &password)?);
+        tracing::warn!(
+            operator = %format!("0x{}", hex::encode(signer.address().as_bytes())),
+            "⚠ DEV/TESTNET operator signer loaded from an ENCRYPTED FILE (not KMS) — do NOT use on mainnet"
+        );
+        Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)))
     }
 
     /// The operator EOA address (never the key).
@@ -380,6 +411,58 @@ fn address_from_spki(spki: &[u8]) -> Result<H160, GatewayError> {
     }
     let digest = Keccak256::digest(&point[1..]);
     Ok(H160::from_slice(&digest[12..]))
+}
+
+// ── Encrypted-file signer (DEV / TESTNET custody) ───────────────────
+//
+// Loads a secp256k1 key from a standard Ethereum **V3 keystore** (scrypt +
+// AES-128-CTR + keccak MAC — interops with `cast wallet` / geth). The key is
+// encrypted at rest; it is decrypted into memory at runtime. This is the
+// handoff's MVP custody for **dev/testnet only** — mainnet must use AWS KMS
+// (`--features aws-kms`), enforced by the from_env precedence + the CI tripwire.
+
+/// A dev/testnet operator signer backed by an encrypted V3 keystore file.
+/// Wraps a [`LocalSigner`] once decrypted; the key never appears in plaintext
+/// on disk or in an env var.
+pub struct EncryptedFileSigner {
+    inner: x402_axum::sign_tx::LocalSigner,
+}
+
+impl EncryptedFileSigner {
+    /// Decrypt the V3 keystore at `path` with `password` and build the signer.
+    pub fn from_keystore(
+        path: impl AsRef<std::path::Path>,
+        password: &str,
+    ) -> Result<Self, GatewayError> {
+        let secret_vec = eth_keystore::decrypt_key(path.as_ref(), password)
+            .map_err(|e| GatewayError::Internal(format!("keystore decrypt: {e}")))?;
+        if secret_vec.len() != 32 {
+            return Err(GatewayError::Internal("keystore key is not 32 bytes".into()));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&secret_vec);
+        let inner = x402_axum::sign_tx::LocalSigner::from_secret(secret)
+            .map_err(|e| GatewayError::Internal(format!("keystore key invalid: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    /// The operator EOA address.
+    pub fn address(&self) -> H160 {
+        self.inner.address()
+    }
+}
+
+#[async_trait::async_trait]
+impl Signer for EncryptedFileSigner {
+    fn address(&self) -> H160 {
+        self.inner.address()
+    }
+    async fn sign_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<x402_axum::sign_tx::RecoverableSignature, x402_axum::error::X402Error> {
+        self.inner.sign_hash(hash).await
+    }
 }
 
 // ── AWS KMS signer (production custody, feature `aws-kms`) ───────────
