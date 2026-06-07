@@ -1,13 +1,13 @@
 {
   "$schema": "./schema.json",
   "aaStack": {
-    "CitrateECDSAValidator": "0x575d0d85e272eca8784a4d11f4713c698082c807",
-    "CitratePaymaster": "0x79432dc27b6fa383e52f29a955fea11d18737467",
-    "CitrateWallet": "0xf3c58459e723d7eabe2a61c6a97776bc2f5e28ed",
-    "CitrateWalletFactory": "0x9b03044419e9b23f775f9f02d72ff23ae29e04d1",
-    "EntryPoint": "0x25051e90A110fbE4569f124274ce387eB033bC9c",
-    "GuardianRecoveryModule": "0x26bad758eac1bac02457f8e4544269b8b52bc5d7",
-    "WebAuthnP256Validator": "0xde991179021a208cf7e6caebf3a07c229aed3d0f"
+    "CitrateECDSAValidator": "0xc0fde3a8a42f6479cf12b4a5489e7a988c918e23",
+    "CitratePaymaster": "0x425064443c3c3392c47dcbe10d455831545efd9b",
+    "CitrateWallet": "0xd71b7e33e447e062f4e796def686156805820b29",
+    "CitrateWalletFactory": "0x1afe987622ab5add275d2fd21248f77f5e00667f",
+    "EntryPoint": "0x1B6AEED728F53b48e1eD831b04A1F4812F48e928",
+    "GuardianRecoveryModule": "0x11399989175783cdca8ecb095835c8cd4720c6fc",
+    "WebAuthnP256Validator": "0xa6a4122126a75611ea06241e404327addfe8eb5e"
   },
   "chainId": 40204,
   "chainName": "Citrate Network",
@@ -53,7 +53,7 @@
     "X402Facilitator": "0xc0fde3a8a42f6479cf12b4a5489e7a988c918e23",
     "X402Paywall": "0x11399989175783cdca8ecb095835c8cd4720c6fc"
   },
-  "deployedAt": "2026-06-07T03:34:31Z",
+  "deployedAt": "2026-06-07T19:15:08Z",
   "deployer": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
   "explorerUrl": "https://explorer.citrate.ai",
   "genesis": {
