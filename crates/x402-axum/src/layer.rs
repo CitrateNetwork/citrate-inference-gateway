@@ -505,6 +505,7 @@ async fn run_paid_path(
         gas_price_wei: config.gas_price_wei,
         gas_limit: config.gas_limit,
         to: config.facilitator_address,
+        value: ethereum_types::U256::zero(),
         data: &calldata,
     };
     let signed = match crate::sign_tx::sign_settlement_tx(tx, &config.operator_secret) {
