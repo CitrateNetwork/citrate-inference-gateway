@@ -75,7 +75,7 @@ pub mod usage;
 pub use config::GatewayConfig;
 pub use error::GatewayError;
 pub use provider::{ProviderProtocolRequest, ProviderProtocolResponse};
-pub use queries::{ChainQueries, HttpChainQueries, PoolEntry, ProviderInfo};
+pub use queries::{ChainQueries, HttpChainQueries, ModelInfo, PoolEntry, ProviderInfo};
 
 use x402_axum::{ChainClient, X402Layer};
 
