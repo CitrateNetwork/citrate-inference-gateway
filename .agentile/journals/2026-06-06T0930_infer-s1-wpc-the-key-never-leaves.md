@@ -63,10 +63,26 @@ was built without `aws-kms`, it errors — it must never silently run the
 marketplace signer-less, and it must never fall back to a local key. The tripwire
 makes the latter a CI failure: `from_env` may not mention `LocalSigner`.
 
+## Postscript — the audit had the last word
+
+I shipped the `AwsKmsSigner` (feature-gated) and called it done. Then the CI audit
+caught what I'd waved past: the full AWS SDK transitively pulls a *vulnerable legacy
+rustls* (RUSTSEC-2026-0098/0099/0104), and no feature flag removes it. The repo's
+policy is "fix don't ignore," and it's right to be — a signing gateway shouldn't carry
+a cert-verification CVE because a transitive connector dragged it in. So the SDK
+adapter came back out: this slice ships the signer framework + the KMS-agnostic crypto
+(DER decode, SPKI→address, recover-id — all k256-tested, no AWS), audit-clean, and the
+`aws-sdk-kms` *network client* lands in the security-reviewed custody slice that already
+gates the funded deploy. The lesson rhymes with the rest of this work: a green I hadn't
+tried to break (here, "it compiles") wasn't the same as done. The audit was the test I
+hadn't run.
+
 ## State at gate
 
 - `x402-axum`: `Signer` trait + `sign_settlement_tx_with` + `ecrecover`/`recover_id`
   + `LocalSigner`; `SettlementTx` gained `value`. Byte-identical + recovery tests.
 - `gateway/signer.rs`: `NonceManager`, `SpendCap`, `OperatorWallet::dispatch_pool_compute`,
-  `AwsKmsSigner` (feature-gated), `from_env` (fail-closed). Unit + anvil e2e.
-- 154 gateway + 112 x402-axum tests pass; tripwire validated. **WP-D consumes this.**
+  the KMS crypto helpers (`parse_kms_der_signature`, `address_from_spki`), `from_env`
+  (fail-closed). Unit + anvil e2e. The `AwsKmsSigner` network adapter is deferred to the
+  security-reviewed custody slice (audit-clean build).
+- 156 gateway + 112 x402-axum tests pass; tripwire validated; **audit clean**. **WP-D consumes this.**

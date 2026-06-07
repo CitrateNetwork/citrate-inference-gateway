@@ -53,7 +53,20 @@ tier: 1
 4. ✅ Spend cap bounds per-epoch dispatch; calldata + SPKI→address + DER→(r,s) +
    recover-id all vector-tested (no AWS needed).
 5. ✅ Byte-identical signer-agnostic path (KMS == local output).
-6. ✅ No regression — 154 gateway + 112 x402-axum tests pass; clippy clean.
+6. ✅ No regression — 156 gateway + 112 x402-axum tests pass; clippy clean; **audit clean**.
+
+## Scope adjustment (2026-06-06) — KMS SDK adapter deferred (audit gate)
+The full AWS SDK (`aws-sdk-kms` + `aws-config`) transitively pulls a **vulnerable
+legacy rustls** (RUSTSEC-2026-0098/0099/0104 in `rustls-webpki 0.101.7`, via the
+SDK's `hyper-rustls 0.24` connector) that **no feature flag or update removes**, and
+the audit gate **denies** vulnerabilities ("fix don't ignore"). So this PR ships the
+**signer framework + the KMS-agnostic crypto** (DER→(r,s), SPKI→address, recover-id —
+all tested with k256, no AWS), **audit-clean**. The `AwsKmsSigner` *network adapter*
+(the `aws-sdk-kms` client) lands in the **security-reviewed custody slice** that
+already gates the funded-testnet deploy — where someone with AWS access tests the live
+KMS round-trip. `from_env` is **fail-closed**: a configured KMS key errors ("adapter
+not built") rather than running signer-less or falling back to a local key. (Lead
+decision: descope the SDK from this PR to keep the build audit-clean.)
 
 ## Honest constraints (documented)
 - **Live AWS KMS network signing can't run in CI/sandbox** (no AWS creds). The
