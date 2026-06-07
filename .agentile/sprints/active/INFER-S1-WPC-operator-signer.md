@@ -55,18 +55,18 @@ tier: 1
 5. ✅ Byte-identical signer-agnostic path (KMS == local output).
 6. ✅ No regression — 156 gateway + 112 x402-axum tests pass; clippy clean; **audit clean**.
 
-## Scope adjustment (2026-06-06) — KMS SDK adapter deferred (audit gate)
-The full AWS SDK (`aws-sdk-kms` + `aws-config`) transitively pulls a **vulnerable
-legacy rustls** (RUSTSEC-2026-0098/0099/0104 in `rustls-webpki 0.101.7`, via the
-SDK's `hyper-rustls 0.24` connector) that **no feature flag or update removes**, and
-the audit gate **denies** vulnerabilities ("fix don't ignore"). So this PR ships the
-**signer framework + the KMS-agnostic crypto** (DER→(r,s), SPKI→address, recover-id —
-all tested with k256, no AWS), **audit-clean**. The `AwsKmsSigner` *network adapter*
-(the `aws-sdk-kms` client) lands in the **security-reviewed custody slice** that
-already gates the funded-testnet deploy — where someone with AWS access tests the live
-KMS round-trip. `from_env` is **fail-closed**: a configured KMS key errors ("adapter
-not built") rather than running signer-less or falling back to a local key. (Lead
-decision: descope the SDK from this PR to keep the build audit-clean.)
+## KMS adapter — implemented via SigV4, audit-clean (2026-06-07)
+The first WP-C PR (#10) **descoped** the full AWS SDK because it transitively pulled a
+vulnerable legacy rustls (RUSTSEC-2026-0098/0099/0104 in `rustls-webpki 0.101.7`, via
+`aws-smithy-http-client`'s `hyper-rustls 0.24` connector) the audit gate denies. This
+follow-up **re-introduces the `AwsKmsSigner` without the SDK's HTTP client**: it calls
+KMS's JSON API directly with **`aws-sigv4`** request signing + the gateway's existing
+**reqwest** (rustls 0.23). Verified: `aws-sdk-kms`/`aws-config`/`rustls-webpki 0.101.7`
+are **absent** from the lock; `cargo audit` exits **0**. `from_env` now builds the
+`AwsKmsSigner` under the `aws-kms` feature (still fail-closed: configured-but-unbuilt
+→ error, never a local-key fallback). Setup + a one-command **live round-trip check**:
+`.agentile/runbooks/AWS_KMS_OPERATOR_SIGNER.md`. The funded-deploy step still gates on
+the **citrate-security custody review**.
 
 ## Honest constraints (documented)
 - **Live AWS KMS network signing can't run in CI/sandbox** (no AWS creds). The
