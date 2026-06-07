@@ -138,13 +138,57 @@ never changed — proven by the 51 integration tests passing untouched.
 F1 makes the store durable and wires it into production `AppState`, but the metered
 path going live in the binary is downstream WP-C/D/E work. Documented, not hidden.
 
-## F2 — durable in-flight batch + resume (next sprint)
-The harder WAL + boot-recovery half: persist `BatchRecord`/`RequestSlot` state so a
-mid-batch crash resumes remaining slots (no completed slot re-run) and never strands
-the up-front escrow debit. Needs `ChatCompletionResponse: Deserialize` (today
-`Serialize`-only, `openai.rs:43`). Chaos test: kill mid-batch repeatedly → balances
-reconcile, no buyer loses funds.
+## F2 — durable in-flight batch + crash-safe settlement ✅ (this slice)
+Branch `feat/infer-s4-wpf-durable-balances` (stacked on F1).
+
+**The gap:** a batch debits its whole escrow up front (durable since F1), but the
+`BatchStore` was in-memory — a mid-batch crash lost the record, so `process_batch`
+never reached terminal and the errored/unprocessed escrow was **never refunded**.
+Buyer debited, no refund: stranded funds.
+
+**Design — the crux is exactly-once settlement.** The terminal refund (a balance
+credit) and the batch's "settled" state are two writes in one logical transaction;
+a crash between them double- or zero-refunds. The fix: `keys` and `batches` **share
+one `PersistentKeyStore`**, and the settlement commits the **balance credit + the
+`batchset:` marker + the terminal snapshot in a single synced RocksDB `WriteBatch`**
+(`settle_batch_refund`). Replaying it (recovery after a crash) is a no-op — exactly
+once.
+
+**Persistence:** a slim, serde_json `PersistedBatch`/`PersistedSlot` (omits the
+response bodies — `ChatCompletionResponse` is `Serialize`-only via its `&'static
+str` fields; persisting it would need a broad type change). Added `Serialize` to
+`ChatCompletionRequest` (all fields already support it). Per-transition checkpoints
+are best-effort (non-synced); the only synced/atomic write is the settlement.
+
+**Recovery (boot, `BatchStore::recover`):** re-hydrate persisted batches; for any a
+crash left unsettled, **refund every not-`Done` slot to the buyer** (money-safe
+refund-on-recovery) via the atomic settle, exactly once. `process_batch` is made
+**resume-safe** (skips already-terminal slots), so re-dispatching interrupted
+*inference* is a clean follow-on; refund-on-recovery is the money-safe interim.
+
+**Acceptance (F2):**
+1. ✅ `batch_refund_settles_exactly_once` — credit + marker atomic; replay no-ops.
+2. ✅ `recovery_refunds_uncompleted_slots_exactly_once` — mid-flight batch (1 Done /
+   2 interrupted) → buyer refunded the 2 un-Done quotes once; 2nd recovery no-ops.
+3. ✅ `batches_persist_and_enumerate_for_recovery`, `batch_settled_flag_tracks_settlement`.
+4. ✅ Production boot shares one durable store + runs recovery; tripwire updated
+   (durable open present, fallback never silent).
+5. ✅ **148 gateway tests pass, 0 fail**; clippy clean on changed files.
+
+**Honest limitation (documented):** recovery **refunds** interrupted slots rather
+than **re-running** them; recovered `Done` slots keep their settlement/quote but not
+their response body (slim persistence). Re-dispatching interrupted inference is a
+follow-on — `process_batch`'s slot-skip already supports it.
+
+## Status log (F2)
+- 2026-06-06 — F2 in isolated worktree off the F1 branch. Spec-first: store-level
+  exactly-once settlement RED → GREEN (`settle_batch_refund` atomic `WriteBatch`).
+  Wired `BatchStore` persistence + `recover()` + shared store in `build_router`.
+  148 tests pass. Tripwire + sprint + journal updated. **F2 gate met — TD-22 fully
+  addressed (balances F1 + batches F2).**
 
 ## Handoff (post-merge)
-- Advance TD-22 (F1 landed; full discharge after F2).
+- **Discharge TD-22** (balances F1 + batch F2 both landed).
+- Follow-on: re-dispatch interrupted inference on recovery (vs refund); persist
+  response bodies (needs owned `object`/`finish_reason` on `ChatCompletionResponse`).
 - Manifest: no chain pin change; gateway is a leaf for this WP.
