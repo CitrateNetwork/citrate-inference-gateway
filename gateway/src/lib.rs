@@ -69,6 +69,7 @@ pub mod pricing;
 pub mod provider;
 pub mod queries;
 pub mod selection;
+pub mod signer;
 pub mod usage;
 
 pub use config::GatewayConfig;

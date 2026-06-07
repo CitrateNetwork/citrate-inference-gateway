@@ -127,6 +127,16 @@ parking_lot = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 # (futures-util is already declared above for reqwest's bytes_stream())
 
+# WP-C (INFER-S1): secp256k1 for the KMS signer's crypto helpers — DER
+# signature decode + low-S normalize + SPKI→address. Light (already in the tree
+# via x402-axum). The AWS SDK itself (aws-sdk-kms/aws-config) is intentionally
+# NOT vendored here: it transitively pulls a vulnerable legacy rustls
+# (RUSTSEC-2026-0098/0099/0104) that the audit gate denies. The KMS *adapter*
+# (the network client) lands in the security-reviewed custody slice that already
+# gates the funded-testnet deploy; this PR ships the signer framework + the
+# KMS-agnostic crypto, audit-clean.
+k256 = { version = "0.13", features = ["ecdsa"] }
+
 # Second binary — the admin CLI ships in the same crate so it shares the
 # keystore module with the gateway proper.
 [[bin]]
