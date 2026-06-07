@@ -178,34 +178,38 @@ impl OperatorWallet {
     /// was built without the `aws-kms` feature, this errors rather than running
     /// the marketplace without a signer.
     pub async fn from_env(rpc_url: impl Into<String>, chain_id: u64) -> Result<Option<Self>, GatewayError> {
-        let Some(_key_id) = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID").ok().filter(|s| !s.is_empty())
+        let Some(key_id) = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID").ok().filter(|s| !s.is_empty())
         else {
             return Ok(None);
         };
-        let _compute_pool = parse_addr_env("CITRATE_GATEWAY_COMPUTE_POOL")?;
-        let _ceiling = std::env::var("CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI")
+        let compute_pool = parse_addr_env("CITRATE_GATEWAY_COMPUTE_POOL")?;
+        let ceiling = std::env::var("CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI")
             .ok()
             .and_then(|s| U256::from_dec_str(&s).ok())
             .ok_or_else(|| GatewayError::Internal(
                 "set CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI (operator blast-radius bound)".into(),
             ))?;
-        let _epoch_blocks: u64 = std::env::var("CITRATE_GATEWAY_OPERATOR_EPOCH_BLOCKS")
+        let epoch_blocks: u64 = std::env::var("CITRATE_GATEWAY_OPERATOR_EPOCH_BLOCKS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
-        // Fail-closed: the KMS *adapter* (the network client) is not vendored in
-        // this slice — the AWS SDK pulls a vulnerable legacy rustls the audit
-        // gate denies. It lands in the security-reviewed custody slice. A
-        // configured-but-unavailable signer must NOT silently run signer-less or
-        // fall back to a local key — it errors.
-        let _ = (rpc_url.into(), chain_id);
-        Err(GatewayError::Internal(
-            "CITRATE_GATEWAY_KMS_KEY_ID is set but the AWS KMS adapter is not built into this \
-             gateway — it lands in the security-reviewed custody slice (see \
-             INFER-S1-WPC-operator-signer.md). Do not run pool dispatch without it."
-                .into(),
-        ))
+        #[cfg(feature = "aws-kms")]
+        {
+            // Production custody: AWS KMS over SigV4 (the key never leaves KMS).
+            let signer = Arc::new(AwsKmsSigner::from_env(key_id).await?);
+            Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)))
+        }
+        #[cfg(not(feature = "aws-kms"))]
+        {
+            // Fail-closed: a configured KMS key with no `aws-kms` build must NOT
+            // run signer-less or fall back to a local key — it errors.
+            let _ = (key_id, compute_pool, ceiling, epoch_blocks, rpc_url.into(), chain_id);
+            Err(GatewayError::Internal(
+                "CITRATE_GATEWAY_KMS_KEY_ID is set but this gateway was built without the \
+                 `aws-kms` feature — rebuild with `--features aws-kms`.".into(),
+            ))
+        }
     }
 
     /// The operator EOA address (never the key).
@@ -378,12 +382,194 @@ fn address_from_spki(spki: &[u8]) -> Result<H160, GatewayError> {
     Ok(H160::from_slice(&digest[12..]))
 }
 
-// NOTE: the `AwsKmsSigner` (the network adapter using `aws-sdk-kms`) lives in
-// the security-reviewed custody slice. It will combine `parse_kms_der_signature`
-// + `address_from_spki` above with `x402_axum::sign_tx::recover_id` to implement
-// `Signer` — the exact assembly the anvil e2e already exercises via `LocalSigner`
-// (byte-identical output, proven). Keeping it out of this PR keeps the build
-// audit-clean (no vulnerable AWS-SDK rustls).
+// ── AWS KMS signer (production custody, feature `aws-kms`) ───────────
+//
+// Calls KMS's JSON API directly over the gateway's existing reqwest (rustls
+// 0.23, audit-clean) with SigV4 request signing — NOT the `aws-sdk-kms` HTTP
+// client, which transitively pulls a vulnerable legacy rustls the audit gate
+// denies. The private key stays in KMS; KMS returns only `(r, s)` (DER), and we
+// derive the EIP-155 `v` by recovery against the KMS public key.
+#[cfg(feature = "aws-kms")]
+pub use aws_kms::AwsKmsSigner;
+
+#[cfg(feature = "aws-kms")]
+mod aws_kms {
+    use super::{address_from_spki, parse_kms_der_signature};
+    use crate::error::GatewayError;
+    use aws_credential_types::Credentials;
+    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+    use aws_sigv4::sign::v4;
+    use aws_smithy_runtime_api::client::identity::Identity;
+    use base64::Engine;
+    use ethereum_types::H160;
+    use serde_json::{json, Value};
+    use std::time::SystemTime;
+    use x402_axum::error::X402Error;
+    use x402_axum::sign_tx::{recover_id, RecoverableSignature, Signer};
+
+    const KMS_JSON: &str = "application/x-amz-json-1.1";
+
+    /// AWS KMS-backed operator signer over SigV4 + reqwest. Credentials + region
+    /// come from the standard AWS env vars; the key never leaves KMS.
+    pub struct AwsKmsSigner {
+        http: reqwest::Client,
+        endpoint: String,
+        host: String,
+        region: String,
+        key_id: String,
+        access_key: String,
+        secret_key: String,
+        session_token: Option<String>,
+        address: H160,
+    }
+
+    impl AwsKmsSigner {
+        /// Load from env (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+        /// optional `AWS_SESSION_TOKEN`) + `key_id`, then `GetPublicKey` to derive
+        /// the operator address. The IAM principal needs `kms:Sign` +
+        /// `kms:GetPublicKey` on an asymmetric `ECC_SECG_P256K1` SIGN_VERIFY key.
+        pub async fn from_env(key_id: String) -> Result<Self, GatewayError> {
+            let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+            let region = env("AWS_REGION")
+                .or_else(|| env("AWS_DEFAULT_REGION"))
+                .ok_or_else(|| GatewayError::Internal("set AWS_REGION for the KMS signer".into()))?;
+            let access_key = env("AWS_ACCESS_KEY_ID")
+                .ok_or_else(|| GatewayError::Internal("set AWS_ACCESS_KEY_ID".into()))?;
+            let secret_key = env("AWS_SECRET_ACCESS_KEY")
+                .ok_or_else(|| GatewayError::Internal("set AWS_SECRET_ACCESS_KEY".into()))?;
+            let session_token = env("AWS_SESSION_TOKEN");
+            let host = format!("kms.{region}.amazonaws.com");
+            let endpoint = format!("https://{host}/");
+            let mut signer = Self {
+                http: reqwest::Client::new(),
+                endpoint,
+                host,
+                region,
+                key_id,
+                access_key,
+                secret_key,
+                session_token,
+                address: H160::zero(),
+            };
+            let resp = signer
+                .kms_call("TrentService.GetPublicKey", json!({ "KeyId": signer.key_id }))
+                .await?;
+            let spki_b64 = resp
+                .get("PublicKey")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GatewayError::Internal("kms GetPublicKey: no PublicKey".into()))?;
+            let spki = base64::engine::general_purpose::STANDARD
+                .decode(spki_b64)
+                .map_err(|e| GatewayError::Internal(format!("kms PublicKey base64: {e}")))?;
+            signer.address = address_from_spki(&spki)?;
+            tracing::info!(
+                operator = %format!("0x{}", hex::encode(signer.address.as_bytes())),
+                region = %signer.region,
+                "AWS KMS operator signer loaded (sigv4)"
+            );
+            Ok(signer)
+        }
+
+        /// SigV4-sign + POST a KMS JSON call (`X-Amz-Target: TrentService.<op>`).
+        async fn kms_call(&self, target: &str, body: Value) -> Result<Value, GatewayError> {
+            let body_bytes = serde_json::to_vec(&body)
+                .map_err(|e| GatewayError::Internal(format!("kms body encode: {e}")))?;
+
+            let creds = Credentials::new(
+                &self.access_key,
+                &self.secret_key,
+                self.session_token.clone(),
+                None,
+                "citrate-gateway-env",
+            );
+            let identity = Identity::from(creds);
+            let params = v4::SigningParams::builder()
+                .identity(&identity)
+                .region(&self.region)
+                .name("kms")
+                .time(SystemTime::now())
+                .settings(SigningSettings::default())
+                .build()
+                .map_err(|e| GatewayError::Internal(format!("sigv4 params: {e}")))?;
+            let params = aws_sigv4::http_request::SigningParams::from(params);
+
+            // Sign exactly the headers we then send; SigV4 only validates these.
+            let signed_headers = [
+                ("host", self.host.as_str()),
+                ("x-amz-target", target),
+                ("content-type", KMS_JSON),
+            ];
+            let signable = SignableRequest::new(
+                "POST",
+                &self.endpoint,
+                signed_headers.iter().map(|(k, v)| (*k, *v)),
+                SignableBody::Bytes(&body_bytes),
+            )
+            .map_err(|e| GatewayError::Internal(format!("sigv4 signable: {e}")))?;
+            let (instructions, _sig) = sign(signable, &params)
+                .map_err(|e| GatewayError::Internal(format!("sigv4 sign: {e}")))?
+                .into_parts();
+
+            let mut req = self
+                .http
+                .post(&self.endpoint)
+                .header("x-amz-target", target)
+                .header("content-type", KMS_JSON)
+                .body(body_bytes);
+            let (sig_headers, _query) = instructions.into_parts();
+            for h in sig_headers {
+                req = req.header(h.name(), h.value());
+            }
+
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| GatewayError::ChainUnavailable(format!("kms transport: {e}")))?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| GatewayError::ChainUnavailable(format!("kms body: {e}")))?;
+            if !status.is_success() {
+                return Err(GatewayError::Internal(format!("kms {target} {status}: {text}")));
+            }
+            serde_json::from_str(&text)
+                .map_err(|e| GatewayError::Internal(format!("kms response decode: {e}")))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Signer for AwsKmsSigner {
+        fn address(&self) -> H160 {
+            self.address
+        }
+
+        async fn sign_hash(&self, hash: &[u8; 32]) -> Result<RecoverableSignature, X402Error> {
+            let msg = base64::engine::general_purpose::STANDARD.encode(hash);
+            let body = json!({
+                "KeyId": self.key_id,
+                "Message": msg,
+                "MessageType": "DIGEST",
+                "SigningAlgorithm": "ECDSA_SHA_256",
+            });
+            let resp = self
+                .kms_call("TrentService.Sign", body)
+                .await
+                .map_err(|e| X402Error::Internal(format!("{e}")))?;
+            let sig_b64 = resp
+                .get("Signature")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| X402Error::Internal("kms Sign: no Signature".into()))?;
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(sig_b64)
+                .map_err(|e| X402Error::Internal(format!("kms Signature base64: {e}")))?;
+            let (r, s) = parse_kms_der_signature(&der).map_err(|e| X402Error::Internal(format!("{e}")))?;
+            let recovery_id = recover_id(hash, &r, &s, self.address)
+                .ok_or_else(|| X402Error::Internal("kms signature did not recover operator".into()))?;
+            Ok(RecoverableSignature { recovery_id, r, s })
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

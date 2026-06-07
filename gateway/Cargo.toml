@@ -137,6 +137,20 @@ clap = { version = "4", features = ["derive", "env"] }
 # KMS-agnostic crypto, audit-clean.
 k256 = { version = "0.13", features = ["ecdsa"] }
 
+# WP-C (INFER-S1): AWS KMS operator signer via SigV4 + the gateway's existing
+# reqwest — NOT the aws-sdk-kms HTTP client (which transitively pulls a
+# vulnerable legacy rustls the audit gate denies). `aws-sigv4` is just request
+# signing; `aws-credential-types` is the `Credentials` type. Feature-gated so
+# they're off the default build; the lock stays audit-clean either way.
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-smithy-runtime-api = { version = "1", optional = true, features = ["client"] }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# Build the AWS KMS operator signer (production custody, INFER-S1).
+aws-kms = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-smithy-runtime-api", "dep:base64"]
+
 # Second binary — the admin CLI ships in the same crate so it shares the
 # keystore module with the gateway proper.
 [[bin]]
