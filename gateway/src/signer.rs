@@ -128,6 +128,17 @@ pub fn encode_request_pool_compute(pool_id: U256, job_spec: &[u8], max_price: U2
     out
 }
 
+/// ABI-encode `reclaimExpiredJob(uint256 jobId)` (INFER-S2 / WP-D refund). The
+/// gateway is the job's `requester`, so it is the only actor that can reclaim
+/// escrow after `JOB_DEADLINE` — this is the gateway's refund-on-timeout call.
+pub fn encode_reclaim_expired_job(job_id: U256) -> Vec<u8> {
+    let selector = &Keccak256::digest(b"reclaimExpiredJob(uint256)")[..4];
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(selector);
+    out.extend_from_slice(&u256_word(job_id));
+    out
+}
+
 fn u256_word(v: U256) -> [u8; 32] {
     let mut w = [0u8; 32];
     v.to_big_endian(&mut w);
@@ -283,10 +294,43 @@ impl OperatorWallet {
             .await
             .map_err(|e| GatewayError::Internal(format!("sign pool dispatch: {e}")))?;
 
-        match self.eth_send_raw_transaction(&signed.raw).await {
+        self.submit_signed(addr, &signed.raw).await
+    }
+
+    /// Sign + submit `reclaimExpiredJob(jobId)` — the gateway's refund-on-timeout
+    /// (INFER-S2 / WP-D). Callable as the job's `requester` after `JOB_DEADLINE`;
+    /// the contract refunds the escrow to the gateway, which then credits the
+    /// buyer's key balance. No spend-cap (it's a refund, not a spend) and no
+    /// `value` (the contract returns escrow). Returns the tx hash.
+    pub async fn reclaim_expired_job(&self, job_id: U256) -> Result<H256, GatewayError> {
+        let addr = self.signer.address();
+        let nonce = self
+            .nonce
+            .reserve(|| self.eth_get_transaction_count(addr))
+            .await?;
+        let gas_price = self.eth_gas_price().await.unwrap_or(DEFAULT_GAS_PRICE_WEI);
+        let data = encode_reclaim_expired_job(job_id);
+        let tx = SettlementTx {
+            chain_id: self.chain_id,
+            nonce,
+            gas_price_wei: gas_price,
+            gas_limit: POOL_DISPATCH_GAS,
+            to: self.compute_pool,
+            value: U256::zero(),
+            data: &data,
+        };
+        let signed = sign_settlement_tx_with(self.signer.as_ref(), tx)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("sign reclaim: {e}")))?;
+        self.submit_signed(addr, &signed.raw).await
+    }
+
+    /// Submit a signed tx; on failure, resync the nonce from chain so the
+    /// reserved-but-unsent nonce isn't left as a gap.
+    async fn submit_signed(&self, addr: H160, raw: &[u8]) -> Result<H256, GatewayError> {
+        match self.eth_send_raw_transaction(raw).await {
             Ok(h) => Ok(h),
             Err(e) => {
-                // Resync the nonce so the reserved-but-unsent nonce isn't a gap.
                 if let Ok(n) = self.eth_get_transaction_count(addr).await {
                     self.nonce.resync(n).await;
                 }
@@ -682,6 +726,14 @@ mod tests {
         assert_eq!(data[4 + 96 + 31], 4);
         // jobSpec bytes
         assert_eq!(&data[4 + 128..4 + 128 + 4], b"spec");
+    }
+
+    #[test]
+    fn calldata_encodes_reclaim_expired_job() {
+        let data = encode_reclaim_expired_job(U256::from(42u64));
+        assert_eq!(data.len(), 4 + 32, "selector + one word");
+        assert_eq!(data[4 + 31], 42, "jobId word");
+        assert_eq!(&data[..4], &Keccak256::digest(b"reclaimExpiredJob(uint256)")[..4]);
     }
 
     #[tokio::test]
