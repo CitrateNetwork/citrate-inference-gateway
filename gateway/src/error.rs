@@ -65,6 +65,16 @@ pub enum GatewayError {
         /// The `max_tokens` value the caller declared.
         max_tokens: u32,
     },
+    /// The key's per-model spend budget for this model is exhausted
+    /// (INFER-S3 / WP-E). The overall balance may still have funds and other
+    /// models still work — only this model's sub-budget is spent.
+    #[error("model budget exhausted for {model}: {remaining_grains} grains remaining")]
+    ModelBudgetExceeded {
+        /// The model whose per-model budget is exhausted.
+        model: String,
+        /// Decimal-string of the remaining budget for this model.
+        remaining_grains: String,
+    },
 }
 
 impl GatewayError {
@@ -73,7 +83,7 @@ impl GatewayError {
         use GatewayError::*;
         match self {
             UnknownModel(_) | BadRequest(_) => 400,
-            Underfunded { .. } => 402,
+            Underfunded { .. } | ModelBudgetExceeded { .. } => 402,
             NoProviders
             | ProviderUnavailable(_)
             | ChainUnavailable(_)

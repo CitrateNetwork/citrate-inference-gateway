@@ -95,6 +95,10 @@ pub async fn chat_completions_handler(
     // `estimate_input_tokens` — so the gate is at least as strict as
     // the truth.
     let mut accepted_charge = None;
+    // INFER-S3 / WP-E: tracks whether we debited this request's per-model
+    // budget, so a downstream failure refunds exactly what was debited (and an
+    // uncapped model — a no-op debit — refunds harmlessly).
+    let mut model_debited = false;
     if let Some(Extension(pay)) = &paid {
         let (actual_cost, requested_tokens) = quote_chat_request_cost(&state, &req).await?;
 
@@ -104,6 +108,28 @@ pub async fn chat_completions_handler(
                 required_wei: actual_cost.to_string(),
                 max_tokens: requested_tokens,
             });
+        }
+
+        // WP-E: enforce the key's per-model budget (api-key requests only;
+        // uncapped models are a no-op). The model + exact cost are known here,
+        // not in the layer (which prices roughly against the default model).
+        if let Some(Extension(ctx)) = &api_key {
+            match state.keys.debit_model_budget(&ctx.key_id, &req.model, actual_cost).await {
+                Ok(()) => model_debited = true,
+                Err(crate::keystore::ModelBudgetError::Exceeded(remaining)) => {
+                    metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "model_budget_exceeded");
+                    return Err(GatewayError::ModelBudgetExceeded {
+                        model: req.model.clone(),
+                        remaining_grains: remaining.to_string(),
+                    });
+                }
+                Err(e) => {
+                    // Transient store error: the overall balance still gates
+                    // spend, so proceed rather than 402 a paying caller. We did
+                    // NOT debit, so do not refund later.
+                    tracing::warn!(model = %req.model, error = ?e, "per-model budget debit backend error; proceeding");
+                }
+            }
         }
         accepted_charge = Some(actual_cost);
     }
@@ -115,6 +141,13 @@ pub async fn chat_completions_handler(
         }
         Err(e) => {
             metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "error");
+            // WP-E: refund the per-model budget we debited (the layer refunds
+            // the overall balance separately, in settle_api_key_response).
+            if model_debited {
+                if let (Some(Extension(ctx)), Some(cost)) = (&api_key, accepted_charge) {
+                    state.keys.refund_model_budget(&ctx.key_id, &req.model, cost).await;
+                }
+            }
             return Err(e);
         }
     };
