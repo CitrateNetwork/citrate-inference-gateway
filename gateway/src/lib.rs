@@ -86,21 +86,21 @@ use x402_axum::{ChainClient, X402Layer};
 /// store, so we panic rather than silently bill against volatile state. When
 /// unset (dev / tests), falls back to in-memory but warns loudly — the
 /// volatility is never silent.
-fn marketplace_key_store() -> auth::ApiKeyStore {
+fn open_marketplace_store() -> Option<Arc<keystore::PersistentKeyStore>> {
     match std::env::var("CITRATE_GATEWAY_KEYSTORE_PATH") {
-        Ok(path) if !path.is_empty() => match auth::ApiKeyStore::open(&path) {
+        Ok(path) if !path.is_empty() => match keystore::PersistentKeyStore::open(&path) {
             Ok(store) => {
-                tracing::info!(keystore = %path, "marketplace API-key store: durable (RocksDB)");
-                store
+                tracing::info!(keystore = %path, "marketplace stores: durable (RocksDB, shared by keys + batches)");
+                Some(store)
             }
-            Err(e) => panic!("failed to open durable API-key store at {path}: {e}"),
+            Err(e) => panic!("failed to open durable gateway store at {path}: {e}"),
         },
         _ => {
             tracing::warn!(
-                "CITRATE_GATEWAY_KEYSTORE_PATH unset — API-key balances are IN-MEMORY and will be \
-                 LOST on restart (INFER-S4/WP-F/TD-22). Set it in production."
+                "CITRATE_GATEWAY_KEYSTORE_PATH unset — API-key balances + in-flight batches are \
+                 IN-MEMORY and will be LOST on restart (INFER-S4/WP-F/TD-22). Set it in production."
             );
-            auth::ApiKeyStore::new()
+            None
         }
     }
 }
@@ -137,12 +137,34 @@ pub async fn build_router(config: GatewayConfig) -> Router {
         config.contracts.clone(),
     ));
     let open_chat = std::env::var("CITRATE_GATEWAY_OPEN_CHAT").ok().as_deref() == Some("1");
+
+    // One shared durable store backs both the API-key balances and the
+    // in-flight batch state (WP-F) — so a batch refund + its balance credit
+    // commit atomically. When unconfigured, both fall back to in-memory.
+    let store = open_marketplace_store();
+    let keys = Arc::new(match &store {
+        Some(s) => auth::ApiKeyStore::with_persistent(s.clone()),
+        None => auth::ApiKeyStore::new(),
+    });
+    let batches = Arc::new(match &store {
+        Some(s) => batch::BatchStore::with_persistence(s.clone()),
+        None => batch::BatchStore::new(),
+    });
+    if store.is_some() {
+        // Boot recovery: re-hydrate persisted batches and refund any escrow a
+        // crash left unsettled (exactly-once).
+        let (rehydrated, settled) = batches.recover().await;
+        if rehydrated > 0 {
+            tracing::info!(rehydrated, settled, "recovered in-flight batches on boot (WP-F)");
+        }
+    }
+
     let state = Arc::new(state::AppState {
         config,
         http: reqwest::Client::new(),
         queries,
-        batches: Arc::new(batch::BatchStore::new()),
-        keys: Arc::new(marketplace_key_store()),
+        batches,
+        keys,
         usage: Arc::new(usage::UsageStore::new()),
     });
     let mut router = Router::new()

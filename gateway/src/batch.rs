@@ -51,7 +51,7 @@ pub const MAX_BATCH_SIZE: usize = 1000;
 // ── State machine types ─────────────────────────────────────────
 
 /// Per-batch lifecycle state. Mirrors `BatchStates` in the TLA+ spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchStatus {
     /// Just created; processor task hasn't picked it up yet.
@@ -74,7 +74,7 @@ impl BatchStatus {
 }
 
 /// Per-request state inside a batch. Mirrors `RequestStates`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
     /// Not yet picked up by the processor.
@@ -134,23 +134,130 @@ impl BatchRecord {
     }
 }
 
+// ── Durable form (WP-F slice F2) ────────────────────────────────
+
+/// Slim, serializable projection of a batch for durable persistence. Omits the
+/// response bodies (`ChatCompletionResponse` is `Serialize`-only — `&'static
+/// str` fields can't deserialize), keeping exactly what's needed to settle
+/// escrow and reconcile on recovery: per-slot state + quote + the request. U256
+/// amounts are decimal strings (lossless, no serde-feature dependency).
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSlot {
+    state: RequestStatus,
+    request: ChatCompletionRequest,
+    quoted_cost_grains: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedBatch {
+    id: String,
+    status: BatchStatus,
+    paid_escrow_grains: String,
+    released_grains: String,
+    refunded_grains: String,
+    payer_api_key_id: Option<String>,
+    slots: Vec<PersistedSlot>,
+    created_at: u64,
+    refund_settled: bool,
+}
+
+impl PersistedBatch {
+    fn from_record(r: &BatchRecord, refund_settled: bool) -> Self {
+        Self {
+            id: r.id.clone(),
+            status: r.status,
+            paid_escrow_grains: r.paid_escrow_grains.to_string(),
+            released_grains: r.released_grains.to_string(),
+            refunded_grains: r.refunded_grains.to_string(),
+            payer_api_key_id: r.payer_api_key_id.clone(),
+            slots: r
+                .slots
+                .iter()
+                .map(|s| PersistedSlot {
+                    state: s.state,
+                    request: s.request.clone(),
+                    quoted_cost_grains: s.quoted_cost_grains.to_string(),
+                    error: s.error.clone(),
+                })
+                .collect(),
+            created_at: r.created_at,
+            refund_settled,
+        }
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Reconstruct a live `BatchRecord` (response bodies are not restored —
+    /// recovered Done slots keep `response: None`; their output body is the
+    /// documented limitation, the slot is not re-run).
+    fn into_record(self) -> BatchRecord {
+        let parse = |s: &str| U256::from_dec_str(s).unwrap_or_else(|_| U256::zero());
+        BatchRecord {
+            id: self.id,
+            status: self.status,
+            paid_escrow_grains: parse(&self.paid_escrow_grains),
+            released_grains: parse(&self.released_grains),
+            refunded_grains: parse(&self.refunded_grains),
+            payer_api_key_id: self.payer_api_key_id,
+            slots: self
+                .slots
+                .into_iter()
+                .map(|s| RequestSlot {
+                    state: s.state,
+                    quoted_cost_grains: parse(&s.quoted_cost_grains),
+                    request: s.request,
+                    response: None,
+                    error: s.error,
+                })
+                .collect(),
+            created_at: self.created_at,
+        }
+    }
+}
+
 // ── Store ───────────────────────────────────────────────────────
 
-/// In-memory batch store. Each batch is wrapped in its own `RwLock`
-/// so the processor task can hold a write lock without blocking
-/// status polls on other batches.
-#[derive(Default, Debug)]
+/// Batch store. The live working set is always the in-memory map (the
+/// processor mutates it while polls read it); when a durable `persist` handle
+/// is present (production, WP-F), every transition is write-through to RocksDB
+/// and the terminal refund settles **atomically + exactly-once**, so a crash
+/// mid-batch never strands the buyer's escrow.
+#[derive(Default)]
 pub struct BatchStore {
     batches: RwLock<HashMap<String, Arc<RwLock<BatchRecord>>>>,
+    persist: Option<Arc<crate::keystore::PersistentKeyStore>>,
+}
+
+impl std::fmt::Debug for BatchStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchStore")
+            .field("durable", &self.persist.is_some())
+            .finish()
+    }
 }
 
 impl BatchStore {
-    /// Construct an empty store.
+    /// In-memory store (tests + the in-memory boot path).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Durable store sharing the one persistent key store (so batch settlement
+    /// and the balance credit commit in a single atomic write).
+    pub fn with_persistence(store: Arc<crate::keystore::PersistentKeyStore>) -> Self {
+        Self {
+            batches: RwLock::new(HashMap::new()),
+            persist: Some(store),
+        }
+    }
+
     async fn insert(&self, record: BatchRecord) -> Arc<RwLock<BatchRecord>> {
+        if let Some(p) = &self.persist {
+            let _ = p.persist_batch(&record.id, &PersistedBatch::from_record(&record, false).to_json());
+        }
         let id = record.id.clone();
         let arc = Arc::new(RwLock::new(record));
         self.batches.write().await.insert(id, arc.clone());
@@ -159,6 +266,94 @@ impl BatchStore {
 
     async fn get(&self, id: &str) -> Option<Arc<RwLock<BatchRecord>>> {
         self.batches.read().await.get(id).cloned()
+    }
+
+    /// Write-through the current batch state (best-effort progress durability).
+    async fn checkpoint(&self, record: &BatchRecord) {
+        if let Some(p) = &self.persist {
+            let settled = p.batch_was_settled(&record.id).unwrap_or(false);
+            let _ = p.persist_batch(&record.id, &PersistedBatch::from_record(record, settled).to_json());
+        }
+    }
+
+    /// Boot recovery (WP-F): re-hydrate persisted batches into the live map and
+    /// settle any a crash left unsettled. We do **not** re-run inference on
+    /// recovery — every not-`Done` slot is **refunded** to the buyer (money-safe
+    /// refund-on-recovery), and the credit + settled-marker commit atomically
+    /// and exactly-once. A previously-settled batch is just re-hydrated for
+    /// polls. Returns `(rehydrated, settled)`. (Resuming interrupted *inference*
+    /// — re-dispatching Pending/Dispatched slots — is a documented follow-on;
+    /// the resume-safe slot-skip in `process_batch` already supports it.)
+    pub async fn recover(&self) -> (usize, usize) {
+        let Some(store) = &self.persist else {
+            return (0, 0);
+        };
+        let persisted = match store.load_batches() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = ?e, "batch recovery: load_batches failed");
+                return (0, 0);
+            }
+        };
+
+        let mut rehydrated = 0usize;
+        let mut settled = 0usize;
+        for (id, bytes) in persisted {
+            let pb: PersistedBatch = match serde_json::from_slice(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(batch_id = %id, error = ?e, "batch recovery: skip undecodable record");
+                    continue;
+                }
+            };
+            let mut record = pb.into_record();
+
+            if !store.batch_was_settled(&id).unwrap_or(false) {
+                // Reconcile: Done slots release; everything else refunds.
+                let total = record.request_count();
+                let dones = record.completed_count();
+                let mut released = U256::zero();
+                let mut refunded = U256::zero();
+                for slot in record.slots.iter_mut() {
+                    if slot.state == RequestStatus::Done {
+                        released = released.saturating_add(slot.quoted_cost_grains);
+                    } else {
+                        refunded = refunded.saturating_add(slot.quoted_cost_grains);
+                        slot.state = RequestStatus::Errored;
+                        if slot.error.is_none() {
+                            slot.error = Some("interrupted by gateway restart".to_string());
+                        }
+                    }
+                }
+                record.released_grains = released;
+                record.refunded_grains = refunded;
+                record.status = if dones == total {
+                    BatchStatus::Completed
+                } else if dones == 0 {
+                    BatchStatus::Failed
+                } else {
+                    BatchStatus::PartialFailure
+                };
+
+                let terminal_bytes = PersistedBatch::from_record(&record, true).to_json();
+                match (record.payer_api_key_id.clone(), refunded > U256::zero()) {
+                    (Some(key_id), true) => {
+                        if let Err(e) = store.settle_batch_refund(&key_id, refunded, &id, &terminal_bytes) {
+                            tracing::warn!(batch_id = %id, error = ?e, "batch recovery: settle failed");
+                        }
+                    }
+                    _ => {
+                        let _ = store.mark_batch_settled(&id, &terminal_bytes);
+                    }
+                }
+                settled += 1;
+                tracing::info!(batch_id = %id, refunded = %refunded, "batch recovery: reconciled + refunded on restart");
+            }
+
+            self.batches.write().await.insert(id, Arc::new(RwLock::new(record)));
+            rehydrated += 1;
+        }
+        (rehydrated, settled)
     }
 }
 
@@ -387,7 +582,19 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
 
     let count = arc.read().await.slots.len();
     for i in 0..count {
-        // Mark Dispatched.
+        // Resume-safe: a slot already Done/Errored (e.g. recovered from a
+        // persisted snapshot) is never re-run.
+        let already_terminal = {
+            let record = arc.read().await;
+            matches!(
+                record.slots[i].state,
+                RequestStatus::Done | RequestStatus::Errored
+            )
+        };
+        if already_terminal {
+            continue;
+        }
+
         {
             let mut record = arc.write().await;
             record.slots[i].state = RequestStatus::Dispatched;
@@ -408,73 +615,113 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
         let result = run_dispatch(&state, &req_snapshot).await;
 
         // Record outcome + bump escrow.
-        let mut record = arc.write().await;
-        match result {
-            Ok(outcome) => {
-                let resp = json_response(req_snapshot, outcome);
-                record.slots[i].state = RequestStatus::Done;
-                record.slots[i].response = Some(resp);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    batch_id = %record.id,
-                    request_index = i,
-                    error = %e,
-                    "batch request errored"
-                );
-                record.slots[i].state = RequestStatus::Errored;
-                record.slots[i].error = Some(e.to_string());
+        {
+            let mut record = arc.write().await;
+            match result {
+                Ok(outcome) => {
+                    let resp = json_response(req_snapshot, outcome);
+                    record.slots[i].state = RequestStatus::Done;
+                    record.slots[i].response = Some(resp);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        batch_id = %record.id,
+                        request_index = i,
+                        error = %e,
+                        "batch request errored"
+                    );
+                    record.slots[i].state = RequestStatus::Errored;
+                    record.slots[i].error = Some(e.to_string());
+                }
             }
         }
+        // Checkpoint the money-relevant state (which slots completed). Best-
+        // effort, non-synced — a hard crash may lose the last few Done writes,
+        // in which case recovery refunds those slots to the BUYER's benefit
+        // (never the buyer's loss). The exactly-once settlement is synced.
+        state.batches.checkpoint(&*arc.read().await).await;
     }
 
     // Compute terminal state + escrow split.
-    let mut record = arc.write().await;
-    let total = record.request_count();
-    let dones = record.completed_count();
-    let errs = record.errored_count();
-    debug_assert!(record.all_terminal(), "all slots must be terminal here");
+    let (batch_id, payer, refund_owed, terminal_bytes) = {
+        let mut record = arc.write().await;
+        let total = record.request_count();
+        let dones = record.completed_count();
+        let errs = record.errored_count();
+        debug_assert!(record.all_terminal(), "all slots must be terminal here");
 
-    let (released, refunded) = split_quoted_escrow(&record.slots);
-    record.released_grains = released;
-    record.refunded_grains = refunded;
-    record.status = if dones == total {
-        BatchStatus::Completed
-    } else if errs == total {
-        BatchStatus::Failed
-    } else {
-        BatchStatus::PartialFailure
+        let (released, refunded) = split_quoted_escrow(&record.slots);
+        record.released_grains = released;
+        record.refunded_grains = refunded;
+        record.status = if dones == total {
+            BatchStatus::Completed
+        } else if errs == total {
+            BatchStatus::Failed
+        } else {
+            BatchStatus::PartialFailure
+        };
+
+        // Sanity check the EscrowBalances + TerminalBatchEscrowSettled
+        // invariants from GatewayBatchLifecycle.tla.
+        debug_assert_eq!(
+            record.released_grains + record.refunded_grains,
+            record.paid_escrow_grains,
+            "TerminalBatchEscrowSettled violated: paid={} released={} refunded={}",
+            record.paid_escrow_grains,
+            record.released_grains,
+            record.refunded_grains
+        );
+
+        let terminal_bytes = PersistedBatch::from_record(&record, true).to_json();
+        (
+            record.id.clone(),
+            record.payer_api_key_id.clone(),
+            record.refunded_grains,
+            terminal_bytes,
+        )
     };
 
-    // Sanity check the EscrowBalances + TerminalBatchEscrowSettled
-    // invariants from GatewayBatchLifecycle.tla. A violation here
-    // indicates a code bug, not bad input — but we surface it loudly
-    // so it shows in tests rather than silent misaccounting.
-    debug_assert_eq!(
-        record.released_grains + record.refunded_grains,
-        record.paid_escrow_grains,
-        "TerminalBatchEscrowSettled violated: paid={} released={} refunded={}",
-        record.paid_escrow_grains,
-        record.released_grains,
-        record.refunded_grains
-    );
-    let api_refund = record
-        .payer_api_key_id
-        .clone()
-        .map(|key_id| (key_id, record.refunded_grains))
-        .filter(|(_, refund)| *refund > U256::zero());
-    drop(record);
+    settle_batch(&state, &batch_id, payer, refund_owed, &terminal_bytes).await;
+}
 
-    if let Some((key_id, refund)) = api_refund {
-        if let Err(err) = state.keys.refund(&key_id, refund).await {
-            tracing::warn!(
-                batch_refund = %refund,
-                key_id = %key_id,
-                error = ?err,
-                "batch api key refund failed"
-            );
-        } else {
-            metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+/// Final, crash-safe escrow settlement for a terminal batch.
+///
+/// Durable path: the buyer's refund credit + the "settled" marker + the
+/// terminal snapshot commit in **one atomic synced write** (exactly-once even
+/// if the process dies mid-settle — recovery replays it as a no-op). In-memory
+/// path (tests): refund the in-memory key store.
+async fn settle_batch(
+    state: &SharedState,
+    batch_id: &str,
+    payer: Option<String>,
+    refund: U256,
+    terminal_bytes: &[u8],
+) {
+    match &state.batches.persist {
+        Some(store) => match (payer, refund > U256::zero()) {
+            (Some(key_id), true) => {
+                if let Err(err) = store.settle_batch_refund(&key_id, refund, batch_id, terminal_bytes) {
+                    tracing::warn!(batch_refund = %refund, key_id = %key_id, error = ?err, "batch api key refund failed");
+                } else {
+                    metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+                }
+            }
+            _ => {
+                // No api-key refund owed — persist terminal + mark settled so
+                // recovery skips this batch.
+                let _ = store.mark_batch_settled(batch_id, terminal_bytes);
+            }
+        },
+        None => {
+            if refund > U256::zero() {
+                if let Some(key_id) = payer {
+                    if let Err(err) = state.keys.refund(&key_id, refund).await {
+                        tracing::warn!(batch_refund = %refund, key_id = %key_id, error = ?err, "batch api key refund failed");
+                    } else {
+                        metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+                    }
+                }
+            }
         }
     }
 }

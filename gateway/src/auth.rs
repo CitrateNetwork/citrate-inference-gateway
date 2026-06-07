@@ -173,9 +173,17 @@ impl ApiKeyStore {
     /// Balances and revocations survive a restart; debit/refund are
     /// crash-atomic (WP-F).
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, crate::keystore::StoreError> {
-        Ok(Self {
-            backend: Backend::Persistent(crate::keystore::PersistentKeyStore::open(path)?),
-        })
+        Ok(Self::with_persistent(crate::keystore::PersistentKeyStore::open(path)?))
+    }
+
+    /// Build over an already-open persistent store, so the API-key balances and
+    /// the durable batch store (WP-F F2) can **share one RocksDB** — the
+    /// prerequisite for committing a batch refund + its balance credit in a
+    /// single atomic write.
+    pub fn with_persistent(store: Arc<crate::keystore::PersistentKeyStore>) -> Self {
+        Self {
+            backend: Backend::Persistent(store),
+        }
     }
 
     /// Read a key's current record. The argument is the bearer
