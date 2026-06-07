@@ -127,6 +127,19 @@ parking_lot = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 # (futures-util is already declared above for reqwest's bytes_stream())
 
+# WP-C (INFER-S1): AWS KMS operator signer. Feature-gated so the heavy AWS SDK
+# dependency tree stays OUT of the default build + CI; production enables it
+# with `--features aws-kms`. The `Signer` trait + `LocalSigner` (tests/anvil)
+# are always present.
+aws-sdk-kms = { version = "1", optional = true }
+aws-config = { version = "1", optional = true, features = ["behavior-version-latest"] }
+# secp256k1 — DER signature decode + low-S normalize for the KMS signer.
+k256 = { version = "0.13", optional = true, features = ["ecdsa"] }
+
+[features]
+# Build the AWS KMS operator signer (production custody, INFER-S1).
+aws-kms = ["dep:aws-sdk-kms", "dep:aws-config", "dep:k256"]
+
 # Second binary — the admin CLI ships in the same crate so it shares the
 # keystore module with the gateway proper.
 [[bin]]
@@ -137,3 +150,5 @@ path = "src/bin/citrate-gateway-admin.rs"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# Used by the signer tests to build a known SPKI point + sign vectors.
+k256 = { version = "0.13", features = ["ecdsa"] }

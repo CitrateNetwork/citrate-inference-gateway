@@ -65,6 +65,15 @@ pub enum GatewayError {
         /// The `max_tokens` value the caller declared.
         max_tokens: u32,
     },
+    /// The operator wallet's per-epoch spend cap would be breached by this pool
+    /// dispatch (INFER-S1 / WP-C blast-radius bound).
+    #[error("operator spend cap exceeded: requested {requested_wei} wei, {remaining_wei} wei left this epoch")]
+    SpendCapExceeded {
+        /// Decimal-string of the requested dispatch value.
+        requested_wei: String,
+        /// Decimal-string of the remaining per-epoch allowance.
+        remaining_wei: String,
+    },
 }
 
 impl GatewayError {
@@ -73,7 +82,7 @@ impl GatewayError {
         use GatewayError::*;
         match self {
             UnknownModel(_) | BadRequest(_) => 400,
-            Underfunded { .. } => 402,
+            Underfunded { .. } | SpendCapExceeded { .. } => 402,
             NoProviders
             | ProviderUnavailable(_)
             | ChainUnavailable(_)
