@@ -2,8 +2,56 @@
 //!
 //! Sourced from a TOML file in production (loaded by `main.rs`)
 //! and constructed manually in tests.
+//!
+//! Contract addresses are NOT hardcoded inline: the
+//! [`ContractAddresses::default()`] impl reads from the federation-canonical
+//! contract-address table vendored at `src/generated/addresses.json`
+//! (source-of-truth: `citrate-chain/contracts/addresses/40204.json`).
+//! After a chain re-roll, run `bash scripts/sync-addresses.sh` from the
+//! gateway repo root to re-vendor the table — no source edit required.
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Vendored copy of the federation-canonical contract-address table.
+const ADDRESS_TABLE_JSON: &str = include_str!("generated/addresses.json");
+
+/// Subset of the canonical table the gateway reads. Anything outside
+/// `contracts` + `aaStack` is ignored — the gateway doesn't care about
+/// precompiles or genesis-allocations.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalTable {
+    contracts: BTreeMap<String, String>,
+    aa_stack: BTreeMap<String, String>,
+}
+
+static ADDRESS_TABLE: Lazy<CanonicalTable> = Lazy::new(|| {
+    // The vendored JSON is bundled with the binary at build time and is
+    // schema-checked by `scripts/sync-addresses.sh` before it ever lands
+    // on disk, so a parse failure here is a build invariant violation.
+    serde_json::from_str::<CanonicalTable>(ADDRESS_TABLE_JSON)
+        .expect("src/generated/addresses.json is malformed at build time")
+});
+
+/// Look up a contract address by canonical name. Searches `contracts`
+/// first, then `aaStack`. Returns the address as a lowercase 0x-prefixed
+/// hex string.
+fn canonical_address(name: &str) -> String {
+    ADDRESS_TABLE
+        .contracts
+        .get(name)
+        .or_else(|| ADDRESS_TABLE.aa_stack.get(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "canonical address table missing {name:?} (vendored \
+                 src/generated/addresses.json may be stale — run \
+                 `bash scripts/sync-addresses.sh`)"
+            )
+        })
+        .clone()
+}
 
 /// Top-level gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,15 +87,13 @@ pub struct ContractAddresses {
 
 impl Default for ContractAddresses {
     fn default() -> Self {
-        // Testnet-beta (chain 40204) deployments per
-        // contracts/DEPLOYED_ADDRESSES.md. Override via env on
-        // any other chain.
+        // Sourced from the federation-canonical contract-address table
+        // (see module-level docstring + `src/generated/addresses.json`).
+        // Override via env on any non-canonical chain.
         Self {
-            model_registry: "0x077fbc3338a9e6bad90a3a041e6b7425689754ef".to_string(),
-            // FIX: 0x46773…d40b5 is the HeartbeatMonitor, not the oracle.
-            // ComputePricingOracle is 0xa1eed6…f4647 per DEPLOYED_ADDRESSES.md.
-            pricing_oracle: "0xa1eed6ae021504e2a1e310e6c0f7c1a0c5bf4647".to_string(),
-            inference_router: "0xad7c3135c1b9b3189208fd617b6b058c1c0469f3".to_string(),
+            model_registry: canonical_address("ModelRegistry"),
+            pricing_oracle: canonical_address("ComputePricingOracle"),
+            inference_router: canonical_address("InferenceRouter"),
         }
     }
 }
@@ -73,6 +119,41 @@ mod tests {
         assert_eq!(c.chain_id, 40204);
         assert!(c.rpc_url.contains("18545"));
         assert!(c.listen_addr.contains("9800"));
+    }
+
+    #[test]
+    fn contract_defaults_come_from_canonical_table() {
+        // The default impl reads from the vendored canonical table at
+        // src/generated/addresses.json; this test pins the three names the
+        // gateway looks up so a rename in the canonical (e.g. ModelRegistry →
+        // ModelRegistryV2) breaks the build instead of silently shifting.
+        let c = ContractAddresses::default();
+        // Addresses are non-empty 0x-prefixed 20-byte hex.
+        for (name, addr) in [
+            ("model_registry", &c.model_registry),
+            ("pricing_oracle", &c.pricing_oracle),
+            ("inference_router", &c.inference_router),
+        ] {
+            assert!(
+                addr.starts_with("0x") && addr.len() == 42,
+                "{name} is not a 20-byte hex: {addr}"
+            );
+        }
+        // Sanity: pricing_oracle is NOT the same as model_registry or
+        // inference_router (would catch a rename collision in the canonical).
+        assert_ne!(c.pricing_oracle, c.model_registry);
+        assert_ne!(c.pricing_oracle, c.inference_router);
+    }
+
+    #[test]
+    #[should_panic(expected = "canonical address table missing")]
+    fn unknown_contract_name_panics() {
+        // Build invariant: if the gateway asks for a name not in the
+        // vendored table, we PANIC at boot rather than silently using "" or
+        // a default — that surfaces a stale `src/generated/addresses.json`
+        // immediately instead of leaking through to an opaque RPC failure
+        // hours later. Verified via #[should_panic].
+        let _ = canonical_address("DefinitelyNotAContractName");
     }
 
     #[test]
