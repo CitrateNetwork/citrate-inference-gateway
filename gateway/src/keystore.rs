@@ -25,7 +25,7 @@ use std::sync::Arc;
 use chrono::{Datelike, NaiveTime, Utc};
 use ethereum_types::{H160, U256};
 use parking_lot::Mutex;
-use rocksdb::{Options, WriteOptions, DB};
+use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -275,6 +275,98 @@ impl PersistentKeyStore {
         Ok(new)
     }
 
+    // ── Durable in-flight batches (INFER-S4 / WP-F, slice F2) ───────
+
+    /// Persist a batch snapshot (best-effort, non-synced). Progress durability
+    /// for resume; money safety comes from the synced, atomic
+    /// [`Self::settle_batch_refund`], not from per-transition writes.
+    pub fn persist_batch(&self, batch_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.db.put(batch_key(batch_id).as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// All persisted batch snapshots as `(batch_id, bytes)`, for boot recovery.
+    pub fn load_batches(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let prefix = b"batch:";
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(prefix) {
+            let (k, v) = item?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            let id = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+            out.push((id, v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Has this batch's refund already been settled? (Recovery idempotency.)
+    pub fn batch_was_settled(&self, batch_id: &str) -> Result<bool, StoreError> {
+        Ok(self.db.get(batch_settled_key(batch_id).as_bytes())?.is_some())
+    }
+
+    /// Mark a batch settled with no balance credit (x402-paid batches, or
+    /// nothing owed). Atomic synced write of the terminal snapshot + marker so
+    /// recovery skips it.
+    pub fn mark_batch_settled(&self, batch_id: &str, batch_bytes: &[u8]) -> Result<(), StoreError> {
+        let mut wb = WriteBatch::default();
+        wb.put(batch_key(batch_id).as_bytes(), batch_bytes);
+        wb.put(batch_settled_key(batch_id).as_bytes(), [1u8]);
+        self.db.write_opt(wb, &synced())?;
+        Ok(())
+    }
+
+    /// Settle a terminal batch's refund **atomically and exactly once**:
+    /// credit the buyer's balance by `refund`, write the terminal batch
+    /// snapshot, and stamp the "settled" marker — all in **one synced
+    /// `WriteBatch`**. If the marker already exists (recovery replayed the
+    /// settlement after a crash), this is a no-op credit: the snapshot is
+    /// refreshed but the balance is never credited twice. Returns the post
+    /// balance. Runs under the buyer's per-key lock so it can't race a debit.
+    pub fn settle_batch_refund(
+        &self,
+        key_id: &str,
+        refund: U256,
+        batch_id: &str,
+        batch_bytes: &[u8],
+    ) -> Result<U256, BalanceError> {
+        let h = hash_key_id(key_id);
+        let keylock = self.lock_for(&h);
+        let _guard = keylock.lock();
+
+        let read_balance = || -> Result<(BalanceRecord, U256), BalanceError> {
+            match self.db.get(bal_key(&h).as_bytes())? {
+                Some(b) => {
+                    let rec: BalanceRecord = bincode::deserialize(&b)
+                        .map_err(|e| BalanceError::Encode(e.to_string()))?;
+                    let bal = U256::from_big_endian(&rec.balance_be);
+                    Ok((rec, bal))
+                }
+                None => Err(BalanceError::Unknown),
+            }
+        };
+
+        // Already settled — idempotent. Refresh the terminal snapshot, never re-credit.
+        if self.db.get(batch_settled_key(batch_id).as_bytes())?.is_some() {
+            self.db.put(batch_key(batch_id).as_bytes(), batch_bytes)?;
+            let (_rec, bal) = read_balance()?;
+            return Ok(bal);
+        }
+
+        let (mut rec, bal) = read_balance()?;
+        let new = bal.saturating_add(refund);
+        new.to_big_endian(&mut rec.balance_be);
+        let bal_bytes =
+            bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
+
+        let mut wb = WriteBatch::default();
+        wb.put(bal_key(&h).as_bytes(), &bal_bytes);
+        wb.put(batch_key(batch_id).as_bytes(), batch_bytes);
+        wb.put(batch_settled_key(batch_id).as_bytes(), [1u8]);
+        self.db.write_opt(wb, &synced())?; // single atomic, durable commit
+        Ok(new)
+    }
+
     /// Per-key lock handle for the balance RMW. Cloned out of the map so the
     /// map mutex is held only briefly.
     fn lock_for(&self, hash: &str) -> Arc<Mutex<()>> {
@@ -432,6 +524,16 @@ fn record_key(hash: &str) -> String {
 
 fn bal_key(hash: &str) -> String {
     format!("bal:{}", hash)
+}
+
+fn batch_key(id: &str) -> String {
+    format!("batch:{}", id)
+}
+
+/// Distinct prefix (NOT `batch:`) so the recovery scan never confuses the
+/// settled marker for a batch snapshot.
+fn batch_settled_key(id: &str) -> String {
+    format!("batchset:{}", id)
 }
 
 /// Write options that fsync the WAL before returning — used for every balance

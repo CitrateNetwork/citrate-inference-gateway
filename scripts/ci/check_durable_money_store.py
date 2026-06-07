@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Tripwire: the production router's API-key (money) store must be durable.
+"""Tripwire: the production gateway's money + batch stores must be durable.
 
-Bug-class (INFER-S4 / WP-F / TD-22): the marketplace `ApiKeyStore` was
-in-memory, so a restart wiped every key balance. The fix routes the production
-builder through `marketplace_key_store()` (durable RocksDB when configured,
-loud-warning in-memory only in dev). This check fails CI if a regression puts
-the volatile `ApiKeyStore::new()` back into `build_router`'s state, or removes
-the durable constructor.
+Bug-class (INFER-S4 / WP-F / TD-22): the marketplace `ApiKeyStore` (balances)
+and `BatchStore` (in-flight batches) were in-memory, so a restart wiped every
+balance and stranded every in-flight batch's escrow. The fix routes the
+production builder through `open_marketplace_store()`, which returns a durable
+RocksDB store when configured and otherwise falls back to in-memory **with a
+loud warning** — the volatility is never silent. Both `keys` and `batches`
+share that one store so a batch refund + its balance credit commit atomically.
+
+This check fails CI if a regression:
+  - removes `open_marketplace_store()` from `build_router` (the gated path), or
+  - lets `open_marketplace_store()` fall back to in-memory **silently** (no
+    `tracing::warn`), or drops the durable `PersistentKeyStore::open`.
 
 Spec: .agentile/sprints/active/INFER-S4-WPF-durable-balances.md
 """
@@ -17,40 +23,45 @@ from pathlib import Path
 LIB = Path(__file__).resolve().parents[2] / "gateway" / "src" / "lib.rs"
 
 
-def build_router_body(src: str) -> str:
-    start = re.search(r"pub async fn build_router\(", src)
+def fn_body(src: str, sig_re: str, name: str) -> str:
+    start = re.search(sig_re, src)
     if not start:
-        sys.exit("FAIL: could not find `build_router` in gateway/src/lib.rs")
-    # The function closes at the first line that is exactly `}` (column 0).
+        sys.exit(f"FAIL: could not find `{name}` in gateway/src/lib.rs")
     rest = src[start.start():]
     end = re.search(r"\n\}\n", rest)
     if not end:
-        sys.exit("FAIL: could not delimit the `build_router` body")
+        sys.exit(f"FAIL: could not delimit the `{name}` body")
     return rest[: end.end()]
 
 
 def main() -> int:
     src = LIB.read_text()
-    body = build_router_body(src)
+    build = fn_body(src, r"pub async fn build_router\(", "build_router")
+    opener = fn_body(src, r"fn open_marketplace_store\(", "open_marketplace_store")
 
     problems = []
-    if "ApiKeyStore::new()" in body:
+    if "open_marketplace_store()" not in build:
         problems.append(
-            "build_router constructs a volatile `ApiKeyStore::new()` — the "
-            "marketplace money store must be durable. Use `marketplace_key_store()`."
+            "build_router no longer wires `open_marketplace_store()` — the durable "
+            "(shared) store path for balances + batches is missing (WP-F regression)."
         )
-    if "marketplace_key_store()" not in body:
+    if "PersistentKeyStore::open" not in opener:
         problems.append(
-            "build_router no longer wires `marketplace_key_store()` — the durable "
-            "API-key store path is missing (WP-F regression)."
+            "open_marketplace_store no longer opens a durable `PersistentKeyStore` — "
+            "the money + batch stores would be volatile in production."
+        )
+    if "tracing::warn" not in opener:
+        problems.append(
+            "open_marketplace_store can fall back to in-memory SILENTLY — a volatile "
+            "money store must warn loudly (it must never be silent)."
         )
 
     if problems:
-        print("TRIPWIRE FAILED — durable money store (INFER-S4/WP-F/TD-22):")
+        print("TRIPWIRE FAILED — durable money + batch store (INFER-S4/WP-F/TD-22):")
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("ok: build_router wires the durable marketplace_key_store(); no volatile ApiKeyStore::new()")
+    print("ok: build_router wires open_marketplace_store(); durable open present; fallback warns loudly")
     return 0
 
 

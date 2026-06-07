@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Incoming `/v1/chat/completions` request body. Matches a useful
 /// subset of OpenAI's shape — extra fields the SDK sends (top_p,
 /// presence_penalty, etc.) are tolerated by serde's default.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     /// Model name (e.g. "llama-3.1-8b") or pinned hash
     /// ("llama-3.1-8b@0xabcd..."). Resolved via ModelRegistry.
