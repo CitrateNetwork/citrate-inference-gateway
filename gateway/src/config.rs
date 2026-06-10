@@ -61,8 +61,10 @@ pub struct GatewayConfig {
     /// JSON-RPC URL for chain queries (ModelRegistry, eth_call,
     /// etc.). Defaults to `http://127.0.0.1:18545`.
     pub rpc_url: String,
-    /// Listen address — `0.0.0.0:9800` for production, `127.0.0.1:0`
-    /// for tests (random port).
+    /// Listen address. Defaults to loopback (`127.0.0.1:9800`); set
+    /// `CITRATE_GATEWAY_LISTEN_ADDR=0.0.0.0:9800` for an intentional remote
+    /// bind (e.g. inside a container). Tests use `127.0.0.1:0` (random port).
+    /// SECREM-01 SVC-5 (pre-audit 2026-06-09): loopback default — see main.rs.
     pub listen_addr: String,
     /// Contract addresses on this chain. Required for production
     /// runs; tests using `build_router_with` inject mock queries
@@ -103,7 +105,8 @@ impl Default for GatewayConfig {
         Self {
             chain_id: 40204,
             rpc_url: "http://127.0.0.1:18545".to_string(),
-            listen_addr: "0.0.0.0:9800".to_string(),
+            // SECREM-01 SVC-5 (pre-audit 2026-06-09): loopback default.
+            listen_addr: "127.0.0.1:9800".to_string(),
             contracts: ContractAddresses::default(),
         }
     }

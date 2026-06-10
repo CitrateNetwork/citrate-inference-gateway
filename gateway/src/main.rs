@@ -74,6 +74,10 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_local_proxy_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    // SECREM-01 SVC-5 (pre-audit 2026-06-09): same non-loopback warning as
+    // marketplace mode — local-proxy enforces cgk_ bearer auth, but a public
+    // bind still widens the attack surface beyond the loopback default.
+    warn_if_non_loopback(&listener);
     tracing::info!(
         addr = %listener.local_addr()?,
         upstreams = ?upstreams,
@@ -93,8 +97,15 @@ async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(40204),
         rpc_url: env::var("CITRATE_GATEWAY_RPC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18545".to_string()),
+        // SECREM-01 SVC-5 (pre-audit 2026-06-09): default to loopback.
+        // Marketplace mode's only request gate is x402 payment on /v1/*;
+        // /models + /healthz are unauthenticated. In production this runs
+        // behind Caddy over loopback (see packaging/*.service), so the
+        // safe default is 127.0.0.1. Operators who genuinely need a remote
+        // bind (e.g. a container) set CITRATE_GATEWAY_LISTEN_ADDR=0.0.0.0:9800
+        // explicitly; that path logs a warning below.
         listen_addr: env::var("CITRATE_GATEWAY_LISTEN_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:9800".to_string()),
+            .unwrap_or_else(|_| "127.0.0.1:9800".to_string()),
         contracts: ContractAddresses {
             model_registry: env::var("CITRATE_GATEWAY_MODEL_REGISTRY")
                 .unwrap_or_else(|_| ContractAddresses::default().model_registry),
@@ -117,7 +128,33 @@ async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(config).await;
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
 
+    // SECREM-01 SVC-5 (pre-audit 2026-06-09): warn loudly if the operator
+    // intentionally exposed the gateway off loopback. Marketplace mode has
+    // no bearer auth (x402 gates /v1/* only; /models + /healthz are open),
+    // so a non-loopback bind without a fronting reverse proxy is a public
+    // unauthenticated surface.
+    warn_if_non_loopback(&listener);
+
     tracing::info!(addr = %listener.local_addr()?, "gateway listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// SECREM-01 SVC-5 (pre-audit 2026-06-09): emit a warning when the gateway
+/// is bound to a non-loopback address. Loopback binds (127.0.0.0/8, ::1)
+/// are silent — that's the safe default and the production topology (Caddy
+/// forwards over loopback). A `0.0.0.0` / public bind means the operator
+/// opted into a remotely reachable, only-payment-gated surface; surface it.
+fn warn_if_non_loopback(listener: &tokio::net::TcpListener) {
+    if let Ok(addr) = listener.local_addr() {
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %addr,
+                "gateway bound to a NON-LOOPBACK address: this exposes /models \
+                 and /healthz unauthenticated and /v1/* behind x402 payment only. \
+                 Ensure a fronting reverse proxy / firewall is in place, or set \
+                 CITRATE_GATEWAY_LISTEN_ADDR to a loopback address."
+            );
+        }
+    }
 }
