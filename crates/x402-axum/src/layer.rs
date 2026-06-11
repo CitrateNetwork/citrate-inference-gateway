@@ -23,6 +23,7 @@ use crate::challenge::{build_challenge, now_unix_secs, ChallengeInputs};
 use crate::digest::wsalt_domain_separator;
 use crate::error::X402Error;
 use crate::header::{decode as decode_payment_header, X_PAYMENT_HEADER};
+use crate::ledger::NonceLedger;
 use crate::nonce::NonceSource;
 use crate::observability::{NoopObservability, ObservabilityHook, RejectedEvent, SettledEvent};
 use crate::pricing::PricingStrategy;
@@ -70,6 +71,10 @@ pub(crate) struct X402Config {
     /// Receipt polling ceiling — after this, settle is reported as
     /// pending (scenario 9 in x402_payment.feature).
     pub receipt_timeout_secs: u64,
+    /// Ledger of server-issued challenge nonces. The paid path only
+    /// accepts a payment whose nonce was minted by this gateway, is
+    /// unexpired, and has not been used before (2026-05-31 audit 001).
+    pub nonce_ledger: Arc<NonceLedger>,
 }
 
 impl std::fmt::Debug for X402Config {
@@ -275,6 +280,9 @@ impl X402LayerBuilder {
                 gas_limit: self.gas_limit.unwrap_or(200_000),
                 challenge_ttl_secs: self.challenge_ttl_secs.unwrap_or(300),
                 receipt_timeout_secs: self.receipt_timeout_secs.unwrap_or(10),
+                nonce_ledger: Arc::new(NonceLedger::new(
+                    crate::ledger::DEFAULT_MAX_OUTSTANDING,
+                )),
             }),
             nonces: Arc::new(NonceSource::new()),
         })
@@ -453,6 +461,21 @@ async fn run_paid_path(
         return PaidOutcome::Reject(X402Error::Expired);
     }
 
+    // 2b. Challenge-nonce ledger (2026-05-31 audit 001): the nonce must
+    // be one THIS gateway minted, unexpired, and never used before.
+    // Consumed (removed) on first use, so a concurrent second payment
+    // with the same nonce is rejected before any chain work — the
+    // on-chain `_authorizationStates` map remains the settlement-level
+    // backstop. A failed settle burns the challenge; clients simply
+    // re-challenge (the 402 response carries a fresh one).
+    if config
+        .nonce_ledger
+        .consume(&payload.nonce, now_unix_secs())
+        .is_err()
+    {
+        return PaidOutcome::Reject(X402Error::ChallengeNotIssued);
+    }
+
     // 3. Price check — caller must have authorized at least what
     // this request costs.
     if payload.value < price {
@@ -578,6 +601,7 @@ fn make_challenge(
     amount_wei: U256,
 ) -> Result<crate::types::PaymentChallenge, X402Error> {
     let nonce = nonces.next_nonce();
+    let now_unix = now_unix_secs();
     let built = build_challenge(ChallengeInputs {
         chain_id: config.chain_id,
         facilitator: config.facilitator_address,
@@ -586,9 +610,14 @@ fn make_challenge(
         amount_wei,
         payer: H160::zero(),
         nonce,
-        now_unix: now_unix_secs(),
+        now_unix,
         ttl_secs: config.challenge_ttl_secs,
     })?;
+    // Record in the issued-nonce ledger so the paid path can later
+    // verify this challenge is ours, unexpired, and single-use.
+    config
+        .nonce_ledger
+        .record(nonce, now_unix + config.challenge_ttl_secs, now_unix);
     Ok(built.challenge)
 }
 

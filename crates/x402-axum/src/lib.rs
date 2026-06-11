@@ -71,6 +71,7 @@ pub mod error;
 pub mod header;
 pub mod keys;
 pub mod layer;
+pub mod ledger;
 pub mod nonce;
 pub mod observability;
 pub mod pricing;
@@ -87,6 +88,7 @@ pub use digest::{eip712_digest, transfer_with_authorization_struct_hash, wsalt_d
 pub use error::X402Error;
 pub use header::{decode as decode_payment_header, encode as encode_payment_header, X_PAYMENT_HEADER};
 pub use layer::{X402Layer, X402LayerBuilder, X402Service};
+pub use ledger::{NonceLedger, NonceLedgerError};
 pub use nonce::NonceSource;
 pub use observability::{
     CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent,
