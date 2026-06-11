@@ -315,23 +315,26 @@ async fn malformed_header_fires_on_rejected() {
 }
 
 #[tokio::test]
-async fn replay_fires_on_rejected_with_replayed_reason() {
+async fn settle_revert_fires_on_rejected_with_neutral_reason() {
     // First request: happy path → hook.settled += 1.
-    // Second request: replay → hook.rejected += 1 with reason.
+    // Second request: on-chain revert → hook.rejected += 1 with the
+    // neutral "settle reverted" reason (2026-05-31 audit -006 /
+    // SECREM-02 6.4a: a revert is not necessarily a replay and must
+    // not be reported as one).
     let hook = Arc::new(RecordingHook::default());
     let app = build_app(hook.clone());
 
     // First paid request succeeds.
     run(app.clone(), paid_request(&app).await).await;
     // Second with the same mock — MockChain returns status=false
-    // (replay simulation).
+    // (revert simulation).
     run(app.clone(), paid_request(&app).await).await;
 
     let settled = hook.settled.lock().expect("mutex");
     let rejected = hook.rejected.lock().expect("mutex");
     assert_eq!(settled.len(), 1);
     assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0].0, "nonce replayed");
+    assert_eq!(rejected[0].0, "settle reverted");
     assert_eq!(rejected[0].1, 402);
 }
 

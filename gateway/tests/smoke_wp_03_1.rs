@@ -28,6 +28,11 @@ use tower::ServiceExt;
 use citrate_gateway::{build_router, GatewayConfig};
 
 fn config_with_unreachable_chain() -> GatewayConfig {
+    // 2026-05-31 audit -005 part b (SECREM-02 6.4a): `build_router` now
+    // fails closed when no durable keystore is configured outside the
+    // explicit dev profile. These tests exercise free endpoints with an
+    // in-memory store, which is exactly the dev-profile case.
+    std::env::set_var("CITRATE_GATEWAY_DEV_MODE", "1");
     GatewayConfig {
         chain_id: 40204,
         // Deliberately a port nothing is listening on — proves the
