@@ -50,6 +50,90 @@ pub struct ProviderProtocolResponse {
     /// back to whitespace-split if absent.
     #[serde(default)]
     pub output_tokens: Option<u32>,
+    /// Optional result-binding signature (FUA-GATEWAY-02): 65-byte
+    /// `r||s||v` hex (0x-prefixed or bare) by the provider's registered
+    /// key over [`result_binding_digest`]. When present it MUST verify;
+    /// when `CITRATE_GATEWAY_REQUIRE_SIGNED_RESULTS=1` it MUST be present.
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// Domain tag for signed provider results (FUA-GATEWAY-02). Versioned so
+/// a future scheme change can't be replayed against the old one.
+pub const RESULT_SIG_DOMAIN: &[u8] = b"CITRATE-RESULT-V1";
+
+/// FUA-GATEWAY-02: the digest a provider signs to bind its output to the
+/// job: `keccak(domain || model_hash || keccak(prompt) || keccak(output))`.
+/// Hashing prompt/output first keeps the preimage fixed-size.
+pub fn result_binding_digest(
+    model_hash: ethereum_types::H256,
+    prompt: &str,
+    output: &str,
+) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let prompt_hash = Keccak256::digest(prompt.as_bytes());
+    let output_hash = Keccak256::digest(output.as_bytes());
+    let mut h = Keccak256::new();
+    h.update(RESULT_SIG_DOMAIN);
+    h.update(model_hash.as_bytes());
+    h.update(&prompt_hash);
+    h.update(&output_hash);
+    h.finalize().into()
+}
+
+/// FUA-GATEWAY-02: verify a provider's result-binding signature against
+/// its on-chain registered address. Any malformed input → `false`
+/// (fail closed).
+pub fn verify_result_binding(
+    provider: ethereum_types::H160,
+    model_hash: ethereum_types::H256,
+    prompt: &str,
+    output: &str,
+    signature_hex: &str,
+) -> bool {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use sha3::{Digest, Keccak256};
+
+    let sig_bytes = match hex::decode(signature_hex.trim_start_matches("0x")) {
+        Ok(b) if b.len() == 65 => b,
+        _ => return false,
+    };
+    let sig = match Signature::from_slice(&sig_bytes[..64]) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let v = sig_bytes[64];
+    let rec = match RecoveryId::from_byte(if v >= 27 { v - 27 } else { v }) {
+        Some(r) => r,
+        None => return false,
+    };
+    let digest = result_binding_digest(model_hash, prompt, output);
+    let vk = match VerifyingKey::recover_from_prehash(&digest, &sig, rec) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let point = vk.to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    ethereum_types::H160::from_slice(&hash[12..]) == provider
+}
+
+/// FUA-GATEWAY-02 policy: when set, every provider result must carry a
+/// valid binding signature or it is treated as a dispatch failure.
+pub fn require_signed_results() -> bool {
+    std::env::var("CITRATE_GATEWAY_REQUIRE_SIGNED_RESULTS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// FUA-GATEWAY-02 acceptance: a present signature must verify; an absent
+/// one is acceptable only while signed results are not required (the
+/// documented pilot trust assumption).
+pub fn result_acceptable(signature_valid: Option<bool>, required: bool) -> bool {
+    match signature_valid {
+        Some(valid) => valid,
+        None => !required,
+    }
 }
 
 /// Pick the best provider from a candidate list, or `None` if no
@@ -344,5 +428,79 @@ mod tests {
             .await
             .expect_err("credentials must be rejected");
         assert!(err.to_string().contains("credentials"));
+    }
+
+    // ── FUA-GATEWAY-02: result-binding signature ────────────────────
+
+    /// Sign the binding digest with a throwaway k256 key and return
+    /// (eth_address, 65-byte r||s||v hex).
+    fn sign_binding(
+        model_hash: ethereum_types::H256,
+        prompt: &str,
+        output: &str,
+    ) -> (H160, String) {
+        use k256::ecdsa::SigningKey;
+        use sha3::{Digest, Keccak256};
+        let sk = SigningKey::from_slice(&[0x42u8; 32]).expect("key");
+        let digest = result_binding_digest(model_hash, prompt, output);
+        let (sig, rec) = sk.sign_prehash_recoverable(&digest).expect("sign");
+        let vk = sk.verifying_key();
+        let point = vk.to_encoded_point(false);
+        let hash = Keccak256::digest(&point.as_bytes()[1..]);
+        let addr = H160::from_slice(&hash[12..]);
+        let mut bytes = sig.to_bytes().to_vec();
+        bytes.push(rec.to_byte() + 27);
+        (addr, format!("0x{}", hex::encode(bytes)))
+    }
+
+    #[test]
+    fn valid_binding_signature_verifies() {
+        let mh = ethereum_types::H256::from([0x11; 32]);
+        let (addr, sig) = sign_binding(mh, "prompt", "output");
+        assert!(verify_result_binding(addr, mh, "prompt", "output", &sig));
+    }
+
+    #[test]
+    fn tampered_output_fails_verification() {
+        let mh = ethereum_types::H256::from([0x11; 32]);
+        let (addr, sig) = sign_binding(mh, "prompt", "output");
+        assert!(!verify_result_binding(addr, mh, "prompt", "FORGED", &sig));
+    }
+
+    #[test]
+    fn wrong_provider_address_fails_verification() {
+        let mh = ethereum_types::H256::from([0x11; 32]);
+        let (_, sig) = sign_binding(mh, "prompt", "output");
+        let other = H160::from([0x99; 20]);
+        assert!(!verify_result_binding(other, mh, "prompt", "output", &sig));
+    }
+
+    #[test]
+    fn wrong_model_hash_fails_verification() {
+        let mh = ethereum_types::H256::from([0x11; 32]);
+        let (addr, sig) = sign_binding(mh, "prompt", "output");
+        let other_mh = ethereum_types::H256::from([0x22; 32]);
+        assert!(!verify_result_binding(addr, other_mh, "prompt", "output", &sig));
+    }
+
+    #[test]
+    fn malformed_signature_fails_closed() {
+        let mh = ethereum_types::H256::from([0x11; 32]);
+        let addr = H160::from([0x01; 20]);
+        assert!(!verify_result_binding(addr, mh, "p", "o", "not-hex"));
+        assert!(!verify_result_binding(addr, mh, "p", "o", "0xabcd"));
+        assert!(!verify_result_binding(addr, mh, "p", "o", ""));
+    }
+
+    #[test]
+    fn result_acceptance_policy_fails_closed() {
+        // Present signature: verification result decides, required or not.
+        assert!(result_acceptable(Some(true), false));
+        assert!(result_acceptable(Some(true), true));
+        assert!(!result_acceptable(Some(false), false));
+        assert!(!result_acceptable(Some(false), true));
+        // Absent signature: acceptable only while not required.
+        assert!(result_acceptable(None, false));
+        assert!(!result_acceptable(None, true));
     }
 }

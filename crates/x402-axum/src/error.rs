@@ -38,6 +38,13 @@ pub enum X402Error {
     #[error("nonce replayed: already settled on-chain")]
     NonceReplayed,
 
+    /// Payment nonce was never issued by this gateway, already consumed
+    /// by a prior payment attempt, or its challenge expired. The paid
+    /// path only accepts nonces minted by `make_challenge` (2026-05-31
+    /// audit finding 001 — challenge-nonce replay ledger).
+    #[error("payment nonce not issued by this gateway (or already used/expired)")]
+    ChallengeNotIssued,
+
     /// `block.timestamp` exceeds `validBefore`, or is below `validAfter`.
     #[error("payload expired or not yet valid")]
     Expired,
@@ -117,6 +124,7 @@ impl X402Error {
             | MalformedPaymentHeader(_)
             | InvalidSignature
             | NonceReplayed
+            | ChallengeNotIssued
             | Expired
             | RecipientNotTreasury
             | InsufficientBalance
@@ -141,6 +149,7 @@ impl X402Error {
             MalformedPaymentHeader(_) => "malformed payment header",
             InvalidSignature => "signature invalid",
             NonceReplayed => "nonce replayed",
+            ChallengeNotIssued => "challenge not issued",
             Expired => "expired",
             RecipientNotTreasury => "recipient not treasury",
             InsufficientBalance => "insufficient balance",

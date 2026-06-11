@@ -212,10 +212,32 @@ async fn run(app: Router, req: Request<Body>) {
     let _res = app.oneshot(req).await.expect("service call");
 }
 
-fn paid_request() -> Request<Body> {
+/// Unpaid handshake → server-issued challenge nonce → paid request.
+/// The challenge-nonce ledger (2026-05-31 audit 001) rejects
+/// self-minted nonces, so every paid request must start from a
+/// server-issued challenge. The unpaid 402 does not fire the
+/// observability hook (first-contact, not a failed settlement), so
+/// hook counts are unaffected.
+async fn paid_request(app: &Router) -> Request<Body> {
+    let res = app
+        .clone()
+        .oneshot(unpaid_request())
+        .await
+        .expect("handshake call");
+    let body = res
+        .into_body()
+        .collect()
+        .await
+        .expect("handshake body")
+        .to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("challenge json");
+    let nonce_hex = v["x402"]["nonce"].as_str().expect("challenge nonce");
+    let bytes = hex::decode(nonce_hex.trim_start_matches("0x")).expect("nonce hex");
+    let mut payload = sample_payload();
+    payload.nonce = H256::from_slice(&bytes);
     Request::builder()
         .uri("/gated")
-        .header(X_PAYMENT_HEADER, encode_payment_header(&sample_payload()))
+        .header(X_PAYMENT_HEADER, encode_payment_header(&payload))
         .body(Body::empty())
         .expect("build request")
 }
@@ -233,7 +255,7 @@ fn unpaid_request() -> Request<Body> {
 async fn happy_path_fires_on_settled_exactly_once() {
     let hook = Arc::new(RecordingHook::default());
     let app = build_app(hook.clone());
-    run(app, paid_request()).await;
+    run(app.clone(), paid_request(&app).await).await;
 
     let settled = hook.settled.lock().expect("mutex");
     assert_eq!(settled.len(), 1);
@@ -300,10 +322,10 @@ async fn replay_fires_on_rejected_with_replayed_reason() {
     let app = build_app(hook.clone());
 
     // First paid request succeeds.
-    run(app.clone(), paid_request()).await;
+    run(app.clone(), paid_request(&app).await).await;
     // Second with the same mock — MockChain returns status=false
     // (replay simulation).
-    run(app, paid_request()).await;
+    run(app.clone(), paid_request(&app).await).await;
 
     let settled = hook.settled.lock().expect("mutex");
     let rejected = hook.rejected.lock().expect("mutex");
@@ -319,7 +341,7 @@ async fn counters_observability_counts_success_and_rejects_separately() {
     let app = build_app(counters.clone());
 
     // 2 happy paths + 1 malformed rejection.
-    run(app.clone(), paid_request()).await;
+    run(app.clone(), paid_request(&app).await).await;
     // (The mock replays on second happy; skip it to keep settled=2)
     // Instead: send two malformed requests to exercise rejection path.
     let malformed = || {
@@ -370,7 +392,7 @@ async fn hook_panic_does_not_leak_to_request() {
     }
 
     let app = build_app(PanickyHook);
-    let res = app.oneshot(paid_request()).await.expect("call");
+    let res = app.clone().oneshot(paid_request(&app).await).await.expect("call");
     // Shouldn't be a 500 in happy path.
     assert_eq!(res.status(), 200);
     // Drain body to avoid leaks.

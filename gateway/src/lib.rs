@@ -106,6 +106,38 @@ fn open_marketplace_store() -> Option<Arc<keystore::PersistentKeyStore>> {
     }
 }
 
+/// FUA-GATEWAY-01: outcome of the open-chat gate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenChatDecision {
+    /// `CITRATE_GATEWAY_OPEN_CHAT` unset — free endpoints only.
+    Off,
+    /// Open-chat requested AND the dev profile is explicitly on.
+    On,
+    /// Open-chat requested WITHOUT the dev profile — refused
+    /// (fail closed; this is what a production deploy hits).
+    RefusedNotDev,
+}
+
+/// FUA-GATEWAY-01: the unauthenticated open-chat pilot routes mount only
+/// when `CITRATE_GATEWAY_OPEN_CHAT=1` AND `CITRATE_GATEWAY_DEV_MODE=1`.
+/// Any other combination fails closed. `main.rs` additionally refuses a
+/// non-loopback bind while the open profile is active (see
+/// [`open_chat_bind_allowed`]).
+pub fn resolve_open_chat(open_chat: Option<&str>, dev_mode: Option<&str>) -> OpenChatDecision {
+    match (open_chat == Some("1"), dev_mode == Some("1")) {
+        (false, _) => OpenChatDecision::Off,
+        (true, true) => OpenChatDecision::On,
+        (true, false) => OpenChatDecision::RefusedNotDev,
+    }
+}
+
+/// FUA-GATEWAY-01 (bind half): while the open-chat dev profile is active,
+/// only loopback binds are permitted — an unauthenticated, unpaid inference
+/// surface must never be remotely reachable.
+pub fn open_chat_bind_allowed(addr: &std::net::SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
 /// Production router builder. Wires `HttpChainQueries` and
 /// `HttpChainClient` from the configured `rpc_url`.
 ///
@@ -137,7 +169,29 @@ pub async fn build_router(config: GatewayConfig) -> Router {
         &config.rpc_url,
         config.contracts.clone(),
     ));
-    let open_chat = std::env::var("CITRATE_GATEWAY_OPEN_CHAT").ok().as_deref() == Some("1");
+    // FUA-GATEWAY-01: OPEN_CHAT alone no longer mounts the unauthenticated
+    // routes — it additionally requires the explicit dev-profile opt-in.
+    // A deploy that sets OPEN_CHAT=1 without DEV_MODE=1 gets free endpoints
+    // only (fail closed) and a loud error explaining why. main.rs adds the
+    // second half of the gate: an active open-chat profile refuses to start
+    // on a non-loopback bind.
+    let open_chat = match resolve_open_chat(
+        std::env::var("CITRATE_GATEWAY_OPEN_CHAT").ok().as_deref(),
+        std::env::var("CITRATE_GATEWAY_DEV_MODE").ok().as_deref(),
+    ) {
+        OpenChatDecision::Off => false,
+        OpenChatDecision::On => true,
+        OpenChatDecision::RefusedNotDev => {
+            tracing::error!(
+                "CITRATE_GATEWAY_OPEN_CHAT=1 REFUSED: the unauthenticated open-chat \
+                 pilot routes additionally require the explicit dev profile \
+                 (CITRATE_GATEWAY_DEV_MODE=1) and a loopback bind. Production \
+                 traffic must use build_router_with (x402 payment) or the \
+                 local-proxy cgk_ key wall. (FUA-GATEWAY-01)"
+            );
+            false
+        }
+    };
 
     // One shared durable store backs both the API-key balances and the
     // in-flight batch state (WP-F) — so a batch refund + its balance credit
@@ -352,3 +406,48 @@ mod state {
 
 /// Type alias for the shared-state Arc handlers receive.
 pub type SharedState = Arc<state::AppState>;
+
+#[cfg(test)]
+mod open_chat_gate_tests {
+    use super::*;
+
+    // FUA-GATEWAY-01 red tests: a production deploy (OPEN_CHAT=1, no dev
+    // profile) must be REFUSED; only the explicit dev profile + loopback
+    // combination may mount the unauthenticated routes.
+
+    #[test]
+    fn open_chat_without_dev_profile_is_refused() {
+        assert_eq!(
+            resolve_open_chat(Some("1"), None),
+            OpenChatDecision::RefusedNotDev
+        );
+        assert_eq!(
+            resolve_open_chat(Some("1"), Some("0")),
+            OpenChatDecision::RefusedNotDev
+        );
+    }
+
+    #[test]
+    fn open_chat_with_dev_profile_is_on() {
+        assert_eq!(resolve_open_chat(Some("1"), Some("1")), OpenChatDecision::On);
+    }
+
+    #[test]
+    fn open_chat_unset_is_off_regardless_of_dev_profile() {
+        assert_eq!(resolve_open_chat(None, Some("1")), OpenChatDecision::Off);
+        assert_eq!(resolve_open_chat(Some("0"), Some("1")), OpenChatDecision::Off);
+        assert_eq!(resolve_open_chat(None, None), OpenChatDecision::Off);
+    }
+
+    #[test]
+    fn open_chat_bind_requires_loopback() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:9800".parse().unwrap();
+        let loopback6: std::net::SocketAddr = "[::1]:9800".parse().unwrap();
+        let public: std::net::SocketAddr = "0.0.0.0:9800".parse().unwrap();
+        let lan: std::net::SocketAddr = "10.0.0.5:9800".parse().unwrap();
+        assert!(open_chat_bind_allowed(&loopback));
+        assert!(open_chat_bind_allowed(&loopback6));
+        assert!(!open_chat_bind_allowed(&public));
+        assert!(!open_chat_bind_allowed(&lan));
+    }
+}

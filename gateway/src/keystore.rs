@@ -581,6 +581,13 @@ impl PersistentKeyStore {
         }
 
         if record.daily_quota > 0 {
+            // FUA-GATEWAY-03: the read-compare-write below must be atomic per
+            // key — two concurrent requests could both read N and both write
+            // N+1, drifting past the cap. Reuse the per-key balance lock so
+            // the daily counter has the same single-writer guarantee money
+            // does.
+            let keylock = self.lock_for(&h);
+            let _guard = keylock.lock();
             let day = today_yyyymmdd();
             let day_key = quota_key(&h, &day);
             let cur = self
@@ -859,5 +866,36 @@ mod tests {
         for _ in 0..200 {
             store.try_consume(&id).unwrap();
         }
+    }
+
+    /// FUA-GATEWAY-03: the daily-quota counter must be atomic per key.
+    /// Pre-fix the read-compare-write raced — concurrent consumers could
+    /// both read N and both write N+1, drifting past the cap. With the
+    /// per-key lock, exactly `daily_quota` consumes succeed no matter how
+    /// many race.
+    #[test]
+    fn daily_quota_is_atomic_under_concurrency() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(PersistentKeyStore::open(dir.path()).unwrap());
+        // quota_rps=0 disables the per-second window so only the daily
+        // path is exercised.
+        let id = store.create_key("racy", 0, 16).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let id = id.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ok = 0u64;
+                for _ in 0..8 {
+                    if store.try_consume(&id).is_ok() {
+                        ok += 1;
+                    }
+                }
+                ok
+            }));
+        }
+        let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 16, "exactly daily_quota consumes may succeed");
     }
 }
