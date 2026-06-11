@@ -38,6 +38,15 @@ pub enum X402Error {
     #[error("nonce replayed: already settled on-chain")]
     NonceReplayed,
 
+    /// The settlement tx reverted on-chain for an undecoded reason
+    /// (2026-05-31 audit -006, SECREM-02 6.4a). A revert is NOT
+    /// necessarily a replay — it can be insufficient balance, a paused
+    /// facilitator, or misconfiguration — so it is reported neutrally,
+    /// carrying the settle tx hash for on-chain inspection. 402: the
+    /// client can re-challenge and retry.
+    #[error("settle reverted on-chain (tx 0x{0})")]
+    SettleReverted(String),
+
     /// Payment nonce was never issued by this gateway, already consumed
     /// by a prior payment attempt, or its challenge expired. The paid
     /// path only accepts nonces minted by `make_challenge` (2026-05-31
@@ -124,6 +133,7 @@ impl X402Error {
             | MalformedPaymentHeader(_)
             | InvalidSignature
             | NonceReplayed
+            | SettleReverted(_)
             | ChallengeNotIssued
             | Expired
             | RecipientNotTreasury
@@ -149,6 +159,7 @@ impl X402Error {
             MalformedPaymentHeader(_) => "malformed payment header",
             InvalidSignature => "signature invalid",
             NonceReplayed => "nonce replayed",
+            SettleReverted(_) => "settle reverted",
             ChallengeNotIssued => "challenge not issued",
             Expired => "expired",
             RecipientNotTreasury => "recipient not treasury",

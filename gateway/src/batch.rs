@@ -107,6 +107,12 @@ struct BatchRecord {
     released_grains: U256,
     refunded_grains: U256,
     payer_api_key_id: Option<String>,
+    /// 2026-05-31 audit -004 (SECREM-02 6.4a): SHA-256 (hex) of the
+    /// submit-time read token issued to payers with no API key (x402 /
+    /// open-chat). Reads must present the matching token; only the hash
+    /// is kept at rest. `None` when an API key owns the batch (reads
+    /// then require that key's bearer).
+    read_token_hash: Option<String>,
     slots: Vec<RequestSlot>,
     created_at: u64,
 }
@@ -157,6 +163,11 @@ struct PersistedBatch {
     released_grains: String,
     refunded_grains: String,
     payer_api_key_id: Option<String>,
+    /// Audit -004 — see [`BatchRecord::read_token_hash`]. `default` keeps
+    /// pre-6.4a persisted batches decodable; they re-hydrate with `None`
+    /// (and no API-key owner), so their reads FAIL CLOSED.
+    #[serde(default)]
+    read_token_hash: Option<String>,
     slots: Vec<PersistedSlot>,
     created_at: u64,
     refund_settled: bool,
@@ -171,6 +182,7 @@ impl PersistedBatch {
             released_grains: r.released_grains.to_string(),
             refunded_grains: r.refunded_grains.to_string(),
             payer_api_key_id: r.payer_api_key_id.clone(),
+            read_token_hash: r.read_token_hash.clone(),
             slots: r
                 .slots
                 .iter()
@@ -202,6 +214,7 @@ impl PersistedBatch {
             released_grains: parse(&self.released_grains),
             refunded_grains: parse(&self.refunded_grains),
             payer_api_key_id: self.payer_api_key_id,
+            read_token_hash: self.read_token_hash,
             slots: self
                 .slots
                 .into_iter()
@@ -393,6 +406,13 @@ pub struct BatchStatusResponse {
     pub released_grains: String,
     /// Amount refunded to client (one share per errored request).
     pub refunded_grains: String,
+    /// 2026-05-31 audit -004: one-time read credential, present ONLY in
+    /// the initial submit response of a batch with no API-key owner
+    /// (x402 / open-chat submits). The caller must present it as a
+    /// Bearer token (or `x-batch-read-token` header) on `GET
+    /// /v1/batch/{id}` and `/output`. Never echoed on polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_token: Option<String>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -461,6 +481,20 @@ pub async fn submit_batch_handler(
 
     let id = format!("batch_{}", Uuid::new_v4());
     let payer_api_key_id = api_key.as_ref().map(|Extension(ctx)| ctx.key_id.clone());
+    // 2026-05-31 audit -004: bind reads to the submitter. API-key
+    // submits are owned by that key (reads require the same bearer).
+    // Key-less submits (x402-settled, and the open-chat dev profile —
+    // where this token is the ONLY thing standing between a guessed
+    // batch id and another tenant's prompts) get a one-time read token,
+    // returned exactly once in the submit response; only its SHA-256
+    // is stored.
+    let (read_token, read_token_hash) = if payer_api_key_id.is_none() {
+        let token = format!("brt_{}", Uuid::new_v4());
+        let hash = crate::auth::hash_key_id(&token);
+        (Some(token), Some(hash))
+    } else {
+        (None, None)
+    };
     let record = BatchRecord {
         id: id.clone(),
         status: BatchStatus::Submitted,
@@ -468,13 +502,15 @@ pub async fn submit_batch_handler(
         released_grains: U256::zero(),
         refunded_grains: U256::zero(),
         payer_api_key_id,
+        read_token_hash,
         slots,
         created_at: now_unix_secs(),
     };
 
     let arc = state.batches.insert(record).await;
     metrics::counter!("gateway_batch_submissions_total", 1);
-    let initial = build_status(&*arc.read().await);
+    let mut initial = build_status(&*arc.read().await);
+    initial.read_token = read_token;
 
     // Spawn the processor task. It runs detached; status polls read
     // through the same Arc<RwLock<BatchRecord>>.
@@ -493,23 +529,71 @@ pub async fn submit_batch_handler(
     Ok(response)
 }
 
-/// `GET /v1/batch/{id}` — poll batch status.
+/// 404 body shared by "unknown id" and "not authorized" so a probing
+/// caller cannot distinguish existing batches from non-existent ones
+/// (audit -004: no existence oracle).
+fn batch_not_found(id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": { "message": format!("unknown batch_id: {}", id) }
+        })),
+    )
+        .into_response()
+}
+
+/// 2026-05-31 audit -004 (SECREM-02 6.4a): batch reads are bound to the
+/// submitter. Pre-fix both read handlers took only `Path(id)` — any
+/// caller who learned a batch id could read another tenant's prompts and
+/// outputs. Authorization:
+///
+/// - API-key-owned batch → the caller must present the owning key as a
+///   Bearer token (compared by SHA-256, never raw).
+/// - Key-less batch (x402 / open-chat dev profile) → the caller must
+///   present the submit-time `read_token` (Bearer or
+///   `x-batch-read-token` header). Only the token's SHA-256 is at rest.
+/// - Neither credential on the record (pre-6.4a persisted batches
+///   re-hydrated after an upgrade) → fail closed.
+fn batch_read_authorized(record: &BatchRecord, headers: &axum::http::HeaderMap) -> bool {
+    let presented = crate::auth::extract_bearer(headers).or_else(|| {
+        headers
+            .get("x-batch-read-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let Some(presented) = presented else {
+        return false;
+    };
+    if let Some(owner_key) = &record.payer_api_key_id {
+        // Hash both sides — avoids a variable-time compare on the raw
+        // bearer secret and never materializes it beyond this scope.
+        crate::auth::hash_key_id(&presented) == crate::auth::hash_key_id(owner_key)
+    } else if let Some(token_hash) = &record.read_token_hash {
+        &crate::auth::hash_key_id(&presented) == token_hash
+    } else {
+        false
+    }
+}
+
+/// `GET /v1/batch/{id}` — poll batch status. Requires the submitter's
+/// credential (audit -004; see [`batch_read_authorized`]).
 pub async fn get_batch_handler(
     State(state): State<SharedState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     match state.batches.get(&id).await {
         Some(arc) => {
-            let body = build_status(&*arc.read().await);
+            let record = arc.read().await;
+            if !batch_read_authorized(&record, &headers) {
+                metrics::counter!("gateway_batch_read_denied_total", 1);
+                return batch_not_found(&id);
+            }
+            let body = build_status(&record);
             (StatusCode::OK, Json(body)).into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "message": format!("unknown batch_id: {}", id) }
-            })),
-        )
-            .into_response(),
+        None => batch_not_found(&id),
     }
 }
 
@@ -522,18 +606,19 @@ pub async fn get_batch_handler(
 pub async fn get_batch_output_handler(
     State(state): State<SharedState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let Some(arc) = state.batches.get(&id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "message": format!("unknown batch_id: {}", id) }
-            })),
-        )
-            .into_response();
+        return batch_not_found(&id);
     };
 
     let record = arc.read().await;
+    // Audit -004: outputs (prompts + completions) are the most
+    // sensitive read — same submitter binding as the status poll.
+    if !batch_read_authorized(&record, &headers) {
+        metrics::counter!("gateway_batch_read_denied_total", 1);
+        return batch_not_found(&id);
+    }
     let mut body = String::with_capacity(256 * record.slots.len());
     for (i, slot) in record.slots.iter().enumerate() {
         let line = match slot.state {
@@ -760,6 +845,9 @@ fn build_status(record: &BatchRecord) -> BatchStatusResponse {
         paid_escrow_grains: record.paid_escrow_grains.to_string(),
         released_grains: record.released_grains.to_string(),
         refunded_grains: record.refunded_grains.to_string(),
+        // Only the submit handler ever sets this (audit -004); polls
+        // never re-issue the read credential.
+        read_token: None,
     }
 }
 

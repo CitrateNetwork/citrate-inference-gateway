@@ -47,7 +47,7 @@ use x402_axum::{PricingStrategy, X402Paid};
 /// surfaced live keys an attacker could replay verbatim.
 /// Post-fix the store only holds `sha256(key_id)`; the live key
 /// material exists only on the holder's side.
-fn hash_key_id(key_id: &str) -> String {
+pub(crate) fn hash_key_id(key_id: &str) -> String {
     let mut h = Sha256::new();
     h.update(key_id.as_bytes());
     let out = h.finalize();
@@ -657,7 +657,7 @@ async fn settle_api_key_response(
     resp
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
