@@ -40,6 +40,27 @@ const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default max output tokens when caller doesn't specify.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 512;
 
+/// Hard ceiling on a single request's output tokens (FUA-GATEWAY-04). Recharging
+/// against the caller's `max_tokens` makes a huge request non-free, but a paid
+/// (or simply large) value still lets one request pin a provider slot generating
+/// an enormous response. `CITRATE_GATEWAY_MAX_TOKENS` overrides; clamped, never
+/// rejected, so legitimate requests still complete (just bounded).
+pub(crate) const DEFAULT_MAX_TOKENS_CEILING: u32 = 8192;
+
+pub(crate) fn max_tokens_ceiling() -> u32 {
+    std::env::var("CITRATE_GATEWAY_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS_CEILING)
+}
+
+/// Clamp a caller's requested `max_tokens` to `ceiling` (FUA-GATEWAY-04). `None`
+/// stays `None` so downstream applies `DEFAULT_MAX_TOKENS`.
+pub(crate) fn clamp_max_tokens(requested: Option<u32>, ceiling: u32) -> Option<u32> {
+    requested.map(|mt| mt.min(ceiling))
+}
+
 /// How many providers to try before giving up on a request. The
 /// first attempt is the highest-scored provider; each subsequent
 /// attempt picks the next-best from the remaining candidates.
@@ -68,13 +89,19 @@ pub async fn chat_completions_handler(
     State(state): State<SharedState>,
     api_key: Option<Extension<ApiKeyContext>>,
     paid: Option<Extension<X402Paid>>,
-    Json(req): Json<ChatCompletionRequest>,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> Result<Response, GatewayError> {
     if req.messages.is_empty() {
         return Err(GatewayError::BadRequest(
             "messages must be non-empty".into(),
         ));
     }
+
+    // FUA-GATEWAY-04: clamp the per-request output budget to the hard ceiling
+    // BEFORE pricing or dispatch, so every downstream use (cost quote, provider
+    // call, batch slot) sees the bounded value. An unset max_tokens stays unset
+    // (downstream applies DEFAULT_MAX_TOKENS, which is well under the ceiling).
+    req.max_tokens = clamp_max_tokens(req.max_tokens, max_tokens_ceiling());
 
     // RM-B1 / WP-D2.4 (audit F-2): recharge against the caller's
     // actual `max_tokens` request. The X402Layer priced this request
@@ -449,6 +476,16 @@ mod input_token_estimation_tests {
             role: role.into(),
             content: content.into(),
         }
+    }
+
+    /// FUA-GATEWAY-04: an over-ceiling request is clamped; an unset value stays
+    /// unset (downstream applies the default); a small value is untouched.
+    #[test]
+    fn clamp_max_tokens_bounds_output_budget() {
+        assert_eq!(clamp_max_tokens(Some(1_000_000), 8192), Some(8192));
+        assert_eq!(clamp_max_tokens(Some(8192), 8192), Some(8192));
+        assert_eq!(clamp_max_tokens(Some(100), 8192), Some(100));
+        assert_eq!(clamp_max_tokens(None, 8192), None);
     }
 
     /// RM-I-3 / WP-I2.1: empty messages list saturates to the
