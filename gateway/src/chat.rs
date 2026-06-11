@@ -367,6 +367,41 @@ pub(crate) async fn run_dispatch(
 
         match dispatch_to_provider(&state.http, chosen, &provider_req, PROVIDER_TIMEOUT).await {
             Ok(resp) => {
+                // FUA-GATEWAY-02: bind the result to this provider + the
+                // priced model before accepting it. An empty output, a
+                // signature that fails to verify against the provider's
+                // registered address, or a missing signature while
+                // CITRATE_GATEWAY_REQUIRE_SIGNED_RESULTS=1 all count as a
+                // dispatch failure → failover, never an authoritative
+                // success that releases buyer funds.
+                let sig_valid = resp.signature.as_deref().map(|s| {
+                    crate::provider::verify_result_binding(
+                        chosen_addr,
+                        model_hash,
+                        &prompt,
+                        &resp.output,
+                        s,
+                    )
+                });
+                let acceptable = !resp.output.is_empty()
+                    && crate::provider::result_acceptable(
+                        sig_valid,
+                        crate::provider::require_signed_results(),
+                    );
+                if !acceptable {
+                    tracing::warn!(
+                        provider = %hex::encode(chosen_addr.as_bytes()),
+                        empty = resp.output.is_empty(),
+                        sig_valid = ?sig_valid,
+                        "provider result rejected (unbound/unverified), trying next"
+                    );
+                    metrics::counter!("gateway_provider_result_rejected_total", 1);
+                    last_err = Some(GatewayError::ProviderUnavailable(
+                        "provider returned an unverified or empty result".into(),
+                    ));
+                    providers.retain(|p| p.address != chosen_addr);
+                    continue;
+                }
                 let prompt_tokens = resp
                     .input_tokens
                     .unwrap_or_else(|| prompt.split_whitespace().count() as u32);
