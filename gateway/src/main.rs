@@ -128,6 +128,27 @@ async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(config).await;
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
 
+    // FUA-GATEWAY-01 (bind half): when the open-chat dev profile is active
+    // (OPEN_CHAT=1 + DEV_MODE=1), the gateway refuses to start on anything
+    // but loopback — an unauthenticated, unpaid inference surface must never
+    // be remotely reachable, dev profile or not.
+    let open_chat_active = citrate_gateway::resolve_open_chat(
+        env::var("CITRATE_GATEWAY_OPEN_CHAT").ok().as_deref(),
+        env::var("CITRATE_GATEWAY_DEV_MODE").ok().as_deref(),
+    ) == citrate_gateway::OpenChatDecision::On;
+    if open_chat_active {
+        let bound = listener.local_addr()?;
+        if !citrate_gateway::open_chat_bind_allowed(&bound) {
+            tracing::error!(
+                addr = %bound,
+                "REFUSING TO START: open-chat dev profile is active on a \
+                 non-loopback bind. Bind to 127.0.0.1, or drop \
+                 CITRATE_GATEWAY_OPEN_CHAT/CITRATE_GATEWAY_DEV_MODE. (FUA-GATEWAY-01)"
+            );
+            return Err("open-chat dev profile on non-loopback bind (FUA-GATEWAY-01)".into());
+        }
+    }
+
     // SECREM-01 SVC-5 (pre-audit 2026-06-09): warn loudly if the operator
     // intentionally exposed the gateway off loopback. Marketplace mode has
     // no bearer auth (x402 gates /v1/* only; /models + /healthz are open),

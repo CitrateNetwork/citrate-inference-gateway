@@ -248,13 +248,75 @@ fn paid_request(payload: &PaymentPayload) -> Request<Body> {
         .expect("build request")
 }
 
+/// Perform the unpaid handshake: hit the gated route with no
+/// X-PAYMENT header, parse the 402 challenge, and return the
+/// server-issued nonce. Since the challenge-nonce ledger landed
+/// (2026-05-31 audit 001), the paid path only accepts nonces minted
+/// this way — payloads with self-minted nonces are rejected.
+async fn issue_nonce(app: &Router) -> H256 {
+    let req = Request::builder()
+        .uri("/gated")
+        .body(Body::empty())
+        .expect("build request");
+    let res = app.clone().oneshot(req).await.expect("service");
+    assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED, "handshake 402");
+    let body = res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("challenge json");
+    let nonce_hex = v["x402"]["nonce"].as_str().expect("challenge nonce");
+    let bytes = hex::decode(nonce_hex.trim_start_matches("0x")).expect("nonce hex");
+    H256::from_slice(&bytes)
+}
+
 // ── Tests ────────────────────────────────────────────────────────
+
+/// 2026-05-31 audit 001 (challenge-nonce ledger): a payment whose
+/// nonce was never issued by this gateway must be rejected before
+/// any chain work — self-minted nonces no longer reach settlement.
+#[tokio::test]
+async fn unissued_nonce_rejected_402() {
+    let mock = MockChain::new(facilitator());
+    let app = build_app_with_mock(mock);
+    // sample_payload() carries a self-minted nonce (0xde…) the server
+    // never issued.
+    let (status, body) = call(app, paid_request(&sample_payload())).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let reason = body["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("challenge"),
+        "reason should mention the challenge ledger, got: {}",
+        reason
+    );
+}
+
+/// 2026-05-31 audit 001: an issued nonce is single-use — the second
+/// payment with the same nonce is rejected at the ledger, before the
+/// on-chain `_authorizationStates` backstop is even consulted.
+#[tokio::test]
+async fn issued_nonce_is_single_use() {
+    let mock = MockChain::new(facilitator());
+    let app = build_app_with_mock(mock);
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, _) = call(app.clone(), paid_request(&payload)).await;
+    assert_eq!(status, StatusCode::OK, "first use settles");
+    let (status, body) = call(app, paid_request(&payload)).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "second use refused");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(body["reason"].as_str().unwrap_or("").contains("challenge"));
+}
 
 #[tokio::test]
 async fn happy_path_forwards_to_inner_with_x402paid() {
     let mock = MockChain::new(facilitator());
     let app = build_app_with_mock(mock);
-    let payload = sample_payload();
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
     let (status, body) = call(app, paid_request(&payload)).await;
     assert_eq!(status, StatusCode::OK, "body = {:?}", String::from_utf8_lossy(&body));
     let text = String::from_utf8(body).expect("utf-8");
@@ -269,7 +331,9 @@ async fn invalid_signature_returns_402() {
     let mut mock = MockChain::new(facilitator());
     mock.force_invalid_sig = true;
     let app = build_app_with_mock(mock);
-    let (status, body) = call(app, paid_request(&sample_payload())).await;
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, body) = call(app, paid_request(&payload)).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let reason = body["reason"].as_str().unwrap_or("");
@@ -311,7 +375,9 @@ async fn recovered_signer_must_match_from_field() {
     }
     let mock = MismatchMock(MockChain::new(facilitator()));
     let app = build_app_with_mock_impl(Box::new(mock));
-    let (status, body) = call(app, paid_request(&sample_payload())).await;
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, body) = call(app, paid_request(&payload)).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert!(body["reason"].as_str().unwrap_or("").contains("signature"));
@@ -328,7 +394,9 @@ async fn replay_nonce_returns_402_with_reason() {
         .insert(H256::from([0xde; 32]));
 
     let app = build_app_with_mock(mock);
-    let (status, body) = call(app, paid_request(&sample_payload())).await;
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, body) = call(app, paid_request(&payload)).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let reason = body["reason"].as_str().unwrap_or("");
@@ -352,6 +420,7 @@ async fn test_f1_cross_gateway_replay_rejected() {
     // Payload addressed to a recipient that is NOT this gateway's
     // configured treasury.
     let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
     payload.to = H160::from([0xbe; 20]); // attacker / other-gateway treasury
 
     let (status, body) = call(app, paid_request(&payload)).await;
@@ -375,7 +444,9 @@ async fn test_f1_correct_treasury_accepted() {
     let mock = MockChain::new(facilitator());
     let app = build_app_with_mock(mock);
     // sample_payload()`to` is now bound to treasury_h160() by default.
-    let (status, _) = call(app, paid_request(&sample_payload())).await;
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, _) = call(app, paid_request(&payload)).await;
     assert_eq!(status, StatusCode::OK, "matched-treasury must be accepted");
 }
 
