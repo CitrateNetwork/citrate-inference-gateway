@@ -28,6 +28,12 @@ use citrate_gateway::{
 };
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Error};
 
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
+/// addresses (the placeholder default was removed from the builders).
+const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
+const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
+
+
 async fn spawn_stub_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
@@ -128,7 +134,17 @@ async fn spawn_gateway(provider: SocketAddr) -> (SocketAddr, Arc<ApiKeyStore>) {
         listen_addr: "127.0.0.1:0".to_string(),
         contracts: citrate_gateway::config::ContractAddresses::default(),
     };
-    let app = build_router_with_auth(config, queries, chain, operator_secret(), facilitator, keys.clone()).await;
+    let app = build_router_with_auth(
+        config,
+        queries,
+        chain,
+        operator_secret(),
+        facilitator,
+        TEST_WSALT,
+        TEST_TREASURY,
+        keys.clone(),
+    )
+    .await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gw");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {

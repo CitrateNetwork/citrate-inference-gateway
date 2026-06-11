@@ -79,30 +79,76 @@ pub use queries::{ChainQueries, HttpChainQueries, ModelInfo, PoolEntry, Provider
 
 use x402_axum::{ChainClient, X402Layer};
 
+/// 2026-05-31 audit -005 part b (SECREM-02 6.4a): outcome of the
+/// marketplace money-store resolution. Pure decision — env reads and
+/// side effects live in `open_marketplace_store`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MarketplaceStoreDecision {
+    /// `CITRATE_GATEWAY_KEYSTORE_PATH` set — durable RocksDB store.
+    Durable(String),
+    /// No keystore path, but the explicit dev profile
+    /// (`CITRATE_GATEWAY_DEV_MODE=1`) is on — volatile in-memory store
+    /// allowed, loudly.
+    VolatileDevAllowed,
+    /// No keystore path and NO dev profile — a production boot must not
+    /// serve money paths against volatile state (balances/escrow would
+    /// vanish on restart). Refused: the caller fails closed.
+    RefusedProdVolatile,
+}
+
+/// Pure resolver for the marketplace money-store policy (audit -005
+/// part b). Mirrors the WP 5.2 `resolve_open_chat` pattern: production
+/// is the *absence* of `CITRATE_GATEWAY_DEV_MODE=1`.
+pub fn resolve_marketplace_store(
+    keystore_path: Option<&str>,
+    dev_mode: Option<&str>,
+) -> MarketplaceStoreDecision {
+    match keystore_path {
+        Some(p) if !p.is_empty() => MarketplaceStoreDecision::Durable(p.to_string()),
+        _ if dev_mode == Some("1") => MarketplaceStoreDecision::VolatileDevAllowed,
+        _ => MarketplaceStoreDecision::RefusedProdVolatile,
+    }
+}
+
 /// Build the marketplace API-key (money) store for the production router.
 ///
 /// Durable RocksDB store when `CITRATE_GATEWAY_KEYSTORE_PATH` is set —
 /// production MUST set it so balances survive a restart (INFER-S4 / WP-F /
 /// TD-22). If set but unopenable, that's a fatal misconfiguration of a money
-/// store, so we panic rather than silently bill against volatile state. When
-/// unset (dev / tests), falls back to in-memory but warns loudly — the
-/// volatility is never silent.
+/// store, so we panic rather than silently bill against volatile state.
+///
+/// 2026-05-31 audit -005 part b (SECREM-02 6.4a): when the path is unset,
+/// the in-memory fallback is now allowed ONLY under the explicit dev
+/// profile (`CITRATE_GATEWAY_DEV_MODE=1`). A production boot (no dev
+/// profile) with no keystore path REFUSES TO START instead of silently
+/// serving money paths on volatile state — pre-fix this was a `warn!`.
 fn open_marketplace_store() -> Option<Arc<keystore::PersistentKeyStore>> {
-    match std::env::var("CITRATE_GATEWAY_KEYSTORE_PATH") {
-        Ok(path) if !path.is_empty() => match keystore::PersistentKeyStore::open(&path) {
+    let path = std::env::var("CITRATE_GATEWAY_KEYSTORE_PATH").ok();
+    let dev_mode = std::env::var("CITRATE_GATEWAY_DEV_MODE").ok();
+    match resolve_marketplace_store(path.as_deref(), dev_mode.as_deref()) {
+        MarketplaceStoreDecision::Durable(path) => match keystore::PersistentKeyStore::open(&path) {
             Ok(store) => {
                 tracing::info!(keystore = %path, "marketplace stores: durable (RocksDB, shared by keys + batches)");
                 Some(store)
             }
             Err(e) => panic!("failed to open durable gateway store at {path}: {e}"),
         },
-        _ => {
+        MarketplaceStoreDecision::VolatileDevAllowed => {
             tracing::warn!(
                 "CITRATE_GATEWAY_KEYSTORE_PATH unset — API-key balances + in-flight batches are \
-                 IN-MEMORY and will be LOST on restart (INFER-S4/WP-F/TD-22). Set it in production."
+                 IN-MEMORY and will be LOST on restart (INFER-S4/WP-F/TD-22). Allowed only \
+                 because CITRATE_GATEWAY_DEV_MODE=1."
             );
             None
         }
+        MarketplaceStoreDecision::RefusedProdVolatile => panic!(
+            "REFUSING TO START: CITRATE_GATEWAY_KEYSTORE_PATH is unset and the dev profile \
+             (CITRATE_GATEWAY_DEV_MODE=1) is not active. A production marketplace boot must \
+             not serve money paths on a volatile in-memory store — balances and batch escrow \
+             would be destroyed by a restart. Set CITRATE_GATEWAY_KEYSTORE_PATH, or set \
+             CITRATE_GATEWAY_DEV_MODE=1 for a non-production run. \
+             (2026-05-31 audit -005 part b / SECREM-02 6.4a)"
+        ),
     }
 }
 
@@ -136,6 +182,49 @@ pub fn resolve_open_chat(open_chat: Option<&str>, dev_mode: Option<&str>) -> Ope
 /// surface must never be remotely reachable.
 pub fn open_chat_bind_allowed(addr: &std::net::SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// The literal that used to be baked into the x402 wiring as both the
+/// wSALT token and the treasury (2026-05-31 audit -007). Kept ONLY so
+/// [`validate_money_address`] can reject it if anyone passes it back in.
+const RETIRED_PLACEHOLDER_ADDR: &str = "8951ae72e5479cae28ef7bb3caa4207d5719e24b";
+
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): money-path addresses must be
+/// explicit. Pre-fix, `build_router_with*` hardcoded the placeholder
+/// `0x8951…e24b` as BOTH the wSALT contract and the treasury — any
+/// deployment wired through those builders silently signed challenges
+/// against a placeholder domain and directed payment to a placeholder
+/// recipient. This validator rejects, fail-closed:
+///
+/// - unset / empty / non-hex / wrong-length input,
+/// - the zero address,
+/// - the retired placeholder literal itself.
+pub fn validate_money_address(name: &str, addr: &str) -> Result<H160, String> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "{name} is not configured — the x402 money path requires an explicit address \
+             (audit -007: no placeholder defaults)"
+        ));
+    }
+    let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let bytes = hex::decode(hex_part)
+        .map_err(|e| format!("{name} is not valid hex ({e}): {trimmed:?}"))?;
+    let arr: [u8; 20] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{name} must be 20 bytes, got {}: {trimmed:?}", bytes.len()))?;
+    let parsed = H160::from(arr);
+    if parsed == H160::zero() {
+        return Err(format!("{name} is the zero address — refusing the money path"));
+    }
+    if hex_part.eq_ignore_ascii_case(RETIRED_PLACEHOLDER_ADDR) {
+        return Err(format!(
+            "{name} is the retired placeholder 0x{RETIRED_PLACEHOLDER_ADDR} — supply the real \
+             deployment address (audit -007)"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Production router builder. Wires `HttpChainQueries` and
@@ -247,13 +336,26 @@ pub async fn build_router(config: GatewayConfig) -> Router {
 /// Test-injection router builder. Production callers use
 /// [`build_router`]; integration tests use this to inject mock
 /// chain queries + mock x402 chain client.
+///
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): `wsalt_address` and
+/// `treasury` are now REQUIRED explicit arguments — pre-fix both were
+/// the baked-in placeholder `0x8951…e24b`, and these builders are the
+/// only x402-wired boot paths, so a real money deployment inherited
+/// the placeholder silently. Validated by [`validate_money_address`];
+/// an unset/zero/placeholder address panics at startup (fail closed).
 pub async fn build_router_with(
     config: GatewayConfig,
     queries: Arc<dyn ChainQueries>,
     chain: Arc<dyn ChainClient>,
     operator_secret: [u8; 32],
     facilitator_address: H160,
+    wsalt_address: &str,
+    treasury: &str,
 ) -> Router {
+    let wsalt = validate_money_address("wsalt_address", wsalt_address)
+        .unwrap_or_else(|e| panic!("build_router_with: {e}"));
+    let treasury_addr = validate_money_address("treasury", treasury)
+        .unwrap_or_else(|e| panic!("build_router_with: {e}"));
     metrics::install_recorder();
     let state = Arc::new(state::AppState {
         config: config.clone(),
@@ -269,11 +371,8 @@ pub async fn build_router_with(
     let layer = X402Layer::builder()
         .chain_id(config.chain_id)
         .facilitator_address(&format!("0x{}", hex::encode(facilitator_address.as_bytes())))
-        // WSALT and treasury aren't critical for the smoke test —
-        // the digest only needs to be self-consistent across
-        // server-issue and client-sign.
-        .wsalt_address("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
-        .treasury("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
+        .wsalt_address(&format!("0x{}", hex::encode(wsalt.as_bytes())))
+        .treasury(&format!("0x{}", hex::encode(treasury_addr.as_bytes())))
         .rpc_url(&config.rpc_url)
         .pricing(pricing)
         .operator_secret_bytes(operator_secret)
@@ -316,14 +415,22 @@ pub async fn build_router_with(
 /// so the x402 layer's bypass forwards directly; an exhausted key
 /// falls through to x402's 402 challenge and the auth layer patches
 /// the body with a `deposit_instructions` pointer.
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): like [`build_router_with`],
+/// `wsalt_address` + `treasury` are required, validated, fail-closed.
 pub async fn build_router_with_auth(
     config: GatewayConfig,
     queries: Arc<dyn ChainQueries>,
     chain: Arc<dyn ChainClient>,
     operator_secret: [u8; 32],
     facilitator_address: H160,
+    wsalt_address: &str,
+    treasury: &str,
     keys: Arc<auth::ApiKeyStore>,
 ) -> Router {
+    let wsalt = validate_money_address("wsalt_address", wsalt_address)
+        .unwrap_or_else(|e| panic!("build_router_with_auth: {e}"));
+    let treasury_addr = validate_money_address("treasury", treasury)
+        .unwrap_or_else(|e| panic!("build_router_with_auth: {e}"));
     metrics::install_recorder();
     let state = Arc::new(state::AppState {
         config: config.clone(),
@@ -345,8 +452,8 @@ pub async fn build_router_with_auth(
     let x402 = X402Layer::builder()
         .chain_id(config.chain_id)
         .facilitator_address(&format!("0x{}", hex::encode(facilitator_address.as_bytes())))
-        .wsalt_address("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
-        .treasury("0x8951ae72e5479cae28ef7bb3caa4207d5719e24b")
+        .wsalt_address(&format!("0x{}", hex::encode(wsalt.as_bytes())))
+        .treasury(&format!("0x{}", hex::encode(treasury_addr.as_bytes())))
         .rpc_url(&config.rpc_url)
         .pricing(pricing_x402)
         .operator_secret_bytes(operator_secret)
@@ -449,5 +556,99 @@ mod open_chat_gate_tests {
         assert!(open_chat_bind_allowed(&loopback6));
         assert!(!open_chat_bind_allowed(&public));
         assert!(!open_chat_bind_allowed(&lan));
+    }
+}
+
+#[cfg(test)]
+mod money_address_tests {
+    use super::*;
+
+    // 2026-05-31 audit -007 (SECREM-02 6.4a) red tests: the retired
+    // placeholder, the zero address, and unset/garbage input must all
+    // be REJECTED by the x402 wiring path.
+
+    #[test]
+    fn placeholder_address_is_rejected() {
+        for form in [
+            "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b",
+            "8951ae72e5479cae28ef7bb3caa4207d5719e24b",
+            "0x8951AE72E5479CAE28EF7BB3CAA4207D5719E24B",
+        ] {
+            let err = validate_money_address("treasury", form)
+                .expect_err("placeholder must be rejected in every case form");
+            assert!(err.contains("placeholder"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn zero_and_unset_addresses_are_rejected() {
+        assert!(validate_money_address("wsalt_address", "").is_err());
+        assert!(validate_money_address("wsalt_address", "   ").is_err());
+        assert!(validate_money_address(
+            "wsalt_address",
+            "0x0000000000000000000000000000000000000000"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn garbage_addresses_are_rejected() {
+        assert!(validate_money_address("treasury", "not-hex").is_err());
+        assert!(validate_money_address("treasury", "0x1234").is_err()); // wrong length
+    }
+
+    #[test]
+    fn real_address_is_accepted() {
+        let parsed = validate_money_address(
+            "wsalt_address",
+            "0x61bc737f67b430fe2567630823694032a049253e",
+        )
+        .expect("real address accepted");
+        assert_ne!(parsed, H160::zero());
+    }
+}
+
+#[cfg(test)]
+mod marketplace_store_policy_tests {
+    use super::*;
+
+    // 2026-05-31 audit -005 part b (SECREM-02 6.4a) red tests: with no
+    // keystore path and no dev profile, the marketplace boot must be
+    // REFUSED — pre-fix it warn!'d and served money paths in-memory.
+
+    #[test]
+    fn prod_without_keystore_is_refused() {
+        assert_eq!(
+            resolve_marketplace_store(None, None),
+            MarketplaceStoreDecision::RefusedProdVolatile
+        );
+        assert_eq!(
+            resolve_marketplace_store(Some(""), None),
+            MarketplaceStoreDecision::RefusedProdVolatile
+        );
+        assert_eq!(
+            resolve_marketplace_store(None, Some("0")),
+            MarketplaceStoreDecision::RefusedProdVolatile
+        );
+    }
+
+    #[test]
+    fn dev_profile_allows_volatile_store_loudly() {
+        assert_eq!(
+            resolve_marketplace_store(None, Some("1")),
+            MarketplaceStoreDecision::VolatileDevAllowed
+        );
+    }
+
+    #[test]
+    fn keystore_path_is_durable_regardless_of_profile() {
+        assert_eq!(
+            resolve_marketplace_store(Some("/var/lib/gw"), None),
+            MarketplaceStoreDecision::Durable("/var/lib/gw".into())
+        );
+        assert_eq!(
+            resolve_marketplace_store(Some("/var/lib/gw"), Some("1")),
+            MarketplaceStoreDecision::Durable("/var/lib/gw".into())
+        );
     }
 }

@@ -466,6 +466,23 @@ fn pad_address_left(addr: H160) -> [u8; 32] {
     buf
 }
 
+/// 2026-05-31 audit -002 (SECREM-02 6.4a): bounded conversion of an
+/// attacker-influenced ABI length word. `U256::as_usize()` panics on
+/// anything above `usize::MAX`, and even an in-range giant overflows
+/// downstream `head + len * unit` arithmetic — so the word is checked
+/// against the number of items the actual buffer can hold BEFORE any
+/// native-width conversion. Mirrors the hardening already applied to
+/// `decode_string_at_offset_word`.
+fn abi_len_bounded(word: &[u8], max_items: usize, what: &str) -> Result<usize, GatewayError> {
+    let v = U256::from_big_endian(word);
+    if v > U256::from(max_items as u64) {
+        return Err(GatewayError::ChainUnavailable(format!(
+            "{what}: declared length {v} exceeds buffer capacity ({max_items} items)"
+        )));
+    }
+    Ok(v.as_u64() as usize)
+}
+
 /// Decode a `address[]` ABI return: 32-byte offset (always 0x20)
 /// + 32-byte length + N × 32-byte left-padded addresses.
 fn decode_address_array(bytes: &[u8]) -> Result<Vec<H160>, GatewayError> {
@@ -476,9 +493,10 @@ fn decode_address_array(bytes: &[u8]) -> Result<Vec<H160>, GatewayError> {
             bytes.len()
         )));
     }
-    // Skip offset (bytes 0..32). Length at bytes 32..64.
-    let len_bytes = &bytes[32..64];
-    let len = U256::from_big_endian(len_bytes).as_usize();
+    // Skip offset (bytes 0..32). Length at bytes 32..64. Bounded by
+    // the element count the remaining buffer can actually hold
+    // (audit -002: no as_usize, no unchecked `64 + len * 32`).
+    let len = abi_len_bounded(&bytes[32..64], (bytes.len() - 64) / 32, "address[]")?;
     let expected = 64 + len * 32;
     if bytes.len() < expected {
         return Err(GatewayError::ChainUnavailable(format!(
@@ -507,7 +525,8 @@ fn decode_bytes32_array(bytes: &[u8]) -> Result<Vec<H256>, GatewayError> {
             bytes.len()
         )));
     }
-    let len = U256::from_big_endian(&bytes[32..64]).as_usize();
+    // Audit -002: bounded conversion — see `abi_len_bounded`.
+    let len = abi_len_bounded(&bytes[32..64], (bytes.len() - 64) / 32, "bytes32[]")?;
     let expected = 64 + len * 32;
     if bytes.len() < expected {
         return Err(GatewayError::ChainUnavailable(format!(
@@ -641,7 +660,10 @@ fn decode_provider_info(addr: H160, bytes: &[u8]) -> Result<ProviderInfoRaw, Gat
     let total_inferences = U256::from_big_endian(&bytes[96..128]);
     let is_active = bytes[159] != 0;
 
-    let str_len = U256::from_big_endian(&bytes[160..192]).as_usize();
+    // Audit -002: bounded conversion — see `abi_len_bounded`. The
+    // endpoint string can occupy at most the bytes after the 192-byte
+    // static head.
+    let str_len = abi_len_bounded(&bytes[160..192], bytes.len() - 192, "provider endpoint")?;
     if bytes.len() < 192 + str_len {
         return Err(GatewayError::ChainUnavailable(format!(
             "endpoint string truncated: declared {} bytes, have {}",
@@ -814,6 +836,58 @@ mod tests {
         buf[32..64].copy_from_slice(&[0xff; 32]);
         let err = decode_string_at_offset_word(&buf, 1).expect_err("should fail");
         assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    // ── 2026-05-31 audit -002 (SECREM-02 6.4a) ──────────────────
+    // ABI length words come from whatever contract the gateway
+    // eth_calls — attacker-influenced on a malicious/compromised RPC
+    // or a hostile registry entry. A length word > usize::MAX made
+    // `U256::as_usize()` panic (DoS); even in-range giants overflowed
+    // the `64 + len * 32` arithmetic. All three decoders must return
+    // an error, never panic.
+
+    #[test]
+    fn hostile_address_array_length_word_errors_not_panics() {
+        // offset + length word of all 0xff (≫ usize::MAX).
+        let mut buf = vec![0u8; 64];
+        buf[31] = 0x20;
+        buf[32..64].copy_from_slice(&[0xff; 32]);
+        let err = decode_address_array(&buf).expect_err("hostile length must error");
+        assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    #[test]
+    fn hostile_address_array_length_overflowing_expected_errors() {
+        // Length fits in u64 but 64 + len*32 overflows usize.
+        let mut buf = vec![0u8; 64];
+        buf[31] = 0x20;
+        // len = 2^60
+        buf[63 - 7] = 0x10;
+        let err = decode_address_array(&buf).expect_err("overflowing length must error");
+        assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    #[test]
+    fn hostile_bytes32_array_length_word_errors_not_panics() {
+        let mut buf = vec![0u8; 64];
+        buf[31] = 0x20;
+        buf[32..64].copy_from_slice(&[0xff; 32]);
+        let err = decode_bytes32_array(&buf).expect_err("hostile length must error");
+        assert!(matches!(err, GatewayError::ChainUnavailable(_)));
+    }
+
+    #[test]
+    fn hostile_provider_info_string_length_errors_not_panics() {
+        // Well-formed 192-byte static head, then a hostile endpoint
+        // length word of all 0xff.
+        let mut buf = vec![0u8; 192];
+        buf[31] = 0xa0; // endpoint offset = 160
+        buf[160..192].copy_from_slice(&[0xff; 32]);
+        let res = decode_provider_info(H160::from([0x11; 20]), &buf);
+        assert!(
+            matches!(res, Err(GatewayError::ChainUnavailable(_))),
+            "hostile endpoint length must error"
+        );
     }
 
     #[test]
