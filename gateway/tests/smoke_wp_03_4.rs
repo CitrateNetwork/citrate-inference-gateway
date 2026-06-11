@@ -32,6 +32,12 @@ use citrate_gateway::{
 };
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Error};
 
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
+/// addresses (the placeholder default was removed from the builders).
+const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
+const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
+
+
 // ── Stub provider ───────────────────────────────────────────────
 
 async fn spawn_stub_provider() -> SocketAddr {
@@ -216,6 +222,8 @@ async fn spawn_gateway(provider_addr: SocketAddr) -> (SocketAddr, Arc<ApiKeyStor
         chain,
         operator_secret(),
         facilitator,
+        TEST_WSALT,
+        TEST_TREASURY,
         keys.clone(),
     )
     .await;
@@ -235,11 +243,18 @@ fn chat_body() -> Value {
     })
 }
 
-async fn wait_batch_terminal(gateway: SocketAddr, batch_id: &str) -> Value {
+/// Polls with the owning API key as bearer — batch reads are bound to
+/// the submitter since 2026-05-31 audit -004 (SECREM-02 6.4a).
+async fn wait_batch_terminal(gateway: SocketAddr, batch_id: &str, key_id: &str) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let url = format!("http://{}/v1/batch/{}", gateway, batch_id);
     loop {
-        let resp = reqwest::get(&url).await.expect("poll");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(key_id)
+            .send()
+            .await
+            .expect("poll");
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.expect("json");
         if matches!(
@@ -352,13 +367,68 @@ async fn api_key_failed_batch_slot_refunds_exact_quote() {
         "submit should retain only the exact batch quote after over-estimate refund"
     );
 
-    let terminal = wait_batch_terminal(gateway, batch_id).await;
+    let terminal = wait_batch_terminal(gateway, batch_id, &key_id).await;
     assert_eq!(terminal["status"].as_str(), Some("failed"));
     let record = keys.get(&key_id).await.expect("key still exists");
     assert_eq!(
         record.balance_grains, initial,
         "failed batch slot must refund its exact accepted quote"
     );
+}
+
+/// 2026-05-31 audit -004 (SECREM-02 6.4a): an API-key-owned batch is
+/// readable ONLY with the owning key. A different (valid, funded) key
+/// or an unauthenticated caller gets 404 — same body as an unknown id.
+#[tokio::test]
+async fn api_key_batch_reads_bound_to_owning_key() {
+    let provider = spawn_stub_provider().await;
+    let (gateway, keys) = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let initial = U256::from(512u64);
+    let owner = create_key(&keys, "tenant-a", initial, H160::from([0xde; 20])).await;
+    let other = create_key(&keys, "tenant-b", initial, H160::from([0xdf; 20])).await;
+
+    let url = format!("http://{}/v1/batch", gateway);
+    let body = serde_json::json!({
+        "requests": [{
+            "model": "llama-3.1-8b",
+            "messages": [{"role": "user", "content": "tenant-a-secret"}],
+            "max_tokens": 10
+        }]
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&owner)
+        .json(&body)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    let batch_id = body["batch_id"].as_str().expect("batch id").to_string();
+    assert!(
+        body["read_token"].is_null(),
+        "API-key-owned batches must not mint a separate read token"
+    );
+
+    let read_url = format!("http://{}/v1/batch/{}", gateway, batch_id);
+    let output_url = format!("http://{}/v1/batch/{}/output", gateway, batch_id);
+    let http = reqwest::Client::new();
+
+    // Unauthenticated → 404.
+    let resp = reqwest::get(&read_url).await.expect("get");
+    assert_eq!(resp.status(), 404, "unauthenticated read must 404");
+
+    // Different tenant's key → 404 (no existence oracle).
+    let resp = http.get(&read_url).bearer_auth(&other).send().await.expect("get");
+    assert_eq!(resp.status(), 404, "cross-tenant read must 404");
+    let resp = http.get(&output_url).bearer_auth(&other).send().await.expect("get");
+    assert_eq!(resp.status(), 404, "cross-tenant output read must 404");
+
+    // Owning key → 200.
+    let resp = http.get(&read_url).bearer_auth(&owner).send().await.expect("get");
+    assert_eq!(resp.status(), 200, "owner must read its own batch");
 }
 
 #[tokio::test]

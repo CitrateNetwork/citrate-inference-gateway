@@ -89,7 +89,7 @@ pub use error::X402Error;
 pub use header::{decode as decode_payment_header, encode as encode_payment_header, X_PAYMENT_HEADER};
 pub use layer::{X402Layer, X402LayerBuilder, X402Service};
 pub use ledger::{NonceLedger, NonceLedgerError};
-pub use nonce::NonceSource;
+pub use nonce::{NonceEntropyError, NonceSource};
 pub use observability::{
     CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent,
     RejectionBreakdown, SettledEvent,

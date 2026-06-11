@@ -284,7 +284,12 @@ impl X402LayerBuilder {
                     crate::ledger::DEFAULT_MAX_OUTSTANDING,
                 )),
             }),
-            nonces: Arc::new(NonceSource::new()),
+            // Audit -003 (SECREM-02 6.4a): seeding the nonce source is
+            // fallible and fail-closed — an x402 layer without a CSPRNG
+            // must not be constructed.
+            nonces: Arc::new(NonceSource::try_new().map_err(|e| {
+                X402Error::Internal(format!("nonce source unavailable: {e}"))
+            })?),
         })
     }
 }
@@ -370,7 +375,7 @@ where
                     Ok(c) => c,
                     Err(e) => return Ok(build_500_response(&e.to_string())),
                 };
-                return Ok(build_402_response(&challenge, None));
+                return Ok(build_402_response(&challenge, None, None));
             }
 
             // WP-02.3 paid path.
@@ -404,7 +409,10 @@ where
                         Ok(c) => c,
                         Err(e) => return Ok(build_500_response(&e.to_string())),
                     };
-                    Ok(build_402_response(&challenge, Some(reason)))
+                    // Audit -006: include the error's Display as `detail`
+                    // (e.g. the settle tx hash on a revert) so callers
+                    // get actionable context beyond the short reason.
+                    Ok(build_402_response(&challenge, Some(reason), Some(err.to_string())))
                 }
                 PaidOutcome::ServerError(err) => {
                     drop(inner);
@@ -551,12 +559,16 @@ async fn run_paid_path(
     };
 
     if !receipt.status {
-        // Most common revert: wSALT sees the nonce already used.
-        // We can't easily distinguish replay from other reverts at
-        // this layer without fetching the revert reason, so surface
-        // "nonce replayed" as the most likely cause. A future
-        // enhancement can decode the revert data.
-        return PaidOutcome::Reject(X402Error::NonceReplayed);
+        // 2026-05-31 audit -006 (SECREM-02 6.4a): a revert here is NOT
+        // necessarily a replay — insufficient balance, a paused
+        // facilitator, or misconfiguration revert identically, and the
+        // receipt does not carry the revert reason. Pre-fix this was
+        // reported as `NonceReplayed`, sending clients (and operators)
+        // chasing a phantom replay. Report neutrally and surface the
+        // settle tx hash so the revert can be inspected on-chain.
+        return PaidOutcome::Reject(X402Error::SettleReverted(hex::encode(
+            tx_hash.as_bytes(),
+        )));
     }
 
     // 8. Extract the PaymentSettled event.
@@ -600,7 +612,13 @@ fn make_challenge(
     nonces: &NonceSource,
     amount_wei: U256,
 ) -> Result<crate::types::PaymentChallenge, X402Error> {
-    let nonce = nonces.next_nonce();
+    // Audit -003 (SECREM-02 6.4a): nonce minting fails CLOSED. If the
+    // OS entropy source is down, the challenge is refused (the caller
+    // returns a 500) — a predictable payment nonce is strictly worse
+    // than a refused request. `fill_random` already logged the failure.
+    let nonce = nonces
+        .next_nonce()
+        .map_err(|e| X402Error::Internal(format!("challenge refused: {e}")))?;
     let now_unix = now_unix_secs();
     let built = build_challenge(ChallengeInputs {
         chain_id: config.chain_id,
@@ -636,9 +654,13 @@ fn build_error_response(err: X402Error) -> Response<Body> {
 }
 
 /// Build a 402 response with the challenge body. Per spec #1.
+/// `detail` (audit -006) carries the rejecting error's Display — e.g.
+/// the settle tx hash on an on-chain revert — alongside the short
+/// machine-matchable `reason`.
 fn build_402_response(
     challenge: &crate::types::PaymentChallenge,
     reason: Option<&str>,
+    detail: Option<String>,
 ) -> Response<Body> {
     let mut body_map = serde_json::Map::new();
     body_map.insert(
@@ -647,6 +669,9 @@ fn build_402_response(
     );
     if let Some(r) = reason {
         body_map.insert("reason".to_string(), serde_json::Value::String(r.to_string()));
+    }
+    if let Some(d) = detail {
+        body_map.insert("detail".to_string(), serde_json::Value::String(d));
     }
     let body = serde_json::Value::Object(body_map).to_string();
 

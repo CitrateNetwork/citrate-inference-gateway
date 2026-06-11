@@ -35,6 +35,12 @@ use citrate_gateway::queries::ChainQueries;
 use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 
+/// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
+/// addresses (the placeholder default was removed from the builders).
+const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
+const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
+
+
 // ── Stub provider with selective failure ────────────────────────
 
 /// Counts requests; for indices in `fail_indices` returns 500.
@@ -237,7 +243,16 @@ async fn spawn_gateway(provider_addr: SocketAddr) -> SocketAddr {
         listen_addr: "127.0.0.1:0".to_string(),
         contracts: citrate_gateway::config::ContractAddresses::default(),
     };
-    let app = build_router_with(config, queries, chain, operator_secret(), facilitator).await;
+    let app = build_router_with(
+        config,
+        queries,
+        chain,
+        operator_secret(),
+        facilitator,
+        TEST_WSALT,
+        TEST_TREASURY,
+    )
+    .await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gw");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -258,9 +273,10 @@ async fn submit_batch_requests(gateway: SocketAddr, requests: Vec<Value>) -> req
     client.send_paid(req).await.expect("submit")
 }
 
-/// Submit a batch of `n` chat-completion requests and return the
-/// batch_id. Auto-pays via X402Client.
-async fn submit_batch(gateway: SocketAddr, n: usize) -> String {
+/// Submit a batch of `n` chat-completion requests and return
+/// `(batch_id, read_token)`. Auto-pays via X402Client. The read token
+/// (2026-05-31 audit -004) is required on every subsequent read.
+async fn submit_batch(gateway: SocketAddr, n: usize) -> (String, String) {
     let requests: Vec<Value> = (0..n)
         .map(|i| {
             serde_json::json!({
@@ -274,7 +290,13 @@ async fn submit_batch(gateway: SocketAddr, n: usize) -> String {
     let resp = submit_batch_requests(gateway, requests).await;
     assert_eq!(resp.status(), 200, "expected 200 from /v1/batch");
     let body: Value = resp.json().await.expect("json");
-    body["batch_id"].as_str().expect("batch_id").to_string()
+    (
+        body["batch_id"].as_str().expect("batch_id").to_string(),
+        body["read_token"]
+            .as_str()
+            .expect("read_token (audit -004)")
+            .to_string(),
+    )
 }
 
 #[tokio::test]
@@ -317,12 +339,24 @@ async fn batch_underfunded_long_prompt_rejected_402() {
     assert!(msg.contains("underfunded"), "got: {}", msg);
 }
 
-/// Poll until terminal state or timeout.
-async fn wait_terminal(gateway: SocketAddr, batch_id: &str, timeout: Duration) -> Value {
+/// Poll until terminal state or timeout. Presents the submit-time read
+/// token (audit -004).
+async fn wait_terminal(
+    gateway: SocketAddr,
+    batch_id: &str,
+    read_token: &str,
+    timeout: Duration,
+) -> Value {
     let deadline = std::time::Instant::now() + timeout;
     let url = format!("http://{}/v1/batch/{}", gateway, batch_id);
+    let http = reqwest::Client::new();
     loop {
-        let resp = reqwest::get(&url).await.expect("poll");
+        let resp = http
+            .get(&url)
+            .bearer_auth(read_token)
+            .send()
+            .await
+            .expect("poll");
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.expect("json");
         let status = body["status"].as_str().unwrap_or("");
@@ -347,8 +381,8 @@ async fn batch_happy_path_5_requests_completes() {
     let gateway = spawn_gateway(provider).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let batch_id = submit_batch(gateway, 5).await;
-    let terminal = wait_terminal(gateway, &batch_id, Duration::from_secs(10)).await;
+    let (batch_id, token) = submit_batch(gateway, 5).await;
+    let terminal = wait_terminal(gateway, &batch_id, &token, Duration::from_secs(10)).await;
     assert_eq!(terminal["status"].as_str(), Some("completed"));
     assert_eq!(terminal["completed_count"].as_u64(), Some(5));
     assert_eq!(terminal["errored_count"].as_u64(), Some(0));
@@ -364,8 +398,8 @@ async fn batch_partial_failure_one_errors() {
     let gateway = spawn_gateway(provider).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let batch_id = submit_batch(gateway, 3).await;
-    let terminal = wait_terminal(gateway, &batch_id, Duration::from_secs(10)).await;
+    let (batch_id, token) = submit_batch(gateway, 3).await;
+    let terminal = wait_terminal(gateway, &batch_id, &token, Duration::from_secs(10)).await;
     assert_eq!(terminal["status"].as_str(), Some("partial_failure"));
     assert_eq!(terminal["completed_count"].as_u64(), Some(2));
     assert_eq!(terminal["errored_count"].as_u64(), Some(1));
@@ -388,8 +422,8 @@ async fn batch_all_fail_returns_failed() {
     let gateway = spawn_gateway(provider).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let batch_id = submit_batch(gateway, 2).await;
-    let terminal = wait_terminal(gateway, &batch_id, Duration::from_secs(10)).await;
+    let (batch_id, token) = submit_batch(gateway, 2).await;
+    let terminal = wait_terminal(gateway, &batch_id, &token, Duration::from_secs(10)).await;
     assert_eq!(terminal["status"].as_str(), Some("failed"));
     assert_eq!(terminal["completed_count"].as_u64(), Some(0));
     assert_eq!(terminal["errored_count"].as_u64(), Some(2));
@@ -401,11 +435,16 @@ async fn batch_output_returns_jsonl() {
     let gateway = spawn_gateway(provider).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let batch_id = submit_batch(gateway, 2).await;
-    let _ = wait_terminal(gateway, &batch_id, Duration::from_secs(10)).await;
+    let (batch_id, token) = submit_batch(gateway, 2).await;
+    let _ = wait_terminal(gateway, &batch_id, &token, Duration::from_secs(10)).await;
 
     let url = format!("http://{}/v1/batch/{}/output", gateway, batch_id);
-    let resp = reqwest::get(&url).await.expect("output");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("output");
     assert_eq!(resp.status(), 200);
     let ct = resp
         .headers()
@@ -422,6 +461,68 @@ async fn batch_output_returns_jsonl() {
         assert_eq!(v["status"].as_str(), Some("completed"));
         assert!(v["response"].is_object(), "completed line has response");
     }
+}
+
+/// 2026-05-31 audit -004 (SECREM-02 6.4a): batch reads must be bound to
+/// the submitter. Pre-fix, `GET /v1/batch/{id}` and `/output` were fully
+/// unauthenticated — anyone who learned (or guessed) a batch id could read
+/// another tenant's prompts and outputs. Post-fix an x402-paid submit
+/// returns a one-time `read_token`; reads presenting no/wrong credentials
+/// get 404 (same body as an unknown id — no existence oracle).
+#[tokio::test]
+async fn batch_reads_require_submit_time_credentials() {
+    let provider = spawn_stub_provider(HashSet::new()).await;
+    let gateway = spawn_gateway(provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let requests = vec![serde_json::json!({
+        "model": "llama-3.1-8b",
+        "messages": [{"role": "user", "content": "secret-tenant-prompt"}],
+        "max_tokens": 10
+    })];
+    let resp = submit_batch_requests(gateway, requests).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    let batch_id = body["batch_id"].as_str().expect("batch_id").to_string();
+    let read_token = body["read_token"]
+        .as_str()
+        .expect("audit -004: x402-paid submit must return a read_token")
+        .to_string();
+
+    let status_url = format!("http://{}/v1/batch/{}", gateway, batch_id);
+    let output_url = format!("http://{}/v1/batch/{}/output", gateway, batch_id);
+    let http = reqwest::Client::new();
+
+    // No credentials → 404 on both reads.
+    let resp = reqwest::get(&status_url).await.expect("get");
+    assert_eq!(resp.status(), 404, "unauthenticated status read must 404");
+    let resp = reqwest::get(&output_url).await.expect("get");
+    assert_eq!(resp.status(), 404, "unauthenticated output read must 404");
+
+    // Wrong token → 404 (no existence oracle).
+    let resp = http
+        .get(&status_url)
+        .bearer_auth("brt_definitely-not-the-token")
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(resp.status(), 404, "wrong-token read must 404");
+
+    // Correct token → 200.
+    let resp = http
+        .get(&status_url)
+        .bearer_auth(&read_token)
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(resp.status(), 200, "payer's token must read its own batch");
+    let resp = http
+        .get(&output_url)
+        .bearer_auth(&read_token)
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(resp.status(), 200, "payer's token must read its own output");
 }
 
 #[tokio::test]

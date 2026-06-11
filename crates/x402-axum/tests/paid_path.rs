@@ -383,11 +383,19 @@ async fn recovered_signer_must_match_from_field() {
     assert!(body["reason"].as_str().unwrap_or("").contains("signature"));
 }
 
+/// 2026-05-31 audit -006 (SECREM-02 6.4a): a settle revert is NOT
+/// necessarily a nonce replay — it can be insufficient balance, a
+/// facilitator misconfig, or anything else the contract rejects. The
+/// layer must report a neutral "settle reverted" carrying the tx hash
+/// (so the operator can inspect the revert on-chain) instead of
+/// unconditionally claiming `NonceReplayed`. (Replaces the pre-6.4a
+/// `replay_nonce_returns_402_with_reason` test, which pinned the
+/// misleading mapping.)
 #[tokio::test]
-async fn replay_nonce_returns_402_with_reason() {
+async fn settle_revert_reports_neutral_reason_with_tx_hash() {
     let mock = MockChain::new(facilitator());
-    // Pre-seed settled with the payload's nonce → wait_for_receipt
-    // returns status=false → layer maps to NonceReplayed.
+    // Seeding `settled` makes wait_for_receipt return status=false —
+    // an opaque revert receipt, reason unknown at this layer.
     mock.settled
         .lock()
         .expect("settled mutex")
@@ -400,10 +408,18 @@ async fn replay_nonce_returns_402_with_reason() {
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let reason = body["reason"].as_str().unwrap_or("");
-    assert!(
-        reason.contains("replayed") || reason.contains("nonce"),
-        "reason should mention replay/nonce, got: {}",
+    assert_eq!(
+        reason, "settle reverted",
+        "revert must be reported neutrally, not as a replay; got: {}",
         reason
+    );
+    // MockChain's send_raw_tx returns 0xbe…be — the response must
+    // surface the tx hash so the operator can look up the revert.
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("bebebe"),
+        "detail must carry the settle tx hash, got: {}",
+        detail
     );
 }
 
