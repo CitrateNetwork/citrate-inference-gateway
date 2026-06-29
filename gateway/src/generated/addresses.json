@@ -2,11 +2,11 @@
   "$schema": "./schema.json",
   "aaStack": {
     "CitrateECDSAValidator": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
-    "CitratePaymaster": "0x96bb6ca3b6a3e2e08a3557dfab6c7a29eb048373",
-    "CitrateWallet": "0x99b370120e7f0a4ea4f85cfcb86d4b8d41c3239b",
-    "CitrateWalletFactory": "0xd951cb15495cb6541f7541b9194b2d311e12fd57",
-    "EntryPoint": "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
-    "GuardianRecoveryModule": "0x42f3d7842d382d47199533a6bfcceaf483c6c857",
+    "CitratePaymaster": "0x7a9adb27578d6837b8b7e4c9ad953bb328f4fd69",
+    "CitrateWallet": "0x21af0fd5b3cb383e20d07c4cf6f3269320c70ef1",
+    "CitrateWalletFactory": "0xdd5f4fcbbee7a744e583d64ade54d085092cf649",
+    "EntryPoint": "0x575d0d85e272eca8784a4D11F4713C698082c807",
+    "GuardianRecoveryModule": "0x381b5848f3b5d73ff67b745624780a43682456ce",
     "WebAuthnP256Validator": "0x97ff6d1c4d2f4337ec09f2a1c01808016f728def"
   },
   "chainId": 40204,
@@ -58,7 +58,7 @@
     "X402Facilitator": "0x81efcb971d7d1f2a277e5c1c6643164c65769abf",
     "X402Paywall": "0x8ed4dce2e9b24bfbfe4c31227bb163de81cd3000"
   },
-  "deployedAt": "2026-06-29T15:44:52Z",
+  "deployedAt": "2026-06-29T17:48:12Z",
   "deployer": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
   "explorerUrl": "https://explorer.citrate.ai",
   "genesis": {
