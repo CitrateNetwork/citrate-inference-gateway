@@ -100,7 +100,7 @@ async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40204),
         rpc_url: env::var("CITRATE_GATEWAY_RPC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:18545".to_string()),
+            .unwrap_or_else(|_| "http://127.0.0.1:8545".to_string()),
         // SECREM-01 SVC-5 (pre-audit 2026-06-09): default to loopback.
         // Marketplace mode's only request gate is x402 payment on /v1/*;
         // /models + /healthz are unauthenticated. In production this runs

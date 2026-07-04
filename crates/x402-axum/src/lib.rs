@@ -34,7 +34,7 @@
 //!     .facilitator_address("0x...")
 //!     .wsalt_address("0x...")
 //!     .treasury("0x...")
-//!     .rpc_url("http://127.0.0.1:18545")
+//!     .rpc_url("http://127.0.0.1:8545")
 //!     .pricing(FixedPricing::new("1000000000000000000"))  // 1 SALT
 //!     .build()?;
 //!

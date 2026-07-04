@@ -125,7 +125,7 @@ pub struct HttpChainClient {
 
 impl HttpChainClient {
     /// Create a new client targeting `rpc_url` (e.g.
-    /// `http://127.0.0.1:18545` or `https://rpc.citrate.ai`).
+    /// `http://127.0.0.1:8545` or `https://rpc.citrate.ai`).
     pub fn new(rpc_url: impl Into<String>) -> Self {
         Self {
             rpc_url: rpc_url.into(),
