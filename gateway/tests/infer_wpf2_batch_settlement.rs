@@ -9,6 +9,10 @@
 
 use citrate_gateway::batch::BatchStore;
 use citrate_gateway::keystore::PersistentKeyStore;
+
+/// Test master key for the at-rest store encryption (ENCRYPT-S1) — the
+/// TD-22 durability guarantees are proven UNDER encryption.
+const TEST_MASTER: [u8; 32] = [7u8; 32];
 use ethereum_types::{H160, U256};
 
 const BACKING_SALT: u8 = 0;
@@ -25,7 +29,7 @@ fn batch_refund_settles_exactly_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let id;
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         // Buyer funded 100, batch debited the whole 100 up front (balance 0).
         id = store
             .create_balance_key("buyer", salt(0), H160::zero(), BACKING_SALT)
@@ -47,7 +51,7 @@ fn batch_refund_settles_exactly_once() {
     }
 
     // And the credit + the settled marker survived the crash atomically.
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(40));
     assert!(store.batch_was_settled("batch_x").expect("settled flag"));
 }
@@ -57,11 +61,11 @@ fn batch_refund_settles_exactly_once() {
 fn batches_persist_and_enumerate_for_recovery() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         store.persist_batch("batch_a", br#"{"id":"batch_a"}"#).expect("persist a");
         store.persist_batch("batch_b", br#"{"id":"batch_b"}"#).expect("persist b");
     }
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     let mut ids: Vec<String> = store
         .load_batches()
         .expect("load")
@@ -76,7 +80,7 @@ fn batches_persist_and_enumerate_for_recovery() {
 #[test]
 fn batch_settled_flag_tracks_settlement() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let id = store
         .create_balance_key("buyer", salt(10), H160::zero(), BACKING_SALT)
         .expect("create");
@@ -95,7 +99,7 @@ fn batch_settled_flag_tracks_settlement() {
 #[tokio::test]
 async fn recovery_refunds_uncompleted_slots_exactly_once() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     // Buyer funded 100, the whole 100 debited up front at submit (balance 0).
     let key = store
         .create_balance_key("buyer", salt(0), H160::zero(), BACKING_SALT)

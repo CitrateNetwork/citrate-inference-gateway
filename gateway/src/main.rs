@@ -69,7 +69,11 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = env::var("CITRATE_GATEWAY_LISTEN_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9800".to_string());
 
-    let store: Arc<PersistentKeyStore> = PersistentKeyStore::open(&keystore_path)?;
+    // ENCRYPT-S1 / WP-2: encrypted at rest; master key via the keyvault
+    // sourcing chain (GATEWAY_STORE_KEY env → key file → generate).
+    let (store, key_source): (Arc<PersistentKeyStore>, _) =
+        citrate_gateway::keyvault::open_store(&keystore_path)?;
+    tracing::info!(key_source = %key_source, "money-store master key sourced");
     let state = LocalProxyState::new(store, upstreams.clone());
     let app = build_local_proxy_router(state);
 
@@ -96,7 +100,7 @@ async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40204),
         rpc_url: env::var("CITRATE_GATEWAY_RPC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:18545".to_string()),
+            .unwrap_or_else(|_| "http://127.0.0.1:8545".to_string()),
         // SECREM-01 SVC-5 (pre-audit 2026-06-09): default to loopback.
         // Marketplace mode's only request gate is x402 payment on /v1/*;
         // /models + /healthz are unauthenticated. In production this runs

@@ -12,23 +12,55 @@
 //! ```text
 //! record:<sha256_hex>            -> bincode KeyRecord
 //! quota:<sha256_hex>:<yyyymmdd>  -> u64 LE  (request count for that UTC day)
+//! bal:<sha256_hex>               -> bincode BalanceRecord   (money, WP-F)
+//! batch:<batch_id>               -> bincode PersistedBatch  (WP-F F2)
+//! batchset:<batch_id>            -> settled marker          (WP-F F2)
+//! mbudget:<sha256_hex>:<model>   -> U256 BE                 (WP-E)
+//! meta:enc                       -> encryption marker       (ENCRYPT-S1)
 //! ```
 //!
 //! Per-second rate-limit windows are kept in memory only — restart resets
 //! the in-flight burst counter, which is correct (the daily quota is what
 //! survives restart, and that *is* persisted).
+//!
+//! # Encryption at rest (ENCRYPT-S1 / WP-2)
+//!
+//! Every VALUE is encrypted with **AES-256-GCM-SIV** before it reaches
+//! RocksDB, following the proven citrate-comms `EncryptedStore` pattern
+//! (nonce-misuse-resistant AEAD per FWA-C11-04; values stored as
+//! `nonce(12) ‖ ciphertext+tag`). Adaptations for this store:
+//!
+//! - This DB uses key-prefix **namespaces** instead of column families, so
+//!   the per-CF derived key becomes a per-namespace derived key
+//!   (`blake3::derive_key("citrate-gateway/store/ns/v1:<ns>", master)`).
+//! - The AAD is the **full record key** (not just the namespace) — stronger
+//!   than the comms pattern, and it matters for money: a ciphertext
+//!   transplanted from one row to another (e.g. copying a rich `bal:` value
+//!   onto a poorer key's row in a stolen-write scenario) fails to decrypt.
+//!
+//! KEYS stay plaintext by design: they are already `sha256(bearer)` digests
+//! (audit F-3, inventory A12) and must remain byte-queryable for the
+//! `record:`/`bal:` lookups and prefix scans. The `meta:enc` marker lets
+//! `open` distinguish an encrypted store from a legacy plaintext one and
+//! reject a wrong master key at boot instead of on first read. The master
+//! key is sourced by [`crate::keyvault`]; legacy plaintext stores are
+//! migrated once via `citrate-gateway-admin migrate-encrypt`
+//! ([`crate::migrate`]).
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use aes_gcm_siv::aead::{Aead, Payload};
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use chrono::{Datelike, NaiveTime, Utc};
 use ethereum_types::{H160, U256};
 use parking_lot::Mutex;
-use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// SHA-256(`key_id`) as lowercase hex. Used for indexing — the plaintext
 /// `cgk_…` token is **never** persisted.
@@ -36,6 +68,111 @@ pub fn hash_key_id(key_id: &str) -> String {
     let mut h = Sha256::new();
     h.update(key_id.as_bytes());
     hex::encode(h.finalize())
+}
+
+// ── Value encryption at rest (ENCRYPT-S1 / WP-2) ────────────────────
+
+/// Marker row proving this store is encrypted and under WHICH key: its value
+/// is [`ENC_MARKER_PLAINTEXT`] sealed under the master key. Checked at
+/// `open`: decrypt failure = wrong key; absence in a non-empty DB = legacy
+/// plaintext store (refused — run `migrate-encrypt`).
+pub(crate) const ENC_MARKER_KEY: &str = "meta:enc";
+/// Known plaintext sealed into the marker row.
+pub(crate) const ENC_MARKER_PLAINTEXT: &[u8] = b"citrate-gateway-store-enc-v1";
+/// BLAKE3 KDF domain prefix for per-namespace data keys. Versioned so an
+/// algorithm change bumps the domain (mirrors comms `store/cf/v2` rationale).
+const KDF_DOMAIN_PREFIX: &str = "citrate-gateway/store/ns/v1:";
+
+/// Why a value failed to seal/unseal.
+#[derive(Debug, thiserror::Error)]
+pub enum CryptError {
+    /// OS RNG failure drawing a nonce.
+    #[error("store rng failure")]
+    Rng,
+    /// AEAD failure — wrong master key or tampered/transplanted bytes.
+    #[error("value decrypt failed (wrong master key or tampered bytes)")]
+    Crypto,
+    /// Stored value shorter than a nonce — not produced by this store.
+    #[error("stored value is corrupt (shorter than a nonce)")]
+    Corrupt,
+}
+
+/// The key-prefix namespace (bytes before the first `:`), e.g. `bal` for
+/// `bal:<hash>`. Keys without a `:` map to themselves.
+fn namespace_of(record_key: &[u8]) -> &[u8] {
+    match record_key.iter().position(|b| *b == b':') {
+        Some(i) => &record_key[..i],
+        None => record_key,
+    }
+}
+
+/// Per-namespace cipher: domain-separated keyed KDF over the master key. The
+/// derived key is `Zeroizing` so its only residence in our memory is this
+/// short-lived buffer (comms `EncryptedStore::cipher` pattern).
+fn cipher_for(master: &[u8; 32], ns: &[u8]) -> Aes256GcmSiv {
+    let domain = format!("{KDF_DOMAIN_PREFIX}{}", String::from_utf8_lossy(ns));
+    let ns_key = Zeroizing::new(blake3::derive_key(&domain, master));
+    Aes256GcmSiv::new_from_slice(ns_key.as_ref()).expect("32-byte derived key")
+}
+
+/// Seal `plaintext` for storage under `record_key`: fresh random 96-bit
+/// nonce, AAD = the full record key, output `nonce(12) ‖ ciphertext+tag`.
+pub(crate) fn seal_value(
+    master: &[u8; 32],
+    record_key: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|_| CryptError::Rng)?;
+    let ct = cipher_for(master, namespace_of(record_key))
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload { msg: plaintext, aad: record_key },
+        )
+        .map_err(|_| CryptError::Crypto)?;
+    let mut val = Vec::with_capacity(12 + ct.len());
+    val.extend_from_slice(&nonce);
+    val.extend_from_slice(&ct);
+    Ok(val)
+}
+
+/// Unseal a stored value; the AAD binding means a value copied from another
+/// row (even in the same namespace) fails authentication.
+pub(crate) fn open_value(
+    master: &[u8; 32],
+    record_key: &[u8],
+    raw: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    if raw.len() < 12 {
+        return Err(CryptError::Corrupt);
+    }
+    let (nonce, ct) = raw.split_at(12);
+    let nonce: [u8; 12] = nonce.try_into().expect("split_at(12)");
+    cipher_for(master, namespace_of(record_key))
+        .decrypt(
+            &Nonce::from(nonce),
+            Payload { msg: ct, aad: record_key },
+        )
+        .map_err(|_| CryptError::Crypto)
+}
+
+/// Internal plumbing error for the sealed read/write helpers — converted
+/// into each public error enum at the call boundary.
+enum ValErr {
+    Db(rocksdb::Error),
+    Crypt(CryptError),
+}
+
+impl From<rocksdb::Error> for ValErr {
+    fn from(e: rocksdb::Error) -> Self {
+        ValErr::Db(e)
+    }
+}
+
+impl From<CryptError> for ValErr {
+    fn from(e: CryptError) -> Self {
+        ValErr::Crypt(e)
+    }
 }
 
 /// One API key's persisted state.
@@ -94,6 +231,9 @@ pub enum BalanceError {
     /// bincode round-trip failure.
     #[error("encode: {0}")]
     Encode(String),
+    /// At-rest encryption failure (ENCRYPT-S1).
+    #[error("store crypto: {0}")]
+    Crypt(#[from] CryptError),
 }
 
 /// Why a per-model budget debit failed (INFER-S3 / WP-E).
@@ -109,6 +249,9 @@ pub enum ModelBudgetError {
     /// On-disk budget value was malformed.
     #[error("encode: {0}")]
     Encode(String),
+    /// At-rest encryption failure (ENCRYPT-S1).
+    #[error("store crypto: {0}")]
+    Crypt(#[from] CryptError),
 }
 
 /// Result of [`PersistentKeyStore::try_consume`] on success — what the
@@ -144,6 +287,9 @@ pub enum ConsumeError {
     /// Underlying RocksDB error — log + 500.
     #[error("keystore unavailable: {0}")]
     Store(#[from] rocksdb::Error),
+    /// At-rest encryption failure (ENCRYPT-S1) — log + 500.
+    #[error("store crypto: {0}")]
+    Crypt(#[from] CryptError),
 }
 
 /// Why a mint / revoke / list operation failed.
@@ -158,11 +304,71 @@ pub enum StoreError {
     /// Serialization round-trip failure (shouldn't happen with bincode).
     #[error("encode: {0}")]
     Encode(String),
+    /// At-rest encryption failure (ENCRYPT-S1).
+    #[error("store crypto: {0}")]
+    Crypt(#[from] CryptError),
+    /// The encryption marker exists but does not decrypt under the supplied
+    /// master key. Fail closed at boot — every read would fail anyway, and a
+    /// wrong-key boot must never look like an empty store.
+    #[error(
+        "wrong master key for this store — the encryption marker failed to decrypt \
+         (check GATEWAY_STORE_KEY / the key file; see ENCRYPTED_MONEY_STORE runbook)"
+    )]
+    WrongKey,
+    /// A non-empty store with no encryption marker: a legacy plaintext DB
+    /// (pre-ENCRYPT-S1). Refused so plaintext and ciphertext rows can never
+    /// mix — run the one-shot migration instead.
+    #[error(
+        "plaintext (pre-ENCRYPT-S1) store detected — run \
+         `citrate-gateway-admin migrate-encrypt` during a maintenance window first \
+         (see ENCRYPTED_MONEY_STORE runbook)"
+    )]
+    PlaintextStore,
 }
 
-/// RocksDB-backed key store. Cheap to clone via [`Arc`].
+impl From<ValErr> for StoreError {
+    fn from(e: ValErr) -> Self {
+        match e {
+            ValErr::Db(e) => StoreError::Rocks(e),
+            ValErr::Crypt(e) => StoreError::Crypt(e),
+        }
+    }
+}
+
+impl From<ValErr> for BalanceError {
+    fn from(e: ValErr) -> Self {
+        match e {
+            ValErr::Db(e) => BalanceError::Store(e),
+            ValErr::Crypt(e) => BalanceError::Crypt(e),
+        }
+    }
+}
+
+impl From<ValErr> for ConsumeError {
+    fn from(e: ValErr) -> Self {
+        match e {
+            ValErr::Db(e) => ConsumeError::Store(e),
+            ValErr::Crypt(e) => ConsumeError::Crypt(e),
+        }
+    }
+}
+
+impl From<ValErr> for ModelBudgetError {
+    fn from(e: ValErr) -> Self {
+        match e {
+            ValErr::Db(e) => ModelBudgetError::Store(e),
+            ValErr::Crypt(e) => ModelBudgetError::Crypt(e),
+        }
+    }
+}
+
+/// RocksDB-backed key store. Cheap to clone via [`Arc`]. All values are
+/// AES-256-GCM-SIV-encrypted at rest (ENCRYPT-S1 / WP-2).
 pub struct PersistentKeyStore {
     db: DB,
+    /// 32-byte master key for the at-rest value encryption. `Zeroizing` so it
+    /// is wiped when the store drops (comms `EncryptedStore` pattern).
+    master: Zeroizing<[u8; 32]>,
     rate: Mutex<HashMap<String, RateWindow>>,
     /// Per-key serialization for the balance read-modify-write (WP-F). A debit
     /// must read, check, deduct, and durably commit as one critical section so
@@ -177,20 +383,103 @@ struct RateWindow {
 }
 
 impl PersistentKeyStore {
-    /// Open (or create) the keystore at `path`.
+    /// Open (or create) the keystore at `path`, encrypted under `master`
+    /// (ENCRYPT-S1: there is deliberately NO plaintext constructor — the type
+    /// system is the "values are encrypted at rest" guarantee).
+    ///
+    /// Marker protocol (`meta:enc`):
+    /// - marker present + decrypts → normal open;
+    /// - marker present + fails to decrypt → [`StoreError::WrongKey`];
+    /// - marker absent + DB non-empty → [`StoreError::PlaintextStore`]
+    ///   (legacy pre-ENCRYPT-S1 data; run `migrate-encrypt`);
+    /// - fresh/empty DB → marker written (synced) and the store is encrypted
+    ///   from its first row.
     ///
     /// The caller is responsible for ensuring the directory and its parent
     /// are owned by the service user with `0600` perms (see PLANSET
     /// security checklist). RocksDB itself doesn't enforce perms.
-    pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>, StoreError> {
+    pub fn open(path: impl AsRef<Path>, master: [u8; 32]) -> Result<Arc<Self>, StoreError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, path)?;
-        Ok(Arc::new(Self {
+        let store = Self {
             db,
+            master: Zeroizing::new(master),
             rate: Mutex::new(HashMap::new()),
             bal_locks: Mutex::new(HashMap::new()),
-        }))
+        };
+        store.check_or_init_enc_marker()?;
+        Ok(Arc::new(store))
+    }
+
+    /// Enforce the `meta:enc` marker protocol described on [`Self::open`].
+    fn check_or_init_enc_marker(&self) -> Result<(), StoreError> {
+        match self.db.get(ENC_MARKER_KEY.as_bytes())? {
+            Some(raw) => {
+                let pt = open_value(&self.master, ENC_MARKER_KEY.as_bytes(), &raw)
+                    .map_err(|_| StoreError::WrongKey)?;
+                if pt != ENC_MARKER_PLAINTEXT {
+                    return Err(StoreError::WrongKey);
+                }
+                Ok(())
+            }
+            None => {
+                if self.db.iterator(IteratorMode::Start).next().is_some() {
+                    return Err(StoreError::PlaintextStore);
+                }
+                let sealed = seal_value(&self.master, ENC_MARKER_KEY.as_bytes(), ENC_MARKER_PLAINTEXT)?;
+                // Synced: the marker must never be lost once rows exist.
+                self.db.put_opt(ENC_MARKER_KEY.as_bytes(), sealed, &synced())?;
+                Ok(())
+            }
+        }
+    }
+
+    // ── Sealed read/write plumbing (ENCRYPT-S1) ─────────────────────
+    //
+    // Every value round-trips through these helpers; no call site touches
+    // `self.db.get`/`put` for data rows directly.
+
+    /// Read + unseal the value at `key`.
+    fn get_val(&self, key: &str) -> Result<Option<Vec<u8>>, ValErr> {
+        match self.db.get(key.as_bytes())? {
+            Some(raw) => Ok(Some(open_value(&self.master, key.as_bytes(), &raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Seal + write `plaintext` at `key` with the given write options.
+    fn put_val(&self, key: &str, plaintext: &[u8], wo: &WriteOptions) -> Result<(), ValErr> {
+        let sealed = seal_value(&self.master, key.as_bytes(), plaintext)?;
+        self.db.put_opt(key.as_bytes(), sealed, wo)?;
+        Ok(())
+    }
+
+    /// Seal a value destined for a [`WriteBatch`] entry at `key`.
+    fn seal_for(&self, key: &str, plaintext: &[u8]) -> Result<Vec<u8>, ValErr> {
+        Ok(seal_value(&self.master, key.as_bytes(), plaintext)?)
+    }
+
+    /// Migration hook: seal + write an arbitrary raw key/value pair
+    /// (non-synced; `migrate-encrypt` flushes once at the end).
+    pub(crate) fn raw_put_sealed(&self, key: &[u8], plaintext: &[u8]) -> Result<(), StoreError> {
+        let sealed = seal_value(&self.master, key, plaintext)?;
+        self.db.put(key, sealed)?;
+        Ok(())
+    }
+
+    /// Migration hook: read + unseal an arbitrary raw key (verification pass).
+    pub(crate) fn raw_get_unsealed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.db.get(key)? {
+            Some(raw) => Ok(Some(open_value(&self.master, key, &raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Migration hook: flush memtables to SSTs before the atomic rename.
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.db.flush()?;
+        Ok(())
     }
 
     // ── Durable balances (INFER-S4 / WP-F) ──────────────────────────
@@ -219,14 +508,14 @@ impl PersistentKeyStore {
         };
         let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
         // Synced write: the record is durable before we hand the caller a token.
-        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+        self.put_val(&bal_key(&h), &bytes, &synced())?;
         Ok(id)
     }
 
     /// Fetch a balance record by plaintext bearer.
     pub fn get_balance_record(&self, key_id: &str) -> Result<Option<BalanceRecord>, StoreError> {
         let h = hash_key_id(key_id);
-        match self.db.get(bal_key(&h).as_bytes())? {
+        match self.get_val(&bal_key(&h))? {
             Some(b) => Ok(Some(
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?,
             )),
@@ -250,7 +539,7 @@ impl PersistentKeyStore {
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
 
-        let mut rec = match self.db.get(bal_key(&h).as_bytes())? {
+        let mut rec = match self.get_val(&bal_key(&h))? {
             Some(b) => bincode::deserialize::<BalanceRecord>(&b)
                 .map_err(|e| BalanceError::Encode(e.to_string()))?,
             None => return Err(BalanceError::Unknown),
@@ -265,7 +554,7 @@ impl PersistentKeyStore {
         let new = bal - amount;
         new.to_big_endian(&mut rec.balance_be);
         let bytes = bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
-        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?; // commit point
+        self.put_val(&bal_key(&h), &bytes, &synced())?; // commit point
         Ok(new)
     }
 
@@ -277,7 +566,7 @@ impl PersistentKeyStore {
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
 
-        let mut rec = match self.db.get(bal_key(&h).as_bytes())? {
+        let mut rec = match self.get_val(&bal_key(&h))? {
             Some(b) => bincode::deserialize::<BalanceRecord>(&b)
                 .map_err(|e| BalanceError::Encode(e.to_string()))?,
             None => return Err(BalanceError::Unknown),
@@ -286,7 +575,7 @@ impl PersistentKeyStore {
         let new = bal.saturating_add(amount);
         new.to_big_endian(&mut rec.balance_be);
         let bytes = bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
-        self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+        self.put_val(&bal_key(&h), &bytes, &synced())?;
         Ok(new)
     }
 
@@ -296,7 +585,7 @@ impl PersistentKeyStore {
     /// for resume; money safety comes from the synced, atomic
     /// [`Self::settle_batch_refund`], not from per-transition writes.
     pub fn persist_batch(&self, batch_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        self.db.put(batch_key(batch_id).as_bytes(), bytes)?;
+        self.put_val(&batch_key(batch_id), bytes, &WriteOptions::default())?;
         Ok(())
     }
 
@@ -310,7 +599,8 @@ impl PersistentKeyStore {
                 break;
             }
             let id = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
-            out.push((id, v.to_vec()));
+            let plain = open_value(&self.master, &k, &v)?;
+            out.push((id, plain));
         }
         Ok(out)
     }
@@ -324,9 +614,11 @@ impl PersistentKeyStore {
     /// nothing owed). Atomic synced write of the terminal snapshot + marker so
     /// recovery skips it.
     pub fn mark_batch_settled(&self, batch_id: &str, batch_bytes: &[u8]) -> Result<(), StoreError> {
+        let bk = batch_key(batch_id);
+        let sk = batch_settled_key(batch_id);
         let mut wb = WriteBatch::default();
-        wb.put(batch_key(batch_id).as_bytes(), batch_bytes);
-        wb.put(batch_settled_key(batch_id).as_bytes(), [1u8]);
+        wb.put(bk.as_bytes(), self.seal_for(&bk, batch_bytes)?);
+        wb.put(sk.as_bytes(), self.seal_for(&sk, &[1u8])?);
         self.db.write_opt(wb, &synced())?;
         Ok(())
     }
@@ -350,7 +642,7 @@ impl PersistentKeyStore {
         let _guard = keylock.lock();
 
         let read_balance = || -> Result<(BalanceRecord, U256), BalanceError> {
-            match self.db.get(bal_key(&h).as_bytes())? {
+            match self.get_val(&bal_key(&h))? {
                 Some(b) => {
                     let rec: BalanceRecord = bincode::deserialize(&b)
                         .map_err(|e| BalanceError::Encode(e.to_string()))?;
@@ -361,9 +653,11 @@ impl PersistentKeyStore {
             }
         };
 
-        // Already settled — idempotent. Refresh the terminal snapshot, never re-credit.
+        // Already settled — idempotent. Refresh the terminal snapshot, never
+        // re-credit. (Presence check only — no decrypt needed on the marker.)
         if self.db.get(batch_settled_key(batch_id).as_bytes())?.is_some() {
-            self.db.put(batch_key(batch_id).as_bytes(), batch_bytes)?;
+            self.put_val(&batch_key(batch_id), batch_bytes, &WriteOptions::default())
+                .map_err(BalanceError::from)?;
             let (_rec, bal) = read_balance()?;
             return Ok(bal);
         }
@@ -374,10 +668,13 @@ impl PersistentKeyStore {
         let bal_bytes =
             bincode::serialize(&rec).map_err(|e| BalanceError::Encode(e.to_string()))?;
 
+        let bk = bal_key(&h);
+        let bat = batch_key(batch_id);
+        let set = batch_settled_key(batch_id);
         let mut wb = WriteBatch::default();
-        wb.put(bal_key(&h).as_bytes(), &bal_bytes);
-        wb.put(batch_key(batch_id).as_bytes(), batch_bytes);
-        wb.put(batch_settled_key(batch_id).as_bytes(), [1u8]);
+        wb.put(bk.as_bytes(), self.seal_for(&bk, &bal_bytes).map_err(BalanceError::from)?);
+        wb.put(bat.as_bytes(), self.seal_for(&bat, batch_bytes).map_err(BalanceError::from)?);
+        wb.put(set.as_bytes(), self.seal_for(&set, &[1u8]).map_err(BalanceError::from)?);
         self.db.write_opt(wb, &synced())?; // single atomic, durable commit
         Ok(new)
     }
@@ -393,14 +690,14 @@ impl PersistentKeyStore {
         let h = hash_key_id(key_id);
         let mut be = [0u8; 32];
         amount.to_big_endian(&mut be);
-        self.db.put_opt(mbudget_key(&h, model).as_bytes(), be, &synced())?;
+        self.put_val(&mbudget_key(&h, model), &be, &synced())?;
         Ok(())
     }
 
     /// A key's remaining budget for `model`, if one is set (else uncapped).
     pub fn get_model_budget(&self, key_id: &str, model: &str) -> Result<Option<U256>, StoreError> {
         let h = hash_key_id(key_id);
-        Ok(self.db.get(mbudget_key(&h, model).as_bytes())?.and_then(parse_u256_be))
+        Ok(self.get_val(&mbudget_key(&h, model))?.and_then(parse_u256_be))
     }
 
     /// All `(model, remaining)` budgets set for a key (admin/inspect).
@@ -416,7 +713,8 @@ impl PersistentKeyStore {
             // The model name is everything after the fixed-length prefix, so a
             // `:` inside a model name is unambiguous.
             let model = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
-            if let Some(amt) = parse_u256_be(v) {
+            let plain = open_value(&self.master, &k, &v)?;
+            if let Some(amt) = parse_u256_be(plain) {
                 out.push((model, amt));
             }
         }
@@ -431,7 +729,7 @@ impl PersistentKeyStore {
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
         let mk = mbudget_key(&h, model);
-        let cur = match self.db.get(mk.as_bytes())? {
+        let cur = match self.get_val(&mk)? {
             Some(b) => parse_u256_be(b).ok_or_else(|| ModelBudgetError::Encode("bad budget value".into()))?,
             None => return Ok(()), // uncapped
         };
@@ -440,7 +738,7 @@ impl PersistentKeyStore {
         }
         let mut be = [0u8; 32];
         (cur - amount).to_big_endian(&mut be);
-        self.db.put_opt(mk.as_bytes(), be, &synced())?;
+        self.put_val(&mk, &be, &synced())?;
         Ok(())
     }
 
@@ -451,13 +749,13 @@ impl PersistentKeyStore {
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
         let mk = mbudget_key(&h, model);
-        let cur = match self.db.get(mk.as_bytes())? {
+        let cur = match self.get_val(&mk)? {
             Some(b) => parse_u256_be(b).unwrap_or_default(),
             None => return Ok(()), // uncapped — nothing to credit
         };
         let mut be = [0u8; 32];
         cur.saturating_add(amount).to_big_endian(&mut be);
-        self.db.put_opt(mk.as_bytes(), be, &synced())?;
+        self.put_val(&mk, &be, &synced())?;
         Ok(())
     }
 
@@ -485,14 +783,14 @@ impl PersistentKeyStore {
             daily_quota,
         };
         let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-        self.db.put(record_key(&h).as_bytes(), bytes)?;
+        self.put_val(&record_key(&h), &bytes, &WriteOptions::default())?;
         Ok(id)
     }
 
     /// Fetch a record by plaintext bearer.
     pub fn get_record(&self, key_id: &str) -> Result<Option<KeyRecord>, StoreError> {
         let h = hash_key_id(key_id);
-        let raw = self.db.get(record_key(&h).as_bytes())?;
+        let raw = self.get_val(&record_key(&h))?;
         match raw {
             Some(b) => Ok(Some(
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?,
@@ -506,23 +804,23 @@ impl PersistentKeyStore {
     /// marketplace) namespaces.
     pub fn revoke(&self, key_id: &str) -> Result<(), StoreError> {
         let h = hash_key_id(key_id);
-        if let Some(b) = self.db.get(record_key(&h).as_bytes())? {
+        if let Some(b) = self.get_val(&record_key(&h))? {
             let mut rec: KeyRecord =
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
             rec.revoked = true;
             let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-            self.db.put(record_key(&h).as_bytes(), bytes)?;
+            self.put_val(&record_key(&h), &bytes, &WriteOptions::default())?;
             return Ok(());
         }
         // Balance key — revoke under the per-key lock so it can't race a debit.
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
-        if let Some(b) = self.db.get(bal_key(&h).as_bytes())? {
+        if let Some(b) = self.get_val(&bal_key(&h))? {
             let mut rec: BalanceRecord =
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
             rec.revoked = true;
             let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-            self.db.put_opt(bal_key(&h).as_bytes(), bytes, &synced())?;
+            self.put_val(&bal_key(&h), &bytes, &synced())?;
             return Ok(());
         }
         Err(StoreError::Unknown)
@@ -539,7 +837,8 @@ impl PersistentKeyStore {
                 break;
             }
             let hash = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
-            if let Ok(r) = bincode::deserialize::<KeyRecord>(&v) {
+            let plain = open_value(&self.master, &k, &v)?;
+            if let Ok(r) = bincode::deserialize::<KeyRecord>(&plain) {
                 out.push((hash, r));
             }
         }
@@ -552,7 +851,7 @@ impl PersistentKeyStore {
     /// 401 vs 429 with the right `Retry-After`.
     pub fn try_consume(&self, key_id: &str) -> Result<ConsumedKey, ConsumeError> {
         let h = hash_key_id(key_id);
-        let raw = self.db.get(record_key(&h).as_bytes())?;
+        let raw = self.get_val(&record_key(&h))?;
         let record: KeyRecord = match raw {
             Some(b) => bincode::deserialize(&b).map_err(|_| ConsumeError::Unknown)?,
             None => return Err(ConsumeError::Unknown),
@@ -591,8 +890,7 @@ impl PersistentKeyStore {
             let day = today_yyyymmdd();
             let day_key = quota_key(&h, &day);
             let cur = self
-                .db
-                .get(day_key.as_bytes())?
+                .get_val(&day_key)?
                 .and_then(|b| {
                     if b.len() == 8 {
                         let mut buf = [0u8; 8];
@@ -609,7 +907,7 @@ impl PersistentKeyStore {
                 });
             }
             let next = cur + 1;
-            self.db.put(day_key.as_bytes(), next.to_le_bytes())?;
+            self.put_val(&day_key, &next.to_le_bytes(), &WriteOptions::default())?;
         }
 
         Ok(ConsumedKey {
@@ -692,10 +990,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Test master key for the at-rest encryption (ENCRYPT-S1).
+    pub(crate) const TEST_MASTER: [u8; 32] = [7u8; 32];
+
+    /// Shorthand: open an encrypted store under [`TEST_MASTER`].
+    fn open(path: &Path) -> Arc<PersistentKeyStore> {
+        PersistentKeyStore::open(path, TEST_MASTER).unwrap()
+    }
+
     #[test]
     fn create_get_list_revoke_roundtrip() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
 
         let id = store.create_key("chatbot", 5, 10_000).unwrap();
         assert!(id.starts_with("cgk_"));
@@ -717,7 +1023,7 @@ mod tests {
     #[test]
     fn unknown_get_is_none_revoke_is_err() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         assert!(store.get_record("cgk_nope").unwrap().is_none());
         assert!(matches!(
             store.revoke("cgk_nope"),
@@ -730,7 +1036,7 @@ mod tests {
     #[test]
     fn storage_never_holds_plaintext_bearer() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let id = store.create_key("ci", 0, 0).unwrap();
 
         // The plaintext id MUST NOT be a key in the DB.
@@ -755,7 +1061,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let id;
         {
-            let store = PersistentKeyStore::open(dir.path()).unwrap();
+            let store = open(dir.path());
             id = store.create_key("explorer", 0, 10).unwrap();
             // burn 3 daily ticks
             for _ in 0..3 {
@@ -763,7 +1069,7 @@ mod tests {
             }
         }
         // "restart" — drop and reopen
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let r = store.get_record(&id).unwrap().unwrap();
         assert_eq!(r.label, "explorer");
 
@@ -780,7 +1086,7 @@ mod tests {
     #[test]
     fn revoked_key_returns_revoked() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let id = store.create_key("rev", 0, 0).unwrap();
         store.revoke(&id).unwrap();
         assert!(matches!(store.try_consume(&id), Err(ConsumeError::Revoked)));
@@ -789,7 +1095,7 @@ mod tests {
     #[test]
     fn unknown_key_returns_unknown() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         assert!(matches!(
             store.try_consume("cgk_does_not_exist"),
             Err(ConsumeError::Unknown)
@@ -799,7 +1105,7 @@ mod tests {
     #[test]
     fn rate_limit_caps_per_second() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let id = store.create_key("rl", 3, 0).unwrap();
         // 3 succeed in the same second
         store.try_consume(&id).unwrap();
@@ -817,7 +1123,7 @@ mod tests {
     #[test]
     fn balance_store_never_holds_plaintext_bearer() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let id = store
             .create_balance_key("buyer", U256::from(100u64), H160::zero(), 0)
             .unwrap();
@@ -839,7 +1145,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (quota_id, bal_id);
         {
-            let store = PersistentKeyStore::open(dir.path()).unwrap();
+            let store = open(dir.path());
             quota_id = store.create_key("proxy", 0, 5).unwrap();
             bal_id = store
                 .create_balance_key("buyer", U256::from(42u64), H160::zero(), 0)
@@ -849,7 +1155,7 @@ mod tests {
             assert!(store.get_record(&bal_id).unwrap().is_none());
         }
         // restart
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         assert_eq!(store.get_record(&quota_id).unwrap().unwrap().daily_quota, 5);
         assert_eq!(
             store.get_balance(&bal_id).unwrap().unwrap(),
@@ -860,7 +1166,7 @@ mod tests {
     #[test]
     fn zero_quota_is_unlimited() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = open(dir.path());
         let id = store.create_key("uncapped", 0, 0).unwrap();
         // Burst far past anything we'd actually configure — should be fine.
         for _ in 0..200 {
@@ -876,7 +1182,7 @@ mod tests {
     #[test]
     fn daily_quota_is_atomic_under_concurrency() {
         let dir = tempdir().unwrap();
-        let store = std::sync::Arc::new(PersistentKeyStore::open(dir.path()).unwrap());
+        let store = open(dir.path());
         // quota_rps=0 disables the per-second window so only the daily
         // path is exercised.
         let id = store.create_key("racy", 0, 16).unwrap();
@@ -897,5 +1203,114 @@ mod tests {
         }
         let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total, 16, "exactly daily_quota consumes may succeed");
+    }
+
+    // ── ENCRYPT-S1 / WP-2: at-rest value encryption ─────────────────
+
+    /// Roundtrip across reopen under the SAME master key: money survives.
+    #[test]
+    fn encrypted_store_roundtrips_across_reopen() {
+        let dir = tempdir().unwrap();
+        let id;
+        {
+            let store = open(dir.path());
+            id = store
+                .create_balance_key("buyer", U256::from(1234u64), H160::zero(), 0)
+                .unwrap();
+        }
+        let store = open(dir.path());
+        assert_eq!(store.get_balance(&id).unwrap().unwrap(), U256::from(1234u64));
+    }
+
+    /// A wrong master key is rejected AT OPEN (marker check) — never a
+    /// silent empty-looking store, never a partial read.
+    #[test]
+    fn wrong_master_key_is_rejected_at_open() {
+        let dir = tempdir().unwrap();
+        {
+            let store = open(dir.path());
+            store
+                .create_balance_key("buyer", U256::from(9u64), H160::zero(), 0)
+                .unwrap();
+        }
+        let err = PersistentKeyStore::open(dir.path(), [9u8; 32]).err().expect("must fail");
+        assert!(matches!(err, StoreError::WrongKey), "got: {err}");
+    }
+
+    /// A legacy plaintext DB (rows, no `meta:enc` marker) is refused with the
+    /// migration pointer — plaintext and ciphertext rows must never mix.
+    #[test]
+    fn plaintext_store_is_refused_at_open() {
+        let dir = tempdir().unwrap();
+        {
+            // Craft a pre-ENCRYPT-S1 store: a raw plaintext row, no marker.
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            let db = DB::open(&opts, dir.path()).unwrap();
+            db.put(b"record:deadbeef", b"plaintext-record").unwrap();
+        }
+        let err = PersistentKeyStore::open(dir.path(), TEST_MASTER).err().expect("must fail");
+        assert!(matches!(err, StoreError::PlaintextStore), "got: {err}");
+    }
+
+    /// Hexdump-probe property: the distinctive plaintext markers of a money
+    /// record (label bytes, deposit address bytes) must not appear anywhere
+    /// in the on-disk files (SSTs, WAL, …). Mirrors the comms
+    /// `on_disk_bytes_are_not_plaintext` red test.
+    #[test]
+    fn on_disk_bytes_hold_no_plaintext_money_markers() {
+        let dir = tempdir().unwrap();
+        let label = "PROBE-LABEL-DO-NOT-LEAK";
+        let deposit = H160::from_slice(&[0xAB; 20]);
+        {
+            let store = open(dir.path());
+            store
+                .create_balance_key(label, U256::from(777_777u64), deposit, 1)
+                .unwrap();
+            store.flush().unwrap();
+        }
+        let mut hits = Vec::new();
+        for f in walk(dir.path()) {
+            if let Ok(bytes) = std::fs::read(&f) {
+                if bytes.windows(label.len()).any(|w| w == label.as_bytes())
+                    || bytes.windows(20).any(|w| w == deposit.as_bytes())
+                {
+                    hits.push(f);
+                }
+            }
+        }
+        assert!(hits.is_empty(), "plaintext money markers leaked to disk: {hits:?}");
+    }
+
+    /// AAD binding (stronger than the comms per-CF pattern): a ciphertext
+    /// transplanted onto another row's key fails authentication instead of
+    /// decrypting as that row's value.
+    #[test]
+    fn transplanted_ciphertext_fails_aad_binding() {
+        let sealed = seal_value(&TEST_MASTER, b"bal:rich", b"lots-of-money").unwrap();
+        // Same namespace, different row — must NOT decrypt.
+        let err = open_value(&TEST_MASTER, b"bal:poor", &sealed).unwrap_err();
+        assert!(matches!(err, CryptError::Crypto));
+        // Original row still decrypts.
+        assert_eq!(
+            open_value(&TEST_MASTER, b"bal:rich", &sealed).unwrap(),
+            b"lots-of-money"
+        );
+    }
+
+    /// Recursively list files under `dir` (probe helper).
+    pub(crate) fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 }

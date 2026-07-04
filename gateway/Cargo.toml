@@ -92,6 +92,16 @@ sha2 = "0.10"
 hex = "0.4"
 ethereum-types = "0.14"
 
+# ENCRYPT-S1 / WP-2: money-store value encryption at rest. Same suite as the
+# proven citrate-comms EncryptedStore — AES-256-GCM-SIV (nonce-misuse-
+# resistant AEAD, RFC 8452) + BLAKE3 keyed KDF for per-namespace data keys +
+# Zeroizing master-key handling. getrandom draws the per-value nonces and the
+# generated-on-first-run master key (keyvault tier 3).
+aes-gcm-siv = "0.11"
+blake3 = { workspace = true }
+zeroize = "1.8"
+getrandom = "0.2"
+
 # Citrate integration — x402-axum stays internal to this workspace.
 # citrate-wallet-core is consumed from CitrateNetwork/citrate-chain via SSH
 # deploy key (federation-transition interim). When citrate-chain publishes

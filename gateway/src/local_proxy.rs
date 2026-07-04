@@ -151,6 +151,12 @@ async fn proxy_handler(
             tracing::error!(error = %e, "keystore unavailable");
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         }
+        // ENCRYPT-S1: an undecryptable record is a store-integrity problem
+        // (wrong key / tampering), never an auth verdict — 500, not 401.
+        Err(ConsumeError::Crypt(e)) => {
+            tracing::error!(error = %e, "keystore crypto failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
     };
 
     tracing::info!(
@@ -283,6 +289,9 @@ fn rate_limited(retry_after_secs: u64, msg: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test master key for the at-rest store encryption (ENCRYPT-S1).
+    const TEST_MASTER: [u8; 32] = [7u8; 32];
     use axum::http::Request;
     use std::net::SocketAddr;
     use tempfile::tempdir;
@@ -341,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn health_is_open() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let app = router_with(store, "http://127.0.0.1:1".into());
         let resp = app
             .oneshot(
@@ -358,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn missing_bearer_is_401() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let app = router_with(store, "http://127.0.0.1:1".into());
         let resp = app
             .oneshot(
@@ -376,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_bearer_is_401() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let app = router_with(store, "http://127.0.0.1:1".into());
         let resp = app
             .oneshot(
@@ -395,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn revoked_bearer_is_401() {
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("t", 0, 0).unwrap();
         store.revoke(&id).unwrap();
         let app = router_with(store, "http://127.0.0.1:1".into());
@@ -417,7 +426,7 @@ mod tests {
     async fn valid_key_proxies_to_upstream() {
         let upstream_addr = spawn_upstream(false).await;
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("ok", 0, 0).unwrap();
         let app = router_with(store, format!("http://{upstream_addr}"));
 
@@ -445,7 +454,7 @@ mod tests {
     async fn sse_response_is_forwarded() {
         let upstream_addr = spawn_upstream(true).await;
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("sse", 0, 0).unwrap();
         let app = router_with(store, format!("http://{upstream_addr}"));
 
@@ -486,7 +495,7 @@ mod tests {
         let live = format!("http://{live_addr}");
 
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("failover", 0, 0).unwrap();
         let state = LocalProxyState::new(store, vec![dead.into(), live]);
         let app = build_local_proxy_router(state);
@@ -515,7 +524,7 @@ mod tests {
     async fn rate_limit_returns_429_with_retry_after() {
         let upstream_addr = spawn_upstream(false).await;
         let dir = tempdir().unwrap();
-        let store = PersistentKeyStore::open(dir.path()).unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("rl", 2, 0).unwrap(); // 2 rps
         let upstream = format!("http://{upstream_addr}");
 

@@ -11,6 +11,10 @@ use std::sync::Arc;
 use std::thread;
 
 use citrate_gateway::keystore::{ModelBudgetError, PersistentKeyStore};
+
+/// Test master key for the at-rest store encryption (ENCRYPT-S1) — the
+/// TD-22 durability guarantees are proven UNDER encryption.
+const TEST_MASTER: [u8; 32] = [7u8; 32];
 use ethereum_types::{H160, U256};
 
 const BACKING_SALT: u8 = 0;
@@ -29,7 +33,7 @@ fn key(store: &PersistentKeyStore) -> String {
 #[test]
 fn model_budget_exhausts_independently() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
 
     store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set");
@@ -53,7 +57,7 @@ fn model_budget_exhausts_independently() {
 #[test]
 fn refund_attributes_to_the_right_model_bucket() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
     store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set llama");
     store.set_model_budget(&k, "mistral-7b", salt(5)).expect("set mistral");
@@ -70,7 +74,7 @@ fn refund_attributes_to_the_right_model_bucket() {
 #[test]
 fn uncapped_model_is_passthrough() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
     store.debit_model_budget(&k, "gpt-whatever", salt(10)).expect("uncapped ok");
     assert!(store.get_model_budget(&k, "gpt-whatever").expect("get").is_none());
@@ -84,12 +88,12 @@ fn model_budget_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let k;
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         k = key(&store);
         store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set");
         store.debit_model_budget(&k, "llama-3.1-8b", salt(3)).expect("debit"); // -> 2
     }
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_model_budget(&k, "llama-3.1-8b").expect("get").expect("set"), salt(2));
 }
 
@@ -97,7 +101,7 @@ fn model_budget_survives_restart() {
 #[test]
 fn concurrent_model_debits_never_overspend() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
     store.set_model_budget(&k, "llama-3.1-8b", salt(300)).expect("set");
 
@@ -117,7 +121,7 @@ fn concurrent_model_debits_never_overspend() {
 #[test]
 fn list_model_budgets_enumerates() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
     store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("a");
     store.set_model_budget(&k, "mistral-7b", salt(9)).expect("b");
