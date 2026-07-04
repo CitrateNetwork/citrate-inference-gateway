@@ -31,7 +31,7 @@ fn build_app() -> Router {
         .facilitator_address(any_addr())
         .wsalt_address(any_addr())
         .treasury(any_addr())
-        .rpc_url("http://127.0.0.1:18545")
+        .rpc_url("http://127.0.0.1:8545")
         .pricing(FixedPricing::new("1000000000000000000")) // 1 SALT
         .operator_secret_hex(test_secret_hex())
         .build()
@@ -223,7 +223,7 @@ async fn different_chain_ids_produce_different_challenge_chain_id() {
         .facilitator_address(any_addr())
         .wsalt_address(any_addr())
         .treasury(any_addr())
-        .rpc_url("http://127.0.0.1:18545")
+        .rpc_url("http://127.0.0.1:8545")
         .pricing(FixedPricing::new("100"))
         .operator_secret_hex(test_secret_hex())
         .build()

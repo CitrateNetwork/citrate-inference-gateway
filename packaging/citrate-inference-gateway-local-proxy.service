@@ -37,6 +37,13 @@ Environment=CITRATE_GATEWAY_MODE=local-proxy
 # for infer.citrate.ai: DGX over Tailscale primary, droplet CPU fallback).
 Environment=CITRATE_GATEWAY_UPSTREAM_URL=http://100.68.173.64:8181,http://127.0.0.1:8181
 Environment=CITRATE_GATEWAY_KEYSTORE_PATH=/var/lib/citrate-gateway/keystore
+# ENCRYPT-S1: the keystore VALUES are encrypted at rest. Master-key sourcing
+# chain: GATEWAY_STORE_KEY (hex 32B) → GATEWAY_STORE_KEY_FILE → generated
+# 0600 sibling file <keystore>.master.key (bootstrap tier ONLY — see
+# .agentile/runbooks/ENCRYPTED_MONEY_STORE.md for the production systemd-
+# credential setup and threat models). Recommended production drop-in:
+#LoadCredentialEncrypted=gateway-store-key:/etc/citrate-gateway/gateway-store-key.cred
+#Environment=GATEWAY_STORE_KEY_FILE=%d/gateway-store-key
 # Loopback only — Caddy terminates TLS publicly and forwards over loopback.
 Environment=CITRATE_GATEWAY_LISTEN_ADDR=127.0.0.1:9800
 Environment=LOG_FORMAT=json

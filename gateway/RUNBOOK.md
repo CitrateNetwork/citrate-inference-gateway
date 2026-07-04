@@ -56,7 +56,7 @@ local devnet — override for testnet / mainnet.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CITRATE_GATEWAY_CHAIN_ID` | `40204` | Citrate testnet chain id |
-| `CITRATE_GATEWAY_RPC_URL` | `http://127.0.0.1:18545` | JSON-RPC endpoint |
+| `CITRATE_GATEWAY_RPC_URL` | `http://127.0.0.1:8545` | JSON-RPC endpoint |
 | `CITRATE_GATEWAY_LISTEN_ADDR` | `127.0.0.1:9800` | HTTP listen socket. Loopback by default (SECREM-01 SVC-5); set `0.0.0.0:9800` for an intentional remote/container bind — logs a warning when bound non-loopback. |
 | `CITRATE_GATEWAY_MODEL_REGISTRY` | deployed-addresses default | ModelRegistry contract |
 | `CITRATE_GATEWAY_PRICING_ORACLE` | deployed-addresses default | ComputePricingOracle |
