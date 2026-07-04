@@ -38,6 +38,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm-siv"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae0784134ba9375416d469ec31e7c5f9fa94405049cf08c5ce5b4698be673e0d"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "polyval",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1144,6 +1159,7 @@ dependencies = [
 name = "citrate-inference-gateway"
 version = "0.4.0"
 dependencies = [
+ "aes-gcm-siv",
  "async-trait",
  "aws-credential-types",
  "aws-sigv4",
@@ -1151,12 +1167,14 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "chrono",
  "citrate-wallet-core",
  "clap",
  "eth-keystore",
  "ethereum-types",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "http 1.4.1",
  "http-body-util",
@@ -1182,6 +1200,7 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "uuid 1.23.2",
  "x402-axum",
+ "zeroize",
 ]
 
 [[package]]

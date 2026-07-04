@@ -61,7 +61,9 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod keystore;
+pub mod keyvault;
 pub mod local_proxy;
+pub mod migrate;
 pub mod metrics;
 pub mod models;
 pub mod openai;
@@ -126,9 +128,19 @@ fn open_marketplace_store() -> Option<Arc<keystore::PersistentKeyStore>> {
     let path = std::env::var("CITRATE_GATEWAY_KEYSTORE_PATH").ok();
     let dev_mode = std::env::var("CITRATE_GATEWAY_DEV_MODE").ok();
     match resolve_marketplace_store(path.as_deref(), dev_mode.as_deref()) {
-        MarketplaceStoreDecision::Durable(path) => match keystore::PersistentKeyStore::open(&path) {
-            Ok(store) => {
-                tracing::info!(keystore = %path, "marketplace stores: durable (RocksDB, shared by keys + batches)");
+        // ENCRYPT-S1 / WP-2: the durable store is encrypted at rest; the
+        // master key comes from the keyvault sourcing chain (GATEWAY_STORE_KEY
+        // env → key file → generate-on-first-run). A wrong key or a
+        // not-yet-migrated plaintext store is a fatal misconfiguration of a
+        // money store — same panic posture as an unopenable path.
+        MarketplaceStoreDecision::Durable(path) => match keyvault::open_store(&path) {
+            Ok((store, key_source)) => {
+                tracing::info!(
+                    keystore = %path,
+                    key_source = %key_source,
+                    "marketplace stores: durable + encrypted at rest \
+                     (RocksDB, AES-256-GCM-SIV values, shared by keys + batches)"
+                );
                 Some(store)
             }
             Err(e) => panic!("failed to open durable gateway store at {path}: {e}"),

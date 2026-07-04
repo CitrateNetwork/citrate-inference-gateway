@@ -174,11 +174,15 @@ impl ApiKeyStore {
         }
     }
 
-    /// Durable, RocksDB-backed store at `path` (production marketplace boot).
-    /// Balances and revocations survive a restart; debit/refund are
-    /// crash-atomic (WP-F).
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, crate::keystore::StoreError> {
-        Ok(Self::with_persistent(crate::keystore::PersistentKeyStore::open(path)?))
+    /// Durable, RocksDB-backed store at `path` (production marketplace boot),
+    /// encrypted at rest under `master` (ENCRYPT-S1 / WP-2 — key sourcing in
+    /// [`crate::keyvault`]). Balances and revocations survive a restart;
+    /// debit/refund are crash-atomic (WP-F).
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+        master: [u8; 32],
+    ) -> Result<Self, crate::keystore::StoreError> {
+        Ok(Self::with_persistent(crate::keystore::PersistentKeyStore::open(path, master)?))
     }
 
     /// Build over an already-open persistent store, so the API-key balances and
@@ -411,7 +415,9 @@ impl DebitError {
             BalanceError::Unknown => DebitError::Unknown,
             BalanceError::Revoked => DebitError::Revoked,
             BalanceError::Insufficient(bal) => DebitError::Insufficient(bal),
-            BalanceError::Store(_) | BalanceError::Encode(_) => DebitError::Unknown,
+            BalanceError::Store(_) | BalanceError::Encode(_) | BalanceError::Crypt(_) => {
+                DebitError::Unknown
+            }
         }
     }
 }

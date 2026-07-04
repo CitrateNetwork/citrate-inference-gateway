@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::thread;
 
 use citrate_gateway::keystore::{BalanceError, PersistentKeyStore};
+
+/// Test master key for the at-rest store encryption (ENCRYPT-S1) — the
+/// TD-22 durability guarantees are proven UNDER encryption.
+const TEST_MASTER: [u8; 32] = [7u8; 32];
 use ethereum_types::{H160, U256};
 
 /// KeyBacking::Salt as the persisted u8 discriminant.
@@ -28,7 +32,7 @@ fn debit_then_crash_reload_applies_exactly_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let id;
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         id = store
             .create_balance_key("buyer", salt(100), H160::zero(), BACKING_SALT)
             .expect("create");
@@ -36,7 +40,7 @@ fn debit_then_crash_reload_applies_exactly_once() {
         assert_eq!(bal, salt(70), "in-process balance after debit");
     } // drop == process crash / restart
 
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     let bal = store.get_balance(&id).expect("get").expect("present");
     assert_eq!(bal, salt(70), "exactly once: not 100 (lost), not 40 (doubled)");
 }
@@ -47,7 +51,7 @@ fn balance_consistent_across_restart_with_refunds() {
     let dir = tempfile::tempdir().expect("tempdir");
     let id;
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         id = store
             .create_balance_key("buyer", salt(100), H160::zero(), BACKING_SALT)
             .expect("create");
@@ -56,7 +60,7 @@ fn balance_consistent_across_restart_with_refunds() {
         store.debit_balance(&id, salt(5)).expect("debit");
         // 100 - 30 + 10 - 5 = 75
     }
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(75));
 }
 
@@ -64,7 +68,7 @@ fn balance_consistent_across_restart_with_refunds() {
 #[test]
 fn insufficient_debit_changes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let id = store
         .create_balance_key("buyer", salt(100), H160::zero(), BACKING_SALT)
         .expect("create");
@@ -77,7 +81,7 @@ fn insufficient_debit_changes_nothing() {
 
     // and across restart
     drop(store);
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(100));
 }
 
@@ -88,7 +92,7 @@ fn refund_credits_revoked_key_durably() {
     let dir = tempfile::tempdir().expect("tempdir");
     let id;
     {
-        let store = PersistentKeyStore::open(dir.path()).expect("open");
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         id = store
             .create_balance_key("buyer", salt(100), H160::zero(), BACKING_SALT)
             .expect("create");
@@ -100,7 +104,7 @@ fn refund_credits_revoked_key_durably() {
         // but refunds still land
         store.refund_balance(&id, salt(40)).expect("refund"); // -> 100
     }
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(100));
 }
 
@@ -109,7 +113,7 @@ fn refund_credits_revoked_key_durably() {
 #[test]
 fn concurrent_debits_never_overspend() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = PersistentKeyStore::open(dir.path()).expect("open");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let id = store
         .create_balance_key("buyer", salt(1000), H160::zero(), BACKING_SALT)
         .expect("create");
@@ -135,6 +139,6 @@ fn concurrent_debits_never_overspend() {
 
     // and the durable value matches across restart
     drop(store);
-    let store = PersistentKeyStore::open(dir.path()).expect("reopen");
+    let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     assert_eq!(store.get_balance(&id).expect("get").expect("present"), expected);
 }
