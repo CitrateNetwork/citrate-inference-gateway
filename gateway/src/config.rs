@@ -59,7 +59,7 @@ pub struct GatewayConfig {
     /// Chain ID. Default 40204 (Citrate testnet).
     pub chain_id: u64,
     /// JSON-RPC URL for chain queries (ModelRegistry, eth_call,
-    /// etc.). Defaults to `http://127.0.0.1:18545`.
+    /// etc.). Defaults to `http://127.0.0.1:8545`.
     pub rpc_url: String,
     /// Listen address. Defaults to loopback (`127.0.0.1:9800`); set
     /// `CITRATE_GATEWAY_LISTEN_ADDR=0.0.0.0:9800` for an intentional remote
@@ -104,7 +104,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             chain_id: 40204,
-            rpc_url: "http://127.0.0.1:18545".to_string(),
+            rpc_url: "http://127.0.0.1:8545".to_string(),
             // SECREM-01 SVC-5 (pre-audit 2026-06-09): loopback default.
             listen_addr: "127.0.0.1:9800".to_string(),
             contracts: ContractAddresses::default(),
@@ -120,7 +120,7 @@ mod tests {
     fn defaults_are_sensible() {
         let c = GatewayConfig::default();
         assert_eq!(c.chain_id, 40204);
-        assert!(c.rpc_url.contains("18545"));
+        assert!(c.rpc_url.contains("8545"));
         assert!(c.listen_addr.contains("9800"));
     }
 
