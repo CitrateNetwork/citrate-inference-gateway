@@ -16,16 +16,26 @@
 //!   request.
 //! - `list` — prints active and revoked keys (hash prefix + label +
 //!   quotas). The plaintext bearer is never recoverable.
+//! - `migrate-encrypt` — ENCRYPT-S1 one-shot: encrypt a legacy plaintext
+//!   keystore in place (staging dir + atomic rename; idempotent;
+//!   `--dry-run` supported). Runbook:
+//!   `.agentile/runbooks/ENCRYPTED_MONEY_STORE.md`.
 //!
 //! All operations require write access to the keystore dir, which is
 //! `0600` and owned by the gateway service user on production hosts.
+//! Since ENCRYPT-S1 the store values are encrypted at rest, so every
+//! keystore command also needs the master key — sourced through the same
+//! chain the gateway uses (`GATEWAY_STORE_KEY` env → key file → generate;
+//! see `citrate_gateway::keyvault`).
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use citrate_gateway::keystore::PersistentKeyStore;
 use citrate_gateway::signer::{EncryptedFileSigner, OperatorWallet};
+use citrate_gateway::{keyvault, migrate};
 use ethereum_types::{H160, U256};
 
 #[derive(Parser)]
@@ -43,6 +53,12 @@ struct Cli {
         default_value = "/var/lib/citrate-gateway/keystore"
     )]
     keystore: String,
+
+    /// Master-key file for the at-rest store encryption (ENCRYPT-S1).
+    /// Defaults to the same chain the gateway uses: `GATEWAY_STORE_KEY` env
+    /// → `GATEWAY_STORE_KEY_FILE` env → `<keystore>.master.key`.
+    #[arg(long)]
+    store_key_file: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -84,6 +100,14 @@ enum Cmd {
     ListModelBudgets {
         /// The plaintext `cgk_…` token.
         id: String,
+    },
+    /// ENCRYPT-S1: encrypt a legacy plaintext keystore in place (one-shot,
+    /// idempotent). Stop the gateway service first; the pre-migration copy
+    /// is kept as `<keystore>.pre-encrypt-<ts>` for rollback.
+    MigrateEncrypt {
+        /// Classify + count only; write nothing (not even a generated key).
+        #[arg(long)]
+        dry_run: bool,
     },
     /// DEV/TESTNET: generate a fresh encrypted operator keystore (V3, scrypt +
     /// AES-128-CTR) and print the operator address to fund. NOT for mainnet —
@@ -183,13 +207,38 @@ fn main() -> ExitCode {
                 job_spec,
             })
         }
-        cmd => run_keystore_cmd(&cli.keystore, cmd),
+        // migrate-encrypt must run BEFORE a normal encrypted open (which
+        // would refuse the plaintext store it exists to fix).
+        Cmd::MigrateEncrypt { dry_run } => {
+            migrate_encrypt_cmd(&cli.keystore, cli.store_key_file.as_deref(), dry_run)
+        }
+        cmd => run_keystore_cmd(&cli.keystore, cli.store_key_file.as_deref(), cmd),
     }
 }
 
+/// Source the store master key via the gateway's chain (ENCRYPT-S1):
+/// `GATEWAY_STORE_KEY` env → key file → (if allowed) generate + persist.
+fn source_store_key(
+    keystore_path: &str,
+    key_file_flag: Option<&str>,
+    allow_generate: bool,
+) -> Result<([u8; 32], keyvault::KeySource), keyvault::KeyvaultError> {
+    let key_file =
+        keyvault::resolve_key_file(Path::new(keystore_path), key_file_flag.map(Path::new));
+    keyvault::load_store_key(&key_file, allow_generate)
+}
+
 /// Run an API-key command against the persistent keystore at `keystore_path`.
-fn run_keystore_cmd(keystore_path: &str, cmd: Cmd) -> ExitCode {
-    let store = match PersistentKeyStore::open(keystore_path) {
+fn run_keystore_cmd(keystore_path: &str, key_file_flag: Option<&str>, cmd: Cmd) -> ExitCode {
+    let (master, key_source) = match source_store_key(keystore_path, key_file_flag, true) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error sourcing store master key: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!("store master key: {key_source}");
+    let store = match PersistentKeyStore::open(keystore_path, master) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error opening keystore at {keystore_path}: {e}");
@@ -290,7 +339,85 @@ fn run_keystore_cmd(keystore_path: &str, cmd: Cmd) -> ExitCode {
             }
         },
         // Handled in main() before the keystore is opened.
-        Cmd::OperatorKeygen { .. } | Cmd::OperatorDispatch { .. } => unreachable!(),
+        Cmd::OperatorKeygen { .. } | Cmd::OperatorDispatch { .. } | Cmd::MigrateEncrypt { .. } => {
+            unreachable!()
+        }
+    }
+}
+
+/// ENCRYPT-S1: drive [`citrate_gateway::migrate::migrate_encrypt`] and print
+/// an operator-readable report. Dry runs never write (not even a generated
+/// key); real runs source the key through the normal chain.
+fn migrate_encrypt_cmd(keystore_path: &str, key_file_flag: Option<&str>, dry_run: bool) -> ExitCode {
+    // Dry run: a key is optional (only used to verify an already-encrypted
+    // store is under OUR key). Real run: required, generation allowed.
+    let master = if dry_run {
+        match source_store_key(keystore_path, key_file_flag, false) {
+            Ok((k, src)) => {
+                eprintln!("store master key: {src}");
+                Some(k)
+            }
+            Err(keyvault::KeyvaultError::NotFound(path)) => {
+                eprintln!(
+                    "no store master key yet — a real run would generate one at {}",
+                    path.display()
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("error sourcing store master key: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match source_store_key(keystore_path, key_file_flag, true) {
+            Ok((k, src)) => {
+                eprintln!("store master key: {src}");
+                Some(k)
+            }
+            Err(e) => {
+                eprintln!("error sourcing store master key: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+
+    match migrate::migrate_encrypt(Path::new(keystore_path), master, dry_run) {
+        Ok(report) => {
+            match report.state {
+                migrate::SourceState::AlreadyEncrypted => {
+                    eprintln!(
+                        "keystore at {keystore_path} is ALREADY encrypted{} — nothing to do",
+                        if master.is_some() { " (under this key)" } else { "" }
+                    );
+                }
+                migrate::SourceState::Plaintext => {
+                    eprintln!(
+                        "{}: plaintext keystore, {} rows:",
+                        if report.dry_run { "DRY RUN" } else { "MIGRATED" },
+                        report.entries
+                    );
+                    for (ns, n) in &report.per_namespace {
+                        eprintln!("  {ns:<10} {n}");
+                    }
+                    if let Some(backup) = &report.backup {
+                        eprintln!(
+                            "pre-migration plaintext copy kept at {} — verify the service, \
+                             then archive/destroy it per the runbook (it still holds \
+                             plaintext money records)",
+                            backup.display()
+                        );
+                    } else if report.dry_run {
+                        eprintln!("(dry run — nothing was written)");
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("migration refused/failed (source store untouched): {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
