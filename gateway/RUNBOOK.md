@@ -1,5 +1,6 @@
 ---
 created: 2026-04-23T00:00:00Z
+last_updated: 2026-07-16
 branch: feat/compute-marketplace-buildout
 author: saulbuilds
 sprint: CM-03
@@ -20,11 +21,25 @@ This is the single source of truth for day-2 ops. Sprint documents
 
 ## 1. What the gateway is
 
-The gateway is a stateless HTTP façade that translates OpenAI-shaped
-API calls into dispatched inference jobs on the Citrate compute
-marketplace. It does not hold long-lived state beyond in-memory
-caches (batch store, usage store, API-key balances — all RocksDB-
-backed in a later slice).
+The gateway binary picks one of two router builds at boot from
+`CITRATE_GATEWAY_MODE` (see `main.rs`):
+
+- **`local-proxy`** (`infer.citrate.ai`) — **production-ready.** A lean
+  authenticated passthrough to a local OpenAI-compatible upstream (e.g.
+  `llama-server`). `cgk_` Bearer-gated (`local_proxy.rs`), per-key
+  per-second rate limit + daily quota, backed by a durable
+  **encrypted-at-rest** RocksDB key store (see §1.1). Keys are minted /
+  revoked / listed with the `citrate-gateway-admin` CLI (§4.3).
+- **`marketplace`** (default — `gateway.citrate.ai`) — the on-chain
+  compute-marketplace gateway described by the endpoint table below.
+  API-key balances and in-flight batches are now durable and
+  crash-atomic (INFER-S4; see §1.1). **Not fully wired: pool dispatch**
+  returns 503 (`PoolDispatchUnimplemented`, `chat.rs`) — the pool
+  slice-2 gateway-wallet path is unfinished. Individual-provider x402
+  dispatch works; pool routing does not.
+
+The marketplace router translates OpenAI-shaped API calls into
+dispatched inference jobs on the Citrate compute marketplace.
 
 | Endpoint | Auth | Handled in |
 |----------|------|-----------|
@@ -46,6 +61,26 @@ Outbound dependencies:
 - **Operator wallet** — the gateway signs `settlePayment` calls with
   this key; needs SALT to pay gas.
 
+### 1.1 Durable key/balance store
+
+Both modes persist through a single RocksDB `PersistentKeyStore`
+(`keystore.rs`), **not** an in-memory map. Every value is encrypted at
+rest with AES-256-GCM-SIV under a per-namespace key derived from a
+master key (ENCRYPT-S1); the master is sourced via
+`GATEWAY_STORE_KEY_FILE` env → `<keystore>.master.key`. A legacy
+plaintext store is refused at boot until migrated with
+`citrate-gateway-admin migrate-encrypt`.
+
+- **local-proxy:** the store holds `cgk_` key records + per-key rate /
+  daily-quota counters (durable across restart).
+- **marketplace:** the same store additively holds API-key
+  `balance_grains` and the batch settlement markers. Debit/refund are
+  per-key-locked, synced, and crash-atomic; a restart replays batch
+  settlement exactly once (INFER-S4 F1 balances + F2 batch resume).
+  Only `sha256(bearer)` is persisted, never the plaintext token.
+
+Store path: `CITRATE_GATEWAY_KEYSTORE_PATH` (dir created `0700`).
+
 ---
 
 ## 2. Configuration
@@ -61,6 +96,9 @@ local devnet — override for testnet / mainnet.
 | `CITRATE_GATEWAY_MODEL_REGISTRY` | deployed-addresses default | ModelRegistry contract |
 | `CITRATE_GATEWAY_PRICING_ORACLE` | deployed-addresses default | ComputePricingOracle |
 | `CITRATE_GATEWAY_INFERENCE_ROUTER` | deployed-addresses default | InferenceRouter |
+| `CITRATE_GATEWAY_MODE` | `marketplace` | `local-proxy` or `marketplace` (§1) |
+| `CITRATE_GATEWAY_KEYSTORE_PATH` | — | RocksDB key/balance store dir (`0700`); required for the durable store (§1.1) |
+| `GATEWAY_STORE_KEY_FILE` | `<keystore>.master.key` | Master key file for at-rest encryption (§1.1) |
 | `LOG_FORMAT` | `pretty` | `json` for structured logs |
 | `RUST_LOG` | `info,citrate_gateway=debug` | Log filter |
 
@@ -107,10 +145,11 @@ RestartSec=3
 EnvironmentFile=/etc/citrate/gateway.env
 ```
 
-The binary is stateless; restart is safe. In-flight chat completions
-are lost on SIGTERM (they're synchronous HTTP, no persistence). Batch
-runs that haven't reached terminal state are lost (slice 2 adds
-RocksDB durability).
+Restart is safe: the key/balance store is durable (§1.1). In-flight
+chat completions are lost on SIGTERM (they're synchronous HTTP, no
+persistence). In marketplace mode, in-flight batches are persisted;
+boot recovery refunds any un-terminal slot to the buyer exactly once
+(INFER-S4 F2) rather than losing the escrow.
 
 ### 4.2 Health check
 
@@ -119,21 +158,36 @@ this is deliberate so load balancers don't flap on transient chain
 outages. Check chain reachability separately via `/metrics`
 (see "chain unavailable" counter in §5 slice-2 additions).
 
-### 4.3 API key creation (slice 1 admin surface)
+### 4.3 API key creation (`citrate-gateway-admin` CLI)
 
-Until the `citrate-gateway-admin` CLI lands (slice 2), keys are minted
-by linking the `auth::create_key` function. For testing and internal
-pilots, a small helper binary pointing at the same in-process store
-is the supported path. See `gateway/src/auth.rs::create_key`.
+The admin CLI ships in the same crate and shares the durable store.
+It reads `CITRATE_GATEWAY_KEYSTORE_PATH` and the master key (§1.1).
+
+```bash
+# Mint a cgk_ key (prints the plaintext token ONCE)
+citrate-gateway-admin create --label alice \
+  --quota-rps 5 --daily-requests 10000
+
+# List active + revoked keys (hash prefix + label + quotas)
+citrate-gateway-admin list
+
+# Revoke a key (effective on next request)
+citrate-gateway-admin revoke cgk_...
+
+# One-time migrate a legacy plaintext store to encrypted-at-rest
+citrate-gateway-admin migrate-encrypt
+```
+
+Keys minted here are usable immediately by a running `local-proxy`
+gateway pointed at the same keystore path.
 
 ### 4.4 Key rotation / revocation
 
-- **Revoke**: `ApiKeyStore::revoke(key_id)` flips the `revoked` bit;
-  next request with that key gets 401.
+- **Revoke**: `citrate-gateway-admin revoke <cgk_id>` marks the key
+  revoked; the next request with that key gets 401.
 - **Rotate**: mint a new key, inform the user, revoke the old one.
-- In slice 1 (in-memory), rotation is tied to the gateway process
-  lifetime. Rolling restarts wipe the store. Do not deploy slice 1
-  to production unless acceptable.
+- The store is durable and encrypted at rest, so revocations and
+  balances survive rolling restarts (§1.1).
 
 ---
 
@@ -268,16 +322,25 @@ patterns:
 
 ## 9. Pending work (slice references)
 
-This runbook reflects **WP-03.6 slice 1** — the set of endpoints and
-behaviours live as of commit 786e6423+. The CM-03 sprint file tracks
-the deferred items:
+**Landed since slice 1** (reflected above):
+- Durable, encrypted-at-rest RocksDB store for keys + balances +
+  batches (INFER-S4 F1/F2; ENCRYPT-S1). §1.1
+- Admin CLI `citrate-gateway-admin` with create / revoke / list /
+  migrate-encrypt. §4.3
+- `local-proxy` mode (`cgk_` auth, per-key rate limit + daily quota).
+  §1
 
-- Slice 2: RocksDB persistence for batches, keys, usage
-- Slice 2: Admin CLI `citrate-gateway-admin` with create/revoke/list
-- Slice 2: SALT → wSALT auto-wrap watcher
-- Slice 2: Operator wallet balance gauge + auto-topup
-- Slice 3: On-chain `postJob` per batch request
-- Slice 3: `eth_subscribe` event subscription for JobCompleted/JobFailed
+**Still pending** (do not assume these work):
+- **Marketplace pool dispatch** — `chat.rs` returns 503
+  (`PoolDispatchUnimplemented`); the slice-2 gateway-wallet
+  `requestPoolCompute` path is unfinished. Individual-provider x402
+  dispatch works.
+- SALT → wSALT auto-wrap watcher.
+- Operator wallet balance gauge + auto-topup (see §6.1, §7.2).
+- Re-dispatch (vs refund) of interrupted batch inference on recovery;
+  persisting slot response bodies across restart.
+- Slice 3: on-chain `postJob` per batch request; `eth_subscribe`
+  event subscription for JobCompleted/JobFailed.
 
 Update this runbook when a slice lands — keep §5 catalogue and §6
 alerts as the canonical references.
