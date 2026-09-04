@@ -95,10 +95,7 @@ impl MockChain {
 
 #[async_trait]
 impl ChainClient for MockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if self.force_invalid_sig {
             return Ok(None);
         }
@@ -236,7 +233,12 @@ async fn call(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let res = app.oneshot(req).await.expect("service");
     (
         res.status(),
-        res.into_body().collect().await.expect("body").to_bytes().to_vec(),
+        res.into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec(),
     )
 }
 
@@ -260,12 +262,7 @@ async fn issue_nonce(app: &Router) -> H256 {
         .expect("build request");
     let res = app.clone().oneshot(req).await.expect("service");
     assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED, "handshake 402");
-    let body = res
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
+    let body = res.into_body().collect().await.expect("body").to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&body).expect("challenge json");
     let nonce_hex = v["x402"]["nonce"].as_str().expect("challenge nonce");
     let bytes = hex::decode(nonce_hex.trim_start_matches("0x")).expect("nonce hex");
@@ -318,12 +315,20 @@ async fn happy_path_forwards_to_inner_with_x402paid() {
     let mut payload = sample_payload();
     payload.nonce = issue_nonce(&app).await;
     let (status, body) = call(app, paid_request(&payload)).await;
-    assert_eq!(status, StatusCode::OK, "body = {:?}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body = {:?}",
+        String::from_utf8_lossy(&body)
+    );
     let text = String::from_utf8(body).expect("utf-8");
     assert!(text.contains("payer"));
-    // MockChain seeds the event's `from` to 0xa1*20 regardless of
-    // payload. The inner handler echoes that.
-    assert!(text.contains("a1a1a1a1"));
+    // IGW-B-001 (settle-after-serve): X402Paid is now attached from the
+    // VALIDATED payload BEFORE the inner service runs, so `payer` is the
+    // payload signer (`sample_payload().from` = 0xb1*20), not the mock's
+    // synthetic post-settle event `from` (0xa1*20). The payload signer is
+    // the correct payer identity.
+    assert!(text.contains("b1b1b1b1"));
 }
 
 #[tokio::test]
@@ -365,11 +370,7 @@ async fn recovered_signer_must_match_from_field() {
         async fn send_raw_tx(&self, b: &[u8]) -> Result<H256, X402Error> {
             self.0.send_raw_tx(b).await
         }
-        async fn wait_for_receipt(
-            &self,
-            h: H256,
-            t: Duration,
-        ) -> Result<TxReceipt, X402Error> {
+        async fn wait_for_receipt(&self, h: H256, t: Duration) -> Result<TxReceipt, X402Error> {
             self.0.wait_for_receipt(h, t).await
         }
     }
@@ -383,19 +384,21 @@ async fn recovered_signer_must_match_from_field() {
     assert!(body["reason"].as_str().unwrap_or("").contains("signature"));
 }
 
-/// 2026-05-31 audit -006 (SECREM-02 6.4a): a settle revert is NOT
-/// necessarily a nonce replay — it can be insufficient balance, a
-/// facilitator misconfig, or anything else the contract rejects. The
-/// layer must report a neutral "settle reverted" carrying the tx hash
-/// (so the operator can inspect the revert on-chain) instead of
-/// unconditionally claiming `NonceReplayed`. (Replaces the pre-6.4a
-/// `replay_nonce_returns_402_with_reason` test, which pinned the
-/// misleading mapping.)
+/// IGW-B-001 (settle-after-serve): under the fixed ordering, settlement runs
+/// only AFTER the inner service returns 2xx. So a settle revert now happens
+/// POST-serve — the client has already received its 200 and keeps it; the
+/// OPERATOR bears the failed-settle loss (surfaced via `tracing::error` +
+/// the observability `on_rejected("settle reverted")` hook, covered in
+/// `observability.rs::settle_revert_fires_on_rejected_with_neutral_reason`).
+/// This is the accepted trade-off: the invariant is that a NON-2xx never
+/// charges the payer; a post-2xx settle miss is operator loss, not a client
+/// rejection. Pre-fix (settle-before-serve) this returned a client-facing
+/// 402 with the neutral reason; that path no longer exists.
 #[tokio::test]
-async fn settle_revert_reports_neutral_reason_with_tx_hash() {
+async fn settle_revert_post_serve_keeps_200_operator_bears_loss() {
     let mock = MockChain::new(facilitator());
     // Seeding `settled` makes wait_for_receipt return status=false —
-    // an opaque revert receipt, reason unknown at this layer.
+    // an opaque revert receipt when the (post-serve) settle runs.
     mock.settled
         .lock()
         .expect("settled mutex")
@@ -404,22 +407,13 @@ async fn settle_revert_reports_neutral_reason_with_tx_hash() {
     let app = build_app_with_mock(mock);
     let mut payload = sample_payload();
     payload.nonce = issue_nonce(&app).await;
-    let (status, body) = call(app, paid_request(&payload)).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let reason = body["reason"].as_str().unwrap_or("");
+    let (status, _body) = call(app, paid_request(&payload)).await;
+    // The inner /gated handler already returned 200 before settlement was
+    // attempted; the post-serve settle revert does NOT downgrade it.
     assert_eq!(
-        reason, "settle reverted",
-        "revert must be reported neutrally, not as a replay; got: {}",
-        reason
-    );
-    // MockChain's send_raw_tx returns 0xbe…be — the response must
-    // surface the tx hash so the operator can look up the revert.
-    let detail = body["detail"].as_str().unwrap_or("");
-    assert!(
-        detail.contains("bebebe"),
-        "detail must carry the settle tx hash, got: {}",
-        detail
+        status,
+        StatusCode::OK,
+        "a settle revert AFTER a 2xx serve must not turn the served 200 into a 402"
     );
 }
 
@@ -486,10 +480,7 @@ fn build_app_with_mock_impl(mock: Box<dyn ChainClient>) -> Router {
     struct Wrap(Box<dyn ChainClient>);
     #[async_trait::async_trait]
     impl ChainClient for Wrap {
-        async fn verify_offline(
-            &self,
-            precompile_input: &[u8],
-        ) -> Result<Option<H160>, X402Error> {
+        async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
             self.0.verify_offline(precompile_input).await
         }
         async fn get_nonce(&self, a: H160) -> Result<u64, X402Error> {
@@ -498,11 +489,7 @@ fn build_app_with_mock_impl(mock: Box<dyn ChainClient>) -> Router {
         async fn send_raw_tx(&self, b: &[u8]) -> Result<H256, X402Error> {
             self.0.send_raw_tx(b).await
         }
-        async fn wait_for_receipt(
-            &self,
-            h: H256,
-            t: Duration,
-        ) -> Result<TxReceipt, X402Error> {
+        async fn wait_for_receipt(&self, h: H256, t: Duration) -> Result<TxReceipt, X402Error> {
             self.0.wait_for_receipt(h, t).await
         }
     }
