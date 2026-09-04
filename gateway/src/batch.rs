@@ -31,7 +31,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ethereum_types::U256;
+use ethereum_types::{H160, U256};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -107,6 +107,11 @@ struct BatchRecord {
     released_grains: U256,
     refunded_grains: U256,
     payer_api_key_id: Option<String>,
+    /// IGW-B-002: the x402 (keyless) payer's on-chain address, set only when
+    /// there is no `payer_api_key_id`. Needed so a refund the gateway cannot
+    /// pay off-chain can be recorded as a durable, reconcilable obligation
+    /// against a named payee rather than silently swallowed.
+    x402_payer: Option<H160>,
     /// 2026-05-31 audit -004 (SECREM-02 6.4a): SHA-256 (hex) of the
     /// submit-time read token issued to payers with no API key (x402 /
     /// open-chat). Reads must present the matching token; only the hash
@@ -163,6 +168,12 @@ struct PersistedBatch {
     released_grains: String,
     refunded_grains: String,
     payer_api_key_id: Option<String>,
+    /// IGW-B-002 — see [`BatchRecord::x402_payer`]. `default` keeps pre-fix
+    /// persisted batches decodable; they re-hydrate with `None` (the
+    /// obligation is then recorded without a named payee, still honest).
+    /// Stored as `0x`-prefixed hex.
+    #[serde(default)]
+    x402_payer: Option<String>,
     /// Audit -004 — see [`BatchRecord::read_token_hash`]. `default` keeps
     /// pre-6.4a persisted batches decodable; they re-hydrate with `None`
     /// (and no API-key owner), so their reads FAIL CLOSED.
@@ -182,6 +193,9 @@ impl PersistedBatch {
             released_grains: r.released_grains.to_string(),
             refunded_grains: r.refunded_grains.to_string(),
             payer_api_key_id: r.payer_api_key_id.clone(),
+            x402_payer: r
+                .x402_payer
+                .map(|p| format!("0x{}", hex::encode(p.as_bytes()))),
             read_token_hash: r.read_token_hash.clone(),
             slots: r
                 .slots
@@ -214,6 +228,7 @@ impl PersistedBatch {
             released_grains: parse(&self.released_grains),
             refunded_grains: parse(&self.refunded_grains),
             payer_api_key_id: self.payer_api_key_id,
+            x402_payer: self.x402_payer.as_deref().and_then(parse_h160_hex),
             read_token_hash: self.read_token_hash,
             slots: self
                 .slots
@@ -269,7 +284,10 @@ impl BatchStore {
 
     async fn insert(&self, record: BatchRecord) -> Arc<RwLock<BatchRecord>> {
         if let Some(p) = &self.persist {
-            let _ = p.persist_batch(&record.id, &PersistedBatch::from_record(&record, false).to_json());
+            let _ = p.persist_batch(
+                &record.id,
+                &PersistedBatch::from_record(&record, false).to_json(),
+            );
         }
         let id = record.id.clone();
         let arc = Arc::new(RwLock::new(record));
@@ -285,7 +303,10 @@ impl BatchStore {
     async fn checkpoint(&self, record: &BatchRecord) {
         if let Some(p) = &self.persist {
             let settled = p.batch_was_settled(&record.id).unwrap_or(false);
-            let _ = p.persist_batch(&record.id, &PersistedBatch::from_record(record, settled).to_json());
+            let _ = p.persist_batch(
+                &record.id,
+                &PersistedBatch::from_record(record, settled).to_json(),
+            );
         }
     }
 
@@ -351,8 +372,26 @@ impl BatchStore {
                 let terminal_bytes = PersistedBatch::from_record(&record, true).to_json();
                 match (record.payer_api_key_id.clone(), refunded > U256::zero()) {
                     (Some(key_id), true) => {
-                        if let Err(e) = store.settle_batch_refund(&key_id, refunded, &id, &terminal_bytes) {
+                        if let Err(e) =
+                            store.settle_batch_refund(&key_id, refunded, &id, &terminal_bytes)
+                        {
                             tracing::warn!(batch_id = %id, error = ?e, "batch recovery: settle failed");
+                        }
+                    }
+                    (None, true) => {
+                        // IGW-B-002 (recovery path, same hole as settle_batch):
+                        // an x402 payer owed a refund on a batch interrupted by
+                        // restart. Record the obligation durably instead of
+                        // marking settled as if nothing were owed.
+                        if let Err(e) = store.record_refund_owed(
+                            &id,
+                            record.x402_payer,
+                            refunded,
+                            &terminal_bytes,
+                        ) {
+                            tracing::error!(batch_id = %id, error = ?e, "batch recovery: recording x402 refund obligation FAILED");
+                        } else {
+                            metrics::counter!("gateway_batch_refunds_owed_total", 1, "payer" => "x402");
                         }
                     }
                     _ => {
@@ -363,7 +402,10 @@ impl BatchStore {
                 tracing::info!(batch_id = %id, refunded = %refunded, "batch recovery: reconciled + refunded on restart");
             }
 
-            self.batches.write().await.insert(id, Arc::new(RwLock::new(record)));
+            self.batches
+                .write()
+                .await
+                .insert(id, Arc::new(RwLock::new(record)));
             rehydrated += 1;
         }
         (rehydrated, settled)
@@ -495,13 +537,29 @@ pub async fn submit_batch_handler(
     } else {
         (None, None)
     };
+    // IGW-B-002: capture the x402 payer's on-chain address for keyless
+    // (x402-settled) batches, so a refund the gateway cannot pay off-chain is
+    // recorded against a named payee instead of being silently swallowed.
+    let x402_payer = if payer_api_key_id.is_none() {
+        Some(paid.payer)
+    } else {
+        None
+    };
     let record = BatchRecord {
         id: id.clone(),
         status: BatchStatus::Submitted,
+        // IGW-B-002 variant (b), DEFERRED: escrow is pinned to `total_required`
+        // (the quote), not `paid.amount_wei`. An x402 payer who authorized MORE
+        // than the quote forfeits the excess — it is neither escrowed nor
+        // refunded. Out of scope for the phantom-refund honest-accounting close
+        // here (it needs an escrow-the-overpayment / refund-the-excess design);
+        // tracked separately. The refund accounting fixed below concerns the
+        // escrowed amount only.
         paid_escrow_grains: total_required,
         released_grains: U256::zero(),
         refunded_grains: U256::zero(),
         payer_api_key_id,
+        x402_payer,
         read_token_hash,
         slots,
         created_at: now_unix_secs(),
@@ -728,7 +786,7 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
     }
 
     // Compute terminal state + escrow split.
-    let (batch_id, payer, refund_owed, terminal_bytes) = {
+    let (batch_id, payer, x402_payer, refund_owed, terminal_bytes) = {
         let mut record = arc.write().await;
         let total = record.request_count();
         let dones = record.completed_count();
@@ -761,12 +819,21 @@ async fn process_batch(state: SharedState, arc: Arc<RwLock<BatchRecord>>) {
         (
             record.id.clone(),
             record.payer_api_key_id.clone(),
+            record.x402_payer,
             record.refunded_grains,
             terminal_bytes,
         )
     };
 
-    settle_batch(&state, &batch_id, payer, refund_owed, &terminal_bytes).await;
+    settle_batch(
+        &state,
+        &batch_id,
+        payer,
+        x402_payer,
+        refund_owed,
+        &terminal_bytes,
+    )
+    .await;
 }
 
 /// Final, crash-safe escrow settlement for a terminal batch.
@@ -779,31 +846,63 @@ async fn settle_batch(
     state: &SharedState,
     batch_id: &str,
     payer: Option<String>,
+    x402_payer: Option<H160>,
     refund: U256,
     terminal_bytes: &[u8],
 ) {
     match &state.batches.persist {
         Some(store) => match (payer, refund > U256::zero()) {
             (Some(key_id), true) => {
-                if let Err(err) = store.settle_batch_refund(&key_id, refund, batch_id, terminal_bytes) {
+                if let Err(err) =
+                    store.settle_batch_refund(&key_id, refund, batch_id, terminal_bytes)
+                {
                     tracing::warn!(batch_refund = %refund, key_id = %key_id, error = ?err, "batch api key refund failed");
                 } else {
                     metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
                 }
             }
+            (None, true) => {
+                // IGW-B-002: an x402 (keyless) payer is owed a refund the
+                // gateway cannot pay by crediting a balance (there is none)
+                // and no on-chain reversal is wired yet (IGW-B-017). Pre-fix
+                // this fell to `mark_batch_settled` as if nothing were owed —
+                // while the buyer's receipt reported a non-zero
+                // `refunded_grains`. That is a phantom refund. Record the
+                // obligation durably (atomically with the settled marker) so
+                // the reported refund is an honest, reconcilable debt rather
+                // than a false statement.
+                if let Err(err) =
+                    store.record_refund_owed(batch_id, x402_payer, refund, terminal_bytes)
+                {
+                    tracing::error!(batch_refund = %refund, batch_id = %batch_id, error = ?err, "recording x402 refund obligation FAILED");
+                } else {
+                    tracing::warn!(batch_refund = %refund, batch_id = %batch_id, payer = ?x402_payer, "x402 batch refund owed — recorded obligation (no on-chain reversal wired, IGW-B-017)");
+                    metrics::counter!("gateway_batch_refunds_owed_total", 1, "payer" => "x402");
+                }
+            }
             _ => {
-                // No api-key refund owed — persist terminal + mark settled so
-                // recovery skips this batch.
+                // Nothing owed (refund == 0) — persist terminal + mark settled
+                // so recovery skips this batch.
                 let _ = store.mark_batch_settled(batch_id, terminal_bytes);
             }
         },
         None => {
+            // In-memory path (tests / no persistence): the only refund we can
+            // actually pay is an api-key balance credit. An x402 refund with
+            // no persist store has nowhere durable to be recorded — surface it
+            // so it is never silently reported-but-unpaid.
             if refund > U256::zero() {
-                if let Some(key_id) = payer {
-                    if let Err(err) = state.keys.refund(&key_id, refund).await {
-                        tracing::warn!(batch_refund = %refund, key_id = %key_id, error = ?err, "batch api key refund failed");
-                    } else {
-                        metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+                match payer {
+                    Some(key_id) => {
+                        if let Err(err) = state.keys.refund(&key_id, refund).await {
+                            tracing::warn!(batch_refund = %refund, key_id = %key_id, error = ?err, "batch api key refund failed");
+                        } else {
+                            metrics::counter!("gateway_batch_refunds_total", 1, "payer" => "api_key");
+                        }
+                    }
+                    None => {
+                        tracing::error!(batch_refund = %refund, batch_id = %batch_id, payer = ?x402_payer, "x402 batch refund owed but no persist store to record the obligation — operator must reconcile");
+                        metrics::counter!("gateway_batch_refunds_owed_total", 1, "payer" => "x402");
                     }
                 }
             }
@@ -856,6 +955,16 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Parse a `0x`-prefixed (or bare) 20-byte hex address. `None` on any
+/// malformed input — a recovered obligation simply loses its payee label,
+/// which never blocks recording the debt.
+fn parse_h160_hex(s: &str) -> Option<H160> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let mut bytes = [0u8; 20];
+    hex::decode_to_slice(s, &mut bytes).ok()?;
+    Some(H160::from(bytes))
 }
 
 #[cfg(test)]
