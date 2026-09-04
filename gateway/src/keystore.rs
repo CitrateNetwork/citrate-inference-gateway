@@ -127,7 +127,10 @@ pub(crate) fn seal_value(
     let ct = cipher_for(master, namespace_of(record_key))
         .encrypt(
             &Nonce::from(nonce),
-            Payload { msg: plaintext, aad: record_key },
+            Payload {
+                msg: plaintext,
+                aad: record_key,
+            },
         )
         .map_err(|_| CryptError::Crypto)?;
     let mut val = Vec::with_capacity(12 + ct.len());
@@ -151,7 +154,10 @@ pub(crate) fn open_value(
     cipher_for(master, namespace_of(record_key))
         .decrypt(
             &Nonce::from(nonce),
-            Payload { msg: ct, aad: record_key },
+            Payload {
+                msg: ct,
+                aad: record_key,
+            },
         )
         .map_err(|_| CryptError::Crypto)
 }
@@ -211,6 +217,24 @@ pub struct BalanceRecord {
     pub deposit_address: [u8; 20],
     /// Current balance in grains, big-endian 32 bytes.
     pub balance_be: [u8; 32],
+}
+
+/// A durable record of an x402 (keyless) refund the gateway owes a batch payer
+/// but cannot pay by crediting an off-chain balance (IGW-B-002). Persisted
+/// under `refundowed:<batch_id>` so an operator can reconcile the obligation
+/// (on-chain reversal is not yet wired — IGW-B-017). Recording this — rather
+/// than silently marking the batch settled — is what makes the buyer-facing
+/// `refunded_grains` an honest statement instead of a phantom refund.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefundOwed {
+    /// The batch the refund is owed against.
+    pub batch_id: String,
+    /// The x402 payer's on-chain address (`0x`-prefixed hex), if known.
+    pub payer: Option<String>,
+    /// Amount owed, in grains (decimal string — lossless across JSON).
+    pub refund_grains: String,
+    /// Unix seconds when the obligation was recorded.
+    pub recorded_at: u64,
 }
 
 /// Why a durable balance operation failed (INFER-S4 / WP-F).
@@ -427,9 +451,14 @@ impl PersistentKeyStore {
                 if self.db.iterator(IteratorMode::Start).next().is_some() {
                     return Err(StoreError::PlaintextStore);
                 }
-                let sealed = seal_value(&self.master, ENC_MARKER_KEY.as_bytes(), ENC_MARKER_PLAINTEXT)?;
+                let sealed = seal_value(
+                    &self.master,
+                    ENC_MARKER_KEY.as_bytes(),
+                    ENC_MARKER_PLAINTEXT,
+                )?;
                 // Synced: the marker must never be lost once rows exist.
-                self.db.put_opt(ENC_MARKER_KEY.as_bytes(), sealed, &synced())?;
+                self.db
+                    .put_opt(ENC_MARKER_KEY.as_bytes(), sealed, &synced())?;
                 Ok(())
             }
         }
@@ -607,7 +636,10 @@ impl PersistentKeyStore {
 
     /// Has this batch's refund already been settled? (Recovery idempotency.)
     pub fn batch_was_settled(&self, batch_id: &str) -> Result<bool, StoreError> {
-        Ok(self.db.get(batch_settled_key(batch_id).as_bytes())?.is_some())
+        Ok(self
+            .db
+            .get(batch_settled_key(batch_id).as_bytes())?
+            .is_some())
     }
 
     /// Mark a batch settled with no balance credit (x402-paid batches, or
@@ -655,7 +687,11 @@ impl PersistentKeyStore {
 
         // Already settled — idempotent. Refresh the terminal snapshot, never
         // re-credit. (Presence check only — no decrypt needed on the marker.)
-        if self.db.get(batch_settled_key(batch_id).as_bytes())?.is_some() {
+        if self
+            .db
+            .get(batch_settled_key(batch_id).as_bytes())?
+            .is_some()
+        {
             self.put_val(&batch_key(batch_id), batch_bytes, &WriteOptions::default())
                 .map_err(BalanceError::from)?;
             let (_rec, bal) = read_balance()?;
@@ -672,11 +708,99 @@ impl PersistentKeyStore {
         let bat = batch_key(batch_id);
         let set = batch_settled_key(batch_id);
         let mut wb = WriteBatch::default();
-        wb.put(bk.as_bytes(), self.seal_for(&bk, &bal_bytes).map_err(BalanceError::from)?);
-        wb.put(bat.as_bytes(), self.seal_for(&bat, batch_bytes).map_err(BalanceError::from)?);
-        wb.put(set.as_bytes(), self.seal_for(&set, &[1u8]).map_err(BalanceError::from)?);
+        wb.put(
+            bk.as_bytes(),
+            self.seal_for(&bk, &bal_bytes).map_err(BalanceError::from)?,
+        );
+        wb.put(
+            bat.as_bytes(),
+            self.seal_for(&bat, batch_bytes)
+                .map_err(BalanceError::from)?,
+        );
+        wb.put(
+            set.as_bytes(),
+            self.seal_for(&set, &[1u8]).map_err(BalanceError::from)?,
+        );
         self.db.write_opt(wb, &synced())?; // single atomic, durable commit
         Ok(new)
+    }
+
+    // ── x402 refund obligations (IGW-B-002) ─────────────────────────
+    //
+    // An x402 (keyless) batch payer is owed a refund when slots fail, but the
+    // gateway cannot credit an off-chain balance (there is none) and no
+    // on-chain reversal is wired yet (`OperatorWallet::reclaim_expired_job`
+    // is unreachable — IGW-B-017). Pre-fix `settle_batch` swallowed this by
+    // calling `mark_batch_settled` as if nothing were owed, while the buyer's
+    // receipt still reported a non-zero `refunded_grains` — a phantom refund,
+    // false accounting on a money path.
+    //
+    // Honest-accounting fix: record the obligation durably here instead of
+    // silently marking settled. The record (`refundowed:<batch_id>`) names the
+    // payer + amount so an operator can reconcile it, and the batch is stamped
+    // settled in the SAME atomic synced write so recovery treats it terminal
+    // (never double-recording). Distinct key prefix so the recovery scan
+    // (`batch:` prefix) never sees it.
+
+    /// Record a refund the gateway OWES an x402 (keyless) payer but cannot pay
+    /// by crediting a balance, and stamp the batch settled — atomically, in one
+    /// synced write. Idempotent: if the batch is already settled (recovery
+    /// replay), the obligation + snapshot are refreshed but not duplicated.
+    pub fn record_refund_owed(
+        &self,
+        batch_id: &str,
+        payer: Option<H160>,
+        refund: U256,
+        batch_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let owed = RefundOwed {
+            batch_id: batch_id.to_string(),
+            payer: payer.map(|p| format!("0x{}", hex::encode(p.as_bytes()))),
+            refund_grains: refund.to_string(),
+            recorded_at: now_unix_secs(),
+        };
+        let owed_bytes =
+            serde_json::to_vec(&owed).map_err(|e| StoreError::Encode(e.to_string()))?;
+
+        let bk = batch_key(batch_id);
+        let sk = batch_settled_key(batch_id);
+        let ok = refund_owed_key(batch_id);
+        let mut wb = WriteBatch::default();
+        wb.put(bk.as_bytes(), self.seal_for(&bk, batch_bytes)?);
+        wb.put(sk.as_bytes(), self.seal_for(&sk, &[1u8])?);
+        wb.put(ok.as_bytes(), self.seal_for(&ok, &owed_bytes)?);
+        self.db.write_opt(wb, &synced())?;
+        Ok(())
+    }
+
+    /// The refund obligation recorded for `batch_id`, if any (reconciliation /
+    /// tests).
+    pub fn refund_owed(&self, batch_id: &str) -> Result<Option<RefundOwed>, StoreError> {
+        match self.get_val(&refund_owed_key(batch_id))? {
+            Some(bytes) => {
+                let owed: RefundOwed = serde_json::from_slice(&bytes)
+                    .map_err(|e| StoreError::Encode(e.to_string()))?;
+                Ok(Some(owed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// All outstanding x402 refund obligations (reconciliation tooling).
+    pub fn load_refunds_owed(&self) -> Result<Vec<RefundOwed>, StoreError> {
+        let prefix = b"refundowed:";
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(prefix) {
+            let (k, v) = item?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            let plain = open_value(&self.master, &k, &v)?;
+            if let Ok(owed) = serde_json::from_slice::<RefundOwed>(&plain) {
+                out.push(owed);
+            }
+        }
+        Ok(out)
     }
 
     // ── Per-model budgets (INFER-S3 / WP-E) ─────────────────────────
@@ -686,7 +810,12 @@ impl PersistentKeyStore {
     // to `BalanceRecord` or the overall-balance debit path.
 
     /// Set (or replace) a key's remaining budget for `model`.
-    pub fn set_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), StoreError> {
+    pub fn set_model_budget(
+        &self,
+        key_id: &str,
+        model: &str,
+        amount: U256,
+    ) -> Result<(), StoreError> {
         let h = hash_key_id(key_id);
         let mut be = [0u8; 32];
         amount.to_big_endian(&mut be);
@@ -697,7 +826,9 @@ impl PersistentKeyStore {
     /// A key's remaining budget for `model`, if one is set (else uncapped).
     pub fn get_model_budget(&self, key_id: &str, model: &str) -> Result<Option<U256>, StoreError> {
         let h = hash_key_id(key_id);
-        Ok(self.get_val(&mbudget_key(&h, model))?.and_then(parse_u256_be))
+        Ok(self
+            .get_val(&mbudget_key(&h, model))?
+            .and_then(parse_u256_be))
     }
 
     /// All `(model, remaining)` budgets set for a key (admin/inspect).
@@ -724,13 +855,19 @@ impl PersistentKeyStore {
     /// Debit a model's budget. **No-op `Ok` if the model is uncapped** (no
     /// budget set). Atomic check-and-deduct under the per-key lock + synced
     /// write; `Err(Exceeded(remaining))` if the budget is insufficient.
-    pub fn debit_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), ModelBudgetError> {
+    pub fn debit_model_budget(
+        &self,
+        key_id: &str,
+        model: &str,
+        amount: U256,
+    ) -> Result<(), ModelBudgetError> {
         let h = hash_key_id(key_id);
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
         let mk = mbudget_key(&h, model);
         let cur = match self.get_val(&mk)? {
-            Some(b) => parse_u256_be(b).ok_or_else(|| ModelBudgetError::Encode("bad budget value".into()))?,
+            Some(b) => parse_u256_be(b)
+                .ok_or_else(|| ModelBudgetError::Encode("bad budget value".into()))?,
             None => return Ok(()), // uncapped
         };
         if cur < amount {
@@ -744,7 +881,12 @@ impl PersistentKeyStore {
 
     /// Credit a model's budget back. **No-op if uncapped.** Same per-key lock +
     /// synced write. Intentionally never creates a budget where none existed.
-    pub fn refund_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), StoreError> {
+    pub fn refund_model_budget(
+        &self,
+        key_id: &str,
+        model: &str,
+        amount: U256,
+    ) -> Result<(), StoreError> {
         let h = hash_key_id(key_id);
         let keylock = self.lock_for(&h);
         let _guard = keylock.lock();
@@ -762,7 +904,11 @@ impl PersistentKeyStore {
     /// Per-key lock handle for the balance RMW. Cloned out of the map so the
     /// map mutex is held only briefly.
     fn lock_for(&self, hash: &str) -> Arc<Mutex<()>> {
-        self.bal_locks.lock().entry(hash.to_owned()).or_default().clone()
+        self.bal_locks
+            .lock()
+            .entry(hash.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// Mint a fresh `cgk_<uuid>` token. Returns the plaintext token —
@@ -953,6 +1099,19 @@ fn batch_settled_key(id: &str) -> String {
     format!("batchset:{}", id)
 }
 
+/// Distinct prefix (NOT `batch:`) for an x402 refund obligation the gateway
+/// owes but cannot pay by crediting a balance (IGW-B-002).
+fn refund_owed_key(id: &str) -> String {
+    format!("refundowed:{}", id)
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Write options that fsync the WAL before returning — used for every balance
 /// mutation so an acknowledged debit/refund is durable (WP-F crash-atomicity).
 fn synced() -> WriteOptions {
@@ -1025,10 +1184,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open(dir.path());
         assert!(store.get_record("cgk_nope").unwrap().is_none());
-        assert!(matches!(
-            store.revoke("cgk_nope"),
-            Err(StoreError::Unknown)
-        ));
+        assert!(matches!(store.revoke("cgk_nope"), Err(StoreError::Unknown)));
     }
 
     /// Plaintext bearer must not appear in the on-disk schema —
@@ -1049,11 +1205,7 @@ mod tests {
 
         // But the hashed key MUST be.
         let h = hash_key_id(&id);
-        assert!(store
-            .db
-            .get(record_key(&h).as_bytes())
-            .unwrap()
-            .is_some());
+        assert!(store.db.get(record_key(&h).as_bytes()).unwrap().is_some());
     }
 
     #[test]
@@ -1130,7 +1282,11 @@ mod tests {
 
         // The plaintext id MUST NOT be a key in the DB (under bal: or record:).
         assert!(store.db.get(bal_key(&id).as_bytes()).unwrap().is_none());
-        assert!(store.db.get(format!("bal:{id}").as_bytes()).unwrap().is_none());
+        assert!(store
+            .db
+            .get(format!("bal:{id}").as_bytes())
+            .unwrap()
+            .is_none());
         // The hashed key MUST be.
         let h = hash_key_id(&id);
         assert!(store.db.get(bal_key(&h).as_bytes()).unwrap().is_some());
@@ -1219,7 +1375,10 @@ mod tests {
                 .unwrap();
         }
         let store = open(dir.path());
-        assert_eq!(store.get_balance(&id).unwrap().unwrap(), U256::from(1234u64));
+        assert_eq!(
+            store.get_balance(&id).unwrap().unwrap(),
+            U256::from(1234u64)
+        );
     }
 
     /// A wrong master key is rejected AT OPEN (marker check) — never a
@@ -1233,7 +1392,9 @@ mod tests {
                 .create_balance_key("buyer", U256::from(9u64), H160::zero(), 0)
                 .unwrap();
         }
-        let err = PersistentKeyStore::open(dir.path(), [9u8; 32]).err().expect("must fail");
+        let err = PersistentKeyStore::open(dir.path(), [9u8; 32])
+            .err()
+            .expect("must fail");
         assert!(matches!(err, StoreError::WrongKey), "got: {err}");
     }
 
@@ -1249,7 +1410,9 @@ mod tests {
             let db = DB::open(&opts, dir.path()).unwrap();
             db.put(b"record:deadbeef", b"plaintext-record").unwrap();
         }
-        let err = PersistentKeyStore::open(dir.path(), TEST_MASTER).err().expect("must fail");
+        let err = PersistentKeyStore::open(dir.path(), TEST_MASTER)
+            .err()
+            .expect("must fail");
         assert!(matches!(err, StoreError::PlaintextStore), "got: {err}");
     }
 
@@ -1279,7 +1442,10 @@ mod tests {
                 }
             }
         }
-        assert!(hits.is_empty(), "plaintext money markers leaked to disk: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "plaintext money markers leaked to disk: {hits:?}"
+        );
     }
 
     /// AAD binding (stronger than the comms per-CF pattern): a ciphertext
