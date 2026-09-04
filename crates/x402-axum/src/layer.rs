@@ -252,8 +252,10 @@ impl X402LayerBuilder {
             .ok_or_else(|| X402Error::Internal("operator_secret not set".into()))?;
 
         // Derive operator address from the secp256k1 key.
-        let operator_address = crate::keys::derive_secp256k1_address(&operator_secret)
-            .ok_or_else(|| X402Error::Internal("invalid operator_secret: not a valid scalar".into()))?;
+        let operator_address =
+            crate::keys::derive_secp256k1_address(&operator_secret).ok_or_else(|| {
+                X402Error::Internal("invalid operator_secret: not a valid scalar".into())
+            })?;
 
         // If no chain client was injected, instantiate the default
         // reqwest-backed one pointing at `rpc_url`.
@@ -280,16 +282,15 @@ impl X402LayerBuilder {
                 gas_limit: self.gas_limit.unwrap_or(200_000),
                 challenge_ttl_secs: self.challenge_ttl_secs.unwrap_or(300),
                 receipt_timeout_secs: self.receipt_timeout_secs.unwrap_or(10),
-                nonce_ledger: Arc::new(NonceLedger::new(
-                    crate::ledger::DEFAULT_MAX_OUTSTANDING,
-                )),
+                nonce_ledger: Arc::new(NonceLedger::new(crate::ledger::DEFAULT_MAX_OUTSTANDING)),
             }),
             // Audit -003 (SECREM-02 6.4a): seeding the nonce source is
             // fallible and fail-closed — an x402 layer without a CSPRNG
             // must not be constructed.
-            nonces: Arc::new(NonceSource::try_new().map_err(|e| {
-                X402Error::Internal(format!("nonce source unavailable: {e}"))
-            })?),
+            nonces: Arc::new(
+                NonceSource::try_new()
+                    .map_err(|e| X402Error::Internal(format!("nonce source unavailable: {e}")))?,
+            ),
         })
     }
 }
@@ -336,7 +337,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let config = self.config.clone();
         let nonces = self.nonces.clone();
         // Prepare a ready-to-go inner service (tower's
@@ -379,21 +380,86 @@ where
             }
 
             // WP-02.3 paid path.
+            //
+            // IGW-B-001 (settle-after-serve): the on-chain settlement is
+            // split OUT of validation and deferred until AFTER the inner
+            // service returns a 2xx. Pre-fix the layer settled the payment
+            // (send_raw_tx + wait_for_receipt) BEFORE invoking the inner
+            // handler, so any inner failure (503 NoProviders, 400
+            // UnknownModel, 402 Underfunded, panic) charged the payer for a
+            // service they never received, with no refund path. Post-fix the
+            // invariant is `settle ⟹ serve`: money moves iff the inner
+            // response status is a success.
             let header_value = payment_header.expect("checked above");
-            match run_paid_path(&config, &header_value, price, req).await {
-                PaidOutcome::Forward(req_with_paid, settled) => {
-                    // Emit success observability BEFORE invoking the
-                    // inner service — keeps the metric count aligned
-                    // with "we charged and released" even if the
-                    // inner handler panics or returns 5xx.
-                    config.observability.on_settled(&settled).await;
+            match validate_paid_path(&config, &header_value, price).await {
+                ValidateOutcome::Validated(payload) => {
+                    // Attach X402Paid BEFORE serving — inner handlers price
+                    // and gate against it (chat.rs Underfunded check,
+                    // batch.rs escrow). payer + gross are known from the
+                    // signed payload: `payload.value` is the gross the payer
+                    // authorized, equal to the on-chain `net + fee`
+                    // (see the post-settle `SettledEvent` below). The settle
+                    // tx hash is not known until after settlement and no
+                    // inner handler reads it, so it is filled as zero here —
+                    // the same convention the API-key bypass path already
+                    // uses (gateway auth.rs).
+                    req.extensions_mut().insert(X402Paid {
+                        payer: payload.from,
+                        amount_wei: payload.value,
+                        nonce: payload.nonce,
+                        settle_tx_hash: ethereum_types::H256::zero(),
+                    });
 
-                    // Forward to inner service. Only now do we need `inner`.
+                    // Serve first. The response head (status) is available
+                    // before the body streams, so we can gate settlement on
+                    // it without buffering the body.
                     let mut inner = inner;
-                    let fut = inner.call(*req_with_paid);
-                    fut.await
+                    let response = inner.call(req).await?;
+
+                    // Settle ONLY on a 2xx inner response. On any non-2xx the
+                    // payer is NOT charged — the challenge nonce stays
+                    // consumed and the client re-challenges (acceptable, the
+                    // 402 path already relies on this). A panic in the inner
+                    // service unwinds here before this point, so no settle
+                    // runs — count stays 0.
+                    if response.status().is_success() {
+                        match settle_paid_path(&config, &payload).await {
+                            Ok(settled) => {
+                                // Charged-and-released: fire observability now
+                                // that the money actually moved (metric count
+                                // reflects real settlements, not attempts).
+                                config.observability.on_settled(&settled).await;
+                            }
+                            Err(err) => {
+                                // Settle failed AFTER a 2xx serve: the payer
+                                // already received value, so we cannot turn
+                                // the response into a 402. The OPERATOR bears
+                                // this loss — surface it loudly for
+                                // reconciliation. This is the accepted
+                                // trade-off (IGW-B-001): the invariant we must
+                                // never break is charging a payer for a
+                                // NON-2xx; a post-2xx settle miss is operator
+                                // loss, not payer loss.
+                                tracing::error!(
+                                    reason = err.reason(),
+                                    detail = %err,
+                                    payer = ?payload.from,
+                                    "x402 settle-after-serve FAILED post-2xx; operator must reconcile"
+                                );
+                                config
+                                    .observability
+                                    .on_rejected(&RejectedEvent {
+                                        reason: err.reason(),
+                                        http_status: err.http_status(),
+                                        payer: Some(payload.from),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Ok(response)
                 }
-                PaidOutcome::Reject(err) => {
+                ValidateOutcome::Reject(err) => {
                     drop(inner);
                     let reason = err.reason();
                     let status = err.http_status();
@@ -412,9 +478,13 @@ where
                     // Audit -006: include the error's Display as `detail`
                     // (e.g. the settle tx hash on a revert) so callers
                     // get actionable context beyond the short reason.
-                    Ok(build_402_response(&challenge, Some(reason), Some(err.to_string())))
+                    Ok(build_402_response(
+                        &challenge,
+                        Some(reason),
+                        Some(err.to_string()),
+                    ))
                 }
-                PaidOutcome::ServerError(err) => {
+                ValidateOutcome::ServerError(err) => {
                     drop(inner);
                     let reason = err.reason();
                     let status = err.http_status();
@@ -433,40 +503,45 @@ where
     }
 }
 
-/// Intermediate outcome of the paid path — lets us unify the
-/// reject-vs-server-error vs. forward-to-inner branches.
+/// Outcome of the VALIDATE phase of the paid path (IGW-B-001). None of
+/// these branches move money — validation is settlement-free. On success
+/// it carries the validated [`PaymentPayload`] so the SETTLE phase can run
+/// AFTER the inner service serves a 2xx.
 ///
-/// `Forward` is boxed because `Request<Body>` is a multi-hundred-byte
-/// struct and clippy's `large_enum_variant` rightly flags it —
-/// boxing keeps the common `Reject(X402Error)` path's enum size
-/// small.
-enum PaidOutcome {
-    /// Forward the (possibly augmented) request to the inner service.
-    /// Carries the settlement event so the outer `call()` can fire
-    /// the observability hook before invoking the inner.
-    Forward(Box<Request<Body>>, SettledEvent),
+/// `Validated` is boxed because `PaymentPayload` is a multi-hundred-byte
+/// struct and clippy's `large_enum_variant` rightly flags it — boxing
+/// keeps the common `Reject(X402Error)` path's enum size small.
+enum ValidateOutcome {
+    /// Validation passed. Carries the validated payload for the deferred
+    /// settle phase.
+    Validated(Box<crate::types::PaymentPayload>),
     /// Reject with a 402 response. Server has a fresh challenge ready.
     Reject(X402Error),
     /// Server-side failure — 500 with a reason.
     ServerError(X402Error),
 }
 
-async fn run_paid_path(
+/// VALIDATE phase (IGW-B-001, steps 1–4.5): decode header, window check,
+/// consume the challenge nonce, price check, verify the signature, and bind
+/// the recipient to this gateway's treasury. NONE of these move money — they
+/// only decide whether the request is allowed to be served. The on-chain
+/// settlement is deferred to [`settle_paid_path`], which runs only after the
+/// inner service returns 2xx.
+async fn validate_paid_path(
     config: &X402Config,
     header_value: &str,
     price: U256,
-    mut req: Request<Body>,
-) -> PaidOutcome {
+) -> ValidateOutcome {
     // 1. Parse header → PaymentPayload.
     let payload = match decode_payment_header(header_value) {
         Ok(p) => p,
-        Err(e) => return PaidOutcome::Reject(e),
+        Err(e) => return ValidateOutcome::Reject(e),
     };
 
     // 2. Window check (expired / not yet valid).
     let now = U256::from(now_unix_secs());
     if payload.valid_before <= now || payload.valid_after > now {
-        return PaidOutcome::Reject(X402Error::Expired);
+        return ValidateOutcome::Reject(X402Error::Expired);
     }
 
     // 2b. Challenge-nonce ledger (2026-05-31 audit 001): the nonce must
@@ -474,20 +549,23 @@ async fn run_paid_path(
     // Consumed (removed) on first use, so a concurrent second payment
     // with the same nonce is rejected before any chain work — the
     // on-chain `_authorizationStates` map remains the settlement-level
-    // backstop. A failed settle burns the challenge; clients simply
-    // re-challenge (the 402 response carries a fresh one).
+    // backstop. IGW-B-001: the consume stays in the VALIDATE phase so a
+    // concurrent double-use is still rejected before serving. On a
+    // non-2xx serve the nonce stays consumed and the client
+    // re-challenges (the 402 response carries a fresh one) — existing
+    // acceptable behavior.
     if config
         .nonce_ledger
         .consume(&payload.nonce, now_unix_secs())
         .is_err()
     {
-        return PaidOutcome::Reject(X402Error::ChallengeNotIssued);
+        return ValidateOutcome::Reject(X402Error::ChallengeNotIssued);
     }
 
     // 3. Price check — caller must have authorized at least what
     // this request costs.
     if payload.value < price {
-        return PaidOutcome::Reject(X402Error::Internal(format!(
+        return ValidateOutcome::Reject(X402Error::Internal(format!(
             "authorized amount {} wei below price {} wei",
             payload.value, price
         )));
@@ -501,14 +579,14 @@ async fn run_paid_path(
     precompile_input.extend_from_slice(&payload.to_bytes());
     let signer = match config.chain.verify_offline(&precompile_input).await {
         Ok(Some(addr)) => addr,
-        Ok(None) => return PaidOutcome::Reject(X402Error::InvalidSignature),
-        Err(e) => return PaidOutcome::ServerError(e),
+        Ok(None) => return ValidateOutcome::Reject(X402Error::InvalidSignature),
+        Err(e) => return ValidateOutcome::ServerError(e),
     };
     if signer != payload.from {
-        return PaidOutcome::Reject(X402Error::InvalidSignature);
+        return ValidateOutcome::Reject(X402Error::InvalidSignature);
     }
 
-    // RM-B1 / WP-D2.3 (audit F-1): treasury bind. Pre-fix the
+    // 4.5 RM-B1 / WP-D2.3 (audit F-1): treasury bind. Pre-fix the
     // gateway accepted any well-signed payload, regardless of who
     // the payer authorized as the recipient. An attacker could
     // re-broadcast a valid signature originally addressed to a
@@ -519,15 +597,27 @@ async fn run_paid_path(
     // Post-fix the recipient is bound to this gateway's configured
     // treasury; cross-gateway replay returns 402.
     if payload.to != config.treasury {
-        return PaidOutcome::Reject(X402Error::RecipientNotTreasury);
+        return ValidateOutcome::Reject(X402Error::RecipientNotTreasury);
     }
 
+    ValidateOutcome::Validated(Box::new(payload))
+}
+
+/// SETTLE phase (IGW-B-001, steps 5–9): build the settlement calldata, fetch
+/// the operator nonce, sign, submit, wait for the receipt, and extract the
+/// `PaymentSettled` event. This is the ONLY place money moves, and it runs
+/// only AFTER the inner service has returned a 2xx response.
+///
+/// On success it returns the [`SettledEvent`] for observability. On failure
+/// the caller has already served a 2xx, so the OPERATOR bears the loss — the
+/// error is surfaced for reconciliation, never charged back to the payer.
+async fn settle_paid_path(
+    config: &X402Config,
+    payload: &crate::types::PaymentPayload,
+) -> Result<SettledEvent, X402Error> {
     // 5. Build settlement calldata + get operator nonce.
-    let calldata = encode_settle_payment(&payload);
-    let op_nonce = match config.chain.get_nonce(config.operator_address).await {
-        Ok(n) => n,
-        Err(e) => return PaidOutcome::ServerError(e),
-    };
+    let calldata = encode_settle_payment(payload);
+    let op_nonce = config.chain.get_nonce(config.operator_address).await?;
 
     // 6. Sign + submit.
     let tx = crate::sign_tx::SettlementTx {
@@ -539,72 +629,48 @@ async fn run_paid_path(
         value: ethereum_types::U256::zero(),
         data: &calldata,
     };
-    let signed = match crate::sign_tx::sign_settlement_tx(tx, &config.operator_secret) {
-        Ok(s) => s,
-        Err(e) => return PaidOutcome::ServerError(e),
-    };
-    let tx_hash = match config.chain.send_raw_tx(&signed.raw).await {
-        Ok(h) => h,
-        Err(e) => return PaidOutcome::ServerError(e),
-    };
+    let signed = crate::sign_tx::sign_settlement_tx(tx, &config.operator_secret)?;
+    let tx_hash = config.chain.send_raw_tx(&signed.raw).await?;
 
     // 7. Wait for receipt.
-    let receipt = match config
+    let receipt = config
         .chain
         .wait_for_receipt(tx_hash, Duration::from_secs(config.receipt_timeout_secs))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return PaidOutcome::ServerError(e),
-    };
+        .await?;
 
     if !receipt.status {
         // 2026-05-31 audit -006 (SECREM-02 6.4a): a revert here is NOT
         // necessarily a replay — insufficient balance, a paused
         // facilitator, or misconfiguration revert identically, and the
-        // receipt does not carry the revert reason. Pre-fix this was
-        // reported as `NonceReplayed`, sending clients (and operators)
-        // chasing a phantom replay. Report neutrally and surface the
-        // settle tx hash so the revert can be inspected on-chain.
-        return PaidOutcome::Reject(X402Error::SettleReverted(hex::encode(
-            tx_hash.as_bytes(),
-        )));
+        // receipt does not carry the revert reason. Report neutrally and
+        // surface the settle tx hash so the revert can be inspected
+        // on-chain.
+        return Err(X402Error::SettleReverted(hex::encode(tx_hash.as_bytes())));
     }
 
     // 8. Extract the PaymentSettled event.
     let settled = match find_payment_settled(&receipt, config.facilitator_address) {
         Some(ev) => ev,
         None => {
-            return PaidOutcome::ServerError(X402Error::FacilitatorReverted(
+            return Err(X402Error::FacilitatorReverted(
                 "no PaymentSettled event in receipt".into(),
             ))
         }
     };
 
-    // 9. Attach X402Paid to request extensions.
-    //
-    // RM-B1 / WP-D2.4 (audit F-2): `amount_wei` carries the GROSS
-    // amount the payer authorized (`net + fee`), not the recipient's
-    // net share. Inner handlers comparing against pricing oracles
-    // need the user-signed total — the fee is internal accounting.
-    let gross = settled.value.saturating_add(settled.fee);
-    req.extensions_mut().insert(X402Paid {
-        payer: settled.from,
-        amount_wei: gross,
-        nonce: settled.nonce,
-        settle_tx_hash: tx_hash,
-    });
-
-    let event = SettledEvent {
+    // 9. Build the settlement event for observability. Note X402Paid was
+    // already attached to the request BEFORE serving (see the outer
+    // `call()`): `amount_wei` there carries the GROSS the payer authorized
+    // (`payload.value` == `net + fee`), matching what inner handlers need
+    // to compare against pricing oracles.
+    Ok(SettledEvent {
         payer: settled.from,
         amount_wei: settled.value,
         fee_wei: settled.fee,
         nonce: settled.nonce,
         tx_hash,
         block_number: receipt.block_number,
-    };
-
-    PaidOutcome::Forward(Box::new(req), event)
+    })
 }
 
 fn make_challenge(
@@ -647,7 +713,9 @@ fn build_error_response(err: X402Error) -> Response<Body> {
     })
     .to_string();
     Response::builder()
-        .status(StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .status(
+            StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -668,7 +736,10 @@ fn build_402_response(
         serde_json::to_value(challenge).unwrap_or(serde_json::Value::Null),
     );
     if let Some(r) = reason {
-        body_map.insert("reason".to_string(), serde_json::Value::String(r.to_string()));
+        body_map.insert(
+            "reason".to_string(),
+            serde_json::Value::String(r.to_string()),
+        );
     }
     if let Some(d) = detail {
         body_map.insert("detail".to_string(), serde_json::Value::String(d));

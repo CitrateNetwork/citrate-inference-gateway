@@ -45,10 +45,7 @@ impl HonestMockChain {
 
 #[async_trait]
 impl ChainClient for HonestMockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         // Trust any well-formed input — echo `from` as recovered signer.
         if precompile_input.len() != 265 {
             return Ok(None);
@@ -194,7 +191,8 @@ async fn client_auto_pays_on_402_and_gets_200() {
 
     let facilitator = H160::from([0xfa; 20]);
     let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).unwrap());
-    let client = X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("build client");
+    let client =
+        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("build client");
 
     let http = reqwest::Client::new();
     let url = format!("http://{}/gated", addr);
@@ -204,15 +202,24 @@ async fn client_auto_pays_on_402_and_gets_200() {
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.expect("body");
     assert!(body.contains("nonce"));
-    // The mock pinned its PaymentSettled event's `nonce` to 0x77*32
-    // — inner handler echoes it via X402Paid.nonce. This confirms
-    // the full flow: challenge → client sign → retry → mock-precompile
-    // verify → mock-settle → PaymentSettled in receipt → X402Paid
-    // attached → inner handler.
-    assert!(body.contains(&"77".repeat(32)));
-    // Handler also echoes payer (from X402Paid.payer, which is the
-    // `from` field of the PaymentSettled event — 0xa1*20 in this mock).
-    assert!(body.contains(&"a1".repeat(20)));
+    // IGW-B-001 (settle-after-serve): X402Paid is attached from the
+    // VALIDATED signed payload BEFORE the inner service runs, so
+    // `X402Paid.nonce` is the challenge nonce the client signed — NOT the
+    // mock's synthetic post-settle event nonce (0x77*32, which is only
+    // known after settlement, which now happens AFTER the handler). So the
+    // old marker must NOT appear.
+    assert!(
+        !body.contains(&"77".repeat(32)),
+        "nonce must be the signed challenge nonce, not the post-settle marker"
+    );
+    // Handler echoes payer from X402Paid.payer, which post-fix is the
+    // signed payload's `from` — the client's own derived payer address,
+    // the correct payer identity (pre-fix it was the mock event's 0xa1).
+    let expected_payer = hex::encode(client.payer_address().as_bytes());
+    assert!(
+        body.contains(&expected_payer),
+        "payer must be the signed payload's `from` (client payer address {expected_payer}); body: {body}"
+    );
 }
 
 #[tokio::test]
@@ -269,6 +276,6 @@ async fn client_passes_through_non_402_responses() {
     // Most important: client must NOT attempt to sign anything for
     // a non-402 code path.
     let _ = client.send_paid(req).await; // either Ok(some-status) or Err(Transport)
-    // Test passes by compiling + not panicking; the budget cap
-    // would only trigger on a real 402.
+                                         // Test passes by compiling + not panicking; the budget cap
+                                         // would only trigger on a real 402.
 }
