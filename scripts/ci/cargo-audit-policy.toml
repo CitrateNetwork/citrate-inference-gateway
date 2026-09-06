@@ -1,0 +1,33 @@
+# Executable cargo-audit exception policy.
+#
+# Every exception is mirrored in audit.toml for assessor visibility. The
+# runner validates that the two lists match and rejects expired entries before
+# invoking cargo audit --deny warnings.
+
+[ignore."RUSTSEC-2025-0055"]
+expires = "2026-10-31"
+reason = "tracing-subscriber 0.2.25 is pulled by ark-relations 0.4.0; the arkworks upgrade is a separately reviewed cryptographic compatibility change."
+
+[ignore."RUSTSEC-2025-0141"]
+expires = "2026-12-31"
+reason = "bincode 1.3.3 is a transitive/direct wallet-store serializer; replacement requires the coordinated wallet-core persistence migration."
+
+[ignore."RUSTSEC-2024-0388"]
+expires = "2026-12-31"
+reason = "derivative 2.2.0 is transitive through the pinned arkworks 0.4 tree; removal is coupled to the reviewed arkworks upgrade."
+
+[ignore."RUSTSEC-2024-0436"]
+expires = "2026-12-31"
+reason = "paste 1.0.15 is transitive through the pinned arkworks/revm tree; replacement is coupled to upstream cryptographic and execution dependency upgrades."
+
+[ignore."RUSTSEC-2025-0124"]
+expires = "2026-12-31"
+reason = "rand_os 0.1.3 is transitive through bip39 1.2.0 in the pinned wallet-core tree; removal requires the wallet-core dependency migration."
+
+[ignore."RUSTSEC-2026-0190"]
+expires = "2026-12-31"
+reason = "anyhow 1.0.102 is transitive through the pinned chain/WASI dependency tree; the affected downcast API is not used by the gateway, but the chain pin must be upgraded and re-reviewed."
+
+[ignore."RUSTSEC-2026-0253"]
+expires = "2026-12-31"
+reason = "lru 0.16.4 is transitive through citrate-execution in the pinned chain dependency; chain-side upgrade and execution-path review are required."
