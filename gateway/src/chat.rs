@@ -215,7 +215,12 @@ pub(crate) async fn quote_chat_request_cost(
     state: &SharedState,
     req: &ChatCompletionRequest,
 ) -> Result<(U256, u32), GatewayError> {
-    let requested_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    // Keep pricing bounded even when an internal caller has not gone through
+    // the HTTP handler's normalization step. Batch submission rejects values
+    // above the ceiling; this second guard keeps the pricing boundary aligned
+    // with the provider boundary for every caller.
+    let requested_tokens =
+        clamp_max_tokens(req.max_tokens, max_tokens_ceiling()).unwrap_or(DEFAULT_MAX_TOKENS);
     let real_input_tokens = estimate_input_tokens(&req.messages);
     let model_hash = state
         .queries
@@ -351,7 +356,10 @@ pub(crate) async fn run_dispatch(
     let provider_req = ProviderProtocolRequest {
         model: req.model.clone(),
         prompt: prompt.clone(),
-        max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        // Defense in depth: every dispatch must carry the bounded value even
+        // if a new route bypasses the current handler normalization.
+        max_tokens: clamp_max_tokens(req.max_tokens, max_tokens_ceiling())
+            .unwrap_or(DEFAULT_MAX_TOKENS),
     };
 
     // Failover loop: try up to MAX_PROVIDER_ATTEMPTS providers,
