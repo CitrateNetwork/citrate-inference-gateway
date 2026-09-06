@@ -357,11 +357,17 @@ jobs:
 
       - name: Determine tag
         id: tag
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
         run: |
-          if [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          if [[ -n "$RELEASE_TAG_INPUT" ]]; then
+            if [[ ! "$RELEASE_TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::release_tag must be a SemVer-style vX.Y.Z tag"
+              exit 1
+            fi
+            printf 'tag=%s\n' "$RELEASE_TAG_INPUT" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            printf 'tag=%s\n' "${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download all artefacts
