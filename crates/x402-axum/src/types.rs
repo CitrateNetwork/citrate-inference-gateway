@@ -51,6 +51,10 @@ pub struct PaymentChallenge {
     /// 32 bytes, `0x`-prefixed. Equal to
     /// `keccak256("\x19\x01" || DOMAIN_SEPARATOR || STRUCT_HASH)`.
     pub digest: String,
+    /// Keccak commitment to the exact method, path/query, and body this
+    /// challenge authorizes. The gateway checks it again on the paid retry.
+    #[serde(default)]
+    pub request_hash: String,
 }
 
 /// Parsed contents of an `X-PAYMENT` header. The header carries 265

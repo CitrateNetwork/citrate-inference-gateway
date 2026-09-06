@@ -24,8 +24,11 @@ use async_trait::async_trait;
 use ethereum_types::{H160, H256, U256};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use x402_axum::keys::{derive_secp256k1_address, sign_digest_secp256k1};
 use x402_axum::{
-    payment_settled_topic, ChainClient, RawLog, TxReceipt, X402Client, X402Error,
+    encode_payment_header, eip712_digest, payment_settled_topic,
+    transfer_with_authorization_struct_hash, ChainClient, RawLog, TxReceipt, X402Client,
+    X402Error, X_PAYMENT_HEADER,
 };
 
 use citrate_gateway::config::GatewayConfig;
@@ -255,20 +258,67 @@ async fn spawn_gateway(provider_addr: SocketAddr, value_wei: u128, fee_wei: u128
 
 // ── Tests ────────────────────────────────────────────────────────
 
-/// F-2: declaring 65535 max_tokens while only paying for ~1 should
-/// be rejected with 402.
+fn parse_addr(value: &str) -> H160 {
+    let bytes = hex::decode(value.trim_start_matches("0x")).expect("address hex");
+    H160::from_slice(&bytes)
+}
+
+/// Sign a valid challenge while intentionally lowering the authorized
+/// amount. This keeps the F-2 handler/settlement gate test meaningful after
+/// IGW-B-006 made the initial challenge quote request-aware.
+fn payment_header_for_amount(
+    challenge: &Value,
+    secret: &[u8; 32],
+    amount: U256,
+) -> String {
+    let payer = derive_secp256k1_address(secret).expect("payer address");
+    let recipient = parse_addr(challenge["x402"]["recipient"].as_str().expect("recipient"));
+    let wsalt = parse_addr(TEST_WSALT);
+    let valid_after = U256::from(challenge["x402"]["valid_after"].as_u64().expect("valid_after"));
+    let valid_before = U256::from(challenge["x402"]["valid_before"].as_u64().expect("valid_before"));
+    let nonce_bytes = hex::decode(
+        challenge["x402"]["nonce"]
+            .as_str()
+            .expect("nonce")
+            .trim_start_matches("0x"),
+    )
+    .expect("nonce hex");
+    let nonce = H256::from_slice(&nonce_bytes);
+    let domain = x402_axum::wsalt_domain_separator(40204, wsalt);
+    let struct_hash = transfer_with_authorization_struct_hash(
+        payer,
+        recipient,
+        amount,
+        valid_after,
+        valid_before,
+        nonce,
+    );
+    let digest = eip712_digest(domain, struct_hash);
+    let mut digest_bytes = [0u8; 32];
+    digest_bytes.copy_from_slice(digest.as_bytes());
+    let (v, r, s) = sign_digest_secp256k1(secret, &digest_bytes).expect("signature");
+    encode_payment_header(&x402_axum::PaymentPayload {
+        from: payer,
+        to: recipient,
+        value: amount,
+        valid_after,
+        valid_before,
+        nonce,
+        v,
+        r: H256::from(r),
+        s: H256::from(s),
+    })
+}
+
+/// F-2: declaring a large max_tokens budget while authorizing only a tiny
+/// amount must be rejected with 402.
 #[tokio::test]
 async fn test_f2_undercharge_rejected_402() {
     let provider_addr = spawn_stub_provider().await;
-    // Settle a tiny amount: gross = 100 wei. LinearCostQueries
-    // returns `output_tokens` wei → for max_tokens = 65535, actual
-    // cost is 65535 wei. 100 < 65535 → underfunded.
+    // The request-aware B-006 quote is intentionally obtained first. Then
+    // sign the same challenge for only 100 wei, below its quoted cost.
     let gateway_addr = spawn_gateway(provider_addr, 95, 5).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let facilitator = H160::from([0xfa; 20]);
-    let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).unwrap());
-    let client = X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("client");
 
     let url = format!("http://{}/v1/chat/completions", gateway_addr);
     let body = serde_json::json!({
@@ -276,18 +326,33 @@ async fn test_f2_undercharge_rejected_402() {
         "messages": [{ "role": "user", "content": "ping" }],
         "max_tokens": 65535
     });
-    let req = reqwest::Client::new().post(&url).json(&body);
-    let resp = client.send_paid(req).await.expect("auto-pay flow");
+    let http = reqwest::Client::new();
+    let challenge_response = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("challenge request");
+    assert_eq!(challenge_response.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+    let challenge: Value = challenge_response.json().await.expect("challenge json");
+    let header = payment_header_for_amount(&challenge, &payer_secret(), U256::from(100u64));
+    let resp = http
+        .post(&url)
+        .header(X_PAYMENT_HEADER, header)
+        .json(&body)
+        .send()
+        .await
+        .expect("underfunded retry");
 
     assert_eq!(
         resp.status().as_u16(),
         402,
-        "F-2: undercharged 65535-token request must be rejected"
+        "F-2: underfunded request must be rejected"
     );
     let text = resp.text().await.unwrap_or_default();
     assert!(
-        text.to_lowercase().contains("underfunded") || text.to_lowercase().contains("payment"),
-        "F-2 body should mention underfunded/payment: {}",
+        text.to_lowercase().contains("below price") || text.to_lowercase().contains("payment"),
+        "F-2 body should mention the payment shortfall: {}",
         text
     );
 }

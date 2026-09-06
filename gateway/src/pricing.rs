@@ -1,17 +1,15 @@
 //! `TokenBasedPricing` — `x402_axum::PricingStrategy` for chat
-//! completions. Estimates wei cost from the request body via
-//! `ChainQueries::estimate_cost`.
+//! completions and batches. Estimates wei cost from the buffered
+//! request body via `ChainQueries::estimate_cost`.
 //!
 //! Per CM-02 RETRO action item #3: "TokenBasedPricing as the
 //! second non-FixedPricing impl. This proves the pricing trait is
 //! well-shaped. If it falls short of what the gateway needs, fix
 //! the trait now while there's only one implementation."
 //!
-//! Verdict so far: trait shape works. The only awkwardness is
-//! that `PricingStrategy::price_for` takes `&Request<Body>` but
-//! we need to read the JSON body (model + max_tokens) to price
-//! it. We solve this by buffering the body inside the strategy
-//! and passing it through a side channel — see the implementation.
+//! The pricing trait receives a send-safe `Request<Bytes>` view so the
+//! middleware can buffer the body once, restore it for the handler, and let
+//! this strategy price the exact model and requested output budget.
 
 use std::sync::Arc;
 
@@ -26,14 +24,6 @@ use x402_axum::{PricingError, PricingStrategy};
 /// 0 = Commitment (1.0× multiplier), 1 = ZKProof (1.5×), 2 = TEE (2.0×).
 const DEFAULT_TIER: u8 = 0;
 
-/// Average tokens we assume per chat request when we can't read the
-/// body. This is a conservative upper bound — actual cost is
-/// re-estimated from the parsed body at handler time and the
-/// difference (if any) is settled / refunded at the next layer.
-///
-/// The prepay model: charge a generous amount up front; the chain's
-/// settle amount equals what the client signed. If the actual job
-/// is cheaper, the client overpaid; v2 may issue partial refunds.
 /// Default verification tier exposed for handler-side recharge.
 pub const DEFAULT_VERIFICATION_TIER: u8 = DEFAULT_TIER;
 
@@ -46,15 +36,14 @@ const ASSUMED_OUTPUT_TOKENS: u32 = 512;
 /// Token-based pricing strategy backed by ComputePricingOracle.
 pub struct TokenBasedPricing {
     queries: Arc<dyn ChainQueries>,
-    /// Default model to price against when the request body isn't
-    /// available at this layer (the X402Layer calls `price_for`
-    /// before the chat handler sees the body).
+    /// Legacy model label retained for constructor compatibility and
+    /// diagnostics. Pricing uses the model in the buffered request body.
     default_model: String,
 }
 
 impl TokenBasedPricing {
     /// Create with a chain-queries handle and a fallback model name
-    /// used when the request body isn't readable at price time.
+    /// used only as a diagnostic label; the request body is authoritative.
     pub fn new(queries: Arc<dyn ChainQueries>, default_model: impl Into<String>) -> Self {
         Self {
             queries,
@@ -75,25 +64,90 @@ impl std::fmt::Debug for TokenBasedPricing {
 impl PricingStrategy for TokenBasedPricing {
     async fn price_for(
         &self,
-        _request: &Request<axum::body::Body>,
+        request: &Request<axum::body::Bytes>,
     ) -> Result<U256, PricingError> {
-        // X402Layer's interface gives us the request HEADERS but
-        // we cannot consume the body here (the layer needs to
-        // forward it intact). So we price assuming the
-        // ASSUMED_INPUT/OUTPUT averages against the default model.
-        // The chat handler re-prices precisely from the parsed
-        // body and rejects if the signed amount falls short.
+        let body = request.body();
+        let value: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+            PricingError::NotPriceable(format!("request body is not valid JSON: {e}"))
+        })?;
+
+        if let Ok(chat) = serde_json::from_value::<crate::openai::ChatCompletionRequest>(
+            value.clone(),
+        ) {
+            return self.quote_chat(&chat).await;
+        }
+
+        let batch = serde_json::from_value::<crate::batch::BatchSubmitRequest>(value)
+            .map_err(|e| PricingError::NotPriceable(format!("request shape is not priceable: {e}")))?;
+        if batch.requests.is_empty() {
+            // Preserve the established x402 flow for structurally valid but
+            // handler-invalid requests: issue a challenge, then let the
+            // paid handler return its documented 400. Invalid requests must
+            // never be settled because the layer settles only after 2xx.
+            return self.fallback_quote().await;
+        }
+        if batch.requests.len() > crate::batch::MAX_BATCH_SIZE {
+            return self.fallback_quote().await;
+        }
+
+        let mut total = U256::zero();
+        for chat in &batch.requests {
+            if chat.messages.is_empty()
+                || chat
+                    .max_tokens
+                    .is_some_and(|value| value > crate::chat::max_tokens_ceiling())
+            {
+                return self.fallback_quote().await;
+            }
+            total = total
+                .checked_add(self.quote_chat(chat).await?)
+                .ok_or_else(|| PricingError::NotPriceable("quoted cost overflow".into()))?;
+        }
+        Ok(total)
+    }
+}
+
+impl TokenBasedPricing {
+    async fn fallback_quote(&self) -> Result<U256, PricingError> {
         let model_hash = self
             .queries
             .resolve_model_name(&self.default_model)
             .await
             .map_err(|e| PricingError::OracleUnavailable(e.to_string()))?;
-        let cost = self
+        self.queries
+            .estimate_cost(
+                model_hash,
+                ASSUMED_INPUT_TOKENS,
+                ASSUMED_OUTPUT_TOKENS,
+                DEFAULT_TIER,
+            )
+            .await
+            .map_err(|e| PricingError::OracleUnavailable(e.to_string()))
+    }
+
+    async fn quote_chat(
+        &self,
+        request: &crate::openai::ChatCompletionRequest,
+    ) -> Result<U256, PricingError> {
+        // Keep malformed-but-deserializable chat requests challengeable so
+        // the existing x402 contract remains intact; the paid handler then
+        // returns its normal 400 without settling. The estimator's floor
+        // supplies the bounded quote for an empty message list.
+        let model_hash = self
             .queries
-            .estimate_cost(model_hash, ASSUMED_INPUT_TOKENS, ASSUMED_OUTPUT_TOKENS, DEFAULT_TIER)
+            .resolve_model_name(&request.model)
             .await
             .map_err(|e| PricingError::OracleUnavailable(e.to_string()))?;
-        Ok(cost)
+        let input_tokens = crate::chat::estimate_input_tokens(&request.messages);
+        let output_tokens = crate::chat::clamp_max_tokens(
+            request.max_tokens,
+            crate::chat::max_tokens_ceiling(),
+        )
+        .unwrap_or(crate::chat::DEFAULT_MAX_TOKENS);
+        self.queries
+            .estimate_cost(model_hash, input_tokens, output_tokens, DEFAULT_TIER)
+            .await
+            .map_err(|e| PricingError::OracleUnavailable(e.to_string()))
     }
 }
 
@@ -128,10 +182,12 @@ mod tests {
         }
     }
 
-    fn empty_request() -> Request<axum::body::Body> {
+    fn request() -> Request<axum::body::Bytes> {
         Request::builder()
             .uri("/v1/chat/completions")
-            .body(axum::body::Body::empty())
+            .body(axum::body::Bytes::from_static(
+                br#"{"model":"llama-3.1-8b","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
             .expect("req")
     }
 
@@ -141,7 +197,7 @@ mod tests {
             Arc::new(MockQueries(U256::from(42u64))),
             "llama-3.1-8b",
         );
-        let p = pricing.price_for(&empty_request()).await.expect("price");
+        let p = pricing.price_for(&request()).await.expect("price");
         assert_eq!(p, U256::from(42u64));
     }
 
@@ -170,7 +226,7 @@ mod tests {
             }
         }
         let pricing = TokenBasedPricing::new(Arc::new(FailingQueries), "x");
-        let err = pricing.price_for(&empty_request()).await.expect_err("fail");
+        let err = pricing.price_for(&request()).await.expect_err("fail");
         assert!(matches!(err, PricingError::OracleUnavailable(_)));
     }
 

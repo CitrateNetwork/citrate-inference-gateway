@@ -94,6 +94,9 @@ pub use observability::{
     CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent,
     RejectionBreakdown, SettledEvent,
 };
-pub use pricing::{FixedPricing, PricingError, PricingStrategy};
+pub use pricing::{
+    buffer_request_body, request_for_pricing, FixedPricing, PricingError, PricingStrategy,
+    MAX_PRICING_BODY_BYTES,
+};
 pub use receipt::{find_payment_settled, PaymentSettledEvent};
 pub use types::{PaymentChallenge, PaymentPayload, PAYLOAD_BYTES, X402Paid};

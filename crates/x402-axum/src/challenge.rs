@@ -37,6 +37,8 @@ pub struct ChallengeInputs {
     pub now_unix: u64,
     /// Challenge lifetime in seconds. Typically 300.
     pub ttl_secs: u64,
+    /// Commitment to the method, path/query, and body being authorized.
+    pub request_commitment: H256,
 }
 
 /// Output of [`build_challenge`]: the public JSON body AND the
@@ -90,6 +92,7 @@ pub fn build_challenge(inputs: ChallengeInputs) -> Result<BuiltChallenge, X402Er
         valid_before: inputs.now_unix.saturating_add(inputs.ttl_secs),
         recipient: hex_addr(inputs.recipient),
         digest: hex_bytes32(digest),
+        request_hash: hex_bytes32(inputs.request_commitment),
     };
 
     Ok(BuiltChallenge { challenge, digest })
@@ -128,6 +131,7 @@ mod tests {
             nonce: H256::from([0x42; 32]),
             now_unix: 1_714_000_000,
             ttl_secs: 300,
+            request_commitment: H256::from([0x24; 32]),
         }
     }
 
@@ -143,6 +147,7 @@ mod tests {
         assert!(challenge.recipient.starts_with("0x"));
         assert!(challenge.nonce.starts_with("0x"));
         assert!(challenge.digest.starts_with("0x"));
+        assert!(challenge.request_hash.starts_with("0x"));
         // Addresses are 20 bytes = 42 chars with 0x prefix.
         assert_eq!(challenge.facilitator.len(), 42);
         assert_eq!(challenge.token.len(), 42);

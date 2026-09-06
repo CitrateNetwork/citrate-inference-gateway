@@ -32,6 +32,8 @@ pub enum NonceLedgerError {
     Unknown,
     /// Issued, but its challenge TTL has elapsed.
     Expired,
+    /// The payment reused a valid nonce for a different method/path/body.
+    RequestMismatch,
 }
 
 /// Thread-safe ledger of issued challenge nonces → expiry (unix seconds).
@@ -40,9 +42,11 @@ pub struct NonceLedger {
     max_outstanding: usize,
 }
 
+#[derive(Clone, Copy)]
 struct LedgerEntry {
     expires_at: u64,
     sequence: u64,
+    request_commitment: H256,
 }
 
 struct LedgerState {
@@ -68,6 +72,17 @@ impl NonceLedger {
     /// older challenges prevents an unpaid challenge flood from invalidating
     /// a payer's already-issued approval window.
     pub fn record(&self, nonce: H256, expires_at: u64, now: u64) {
+        self.record_bound(nonce, H256::zero(), expires_at, now);
+    }
+
+    /// Record a challenge nonce bound to one exact request commitment.
+    pub fn record_bound(
+        &self,
+        nonce: H256,
+        request_commitment: H256,
+        expires_at: u64,
+        now: u64,
+    ) {
         if self.max_outstanding == 0 {
             return;
         }
@@ -108,6 +123,7 @@ impl NonceLedger {
             LedgerEntry {
                 expires_at,
                 sequence,
+                request_commitment,
             },
         );
         state.insertion_order.insert(sequence, nonce);
@@ -117,16 +133,33 @@ impl NonceLedger {
     /// Removal happens on first use, so a second payment with the same
     /// nonce — even before the first settles — sees `Unknown`.
     pub fn consume(&self, nonce: &H256, now: u64) -> Result<(), NonceLedgerError> {
+        self.consume_bound(nonce, &H256::zero(), now)
+    }
+
+    /// Consume an issued nonce only when it is still live and is being used
+    /// for the exact request that minted it. A commitment mismatch leaves the
+    /// nonce available for the legitimate retry.
+    pub fn consume_bound(
+        &self,
+        nonce: &H256,
+        request_commitment: &H256,
+        now: u64,
+    ) -> Result<(), NonceLedgerError> {
         let mut state = self.inner.lock().expect("nonce ledger poisoned");
-        match state.entries.remove(nonce) {
+        match state.entries.get(nonce).copied() {
             None => Err(NonceLedgerError::Unknown),
-            Some(entry) => {
+            Some(entry) if entry.expires_at <= now => {
+                state.entries.remove(nonce);
                 state.insertion_order.remove(&entry.sequence);
-                if entry.expires_at <= now {
-                    Err(NonceLedgerError::Expired)
-                } else {
-                    Ok(())
-                }
+                Err(NonceLedgerError::Expired)
+            }
+            Some(entry) if entry.request_commitment != *request_commitment => {
+                Err(NonceLedgerError::RequestMismatch)
+            }
+            Some(entry) => {
+                state.entries.remove(nonce);
+                state.insertion_order.remove(&entry.sequence);
+                Ok(())
             }
         }
     }
@@ -169,6 +202,17 @@ mod tests {
         let ledger = NonceLedger::new(8);
         ledger.record(n(2), 1_000, 500);
         assert_eq!(ledger.consume(&n(2), 1_000), Err(NonceLedgerError::Expired));
+    }
+
+    #[test]
+    fn request_mismatch_does_not_consume_live_nonce() {
+        let ledger = NonceLedger::new(8);
+        ledger.record_bound(n(3), n(4), 1_000, 500);
+        assert_eq!(
+            ledger.consume_bound(&n(3), &n(5), 600),
+            Err(NonceLedgerError::RequestMismatch)
+        );
+        assert_eq!(ledger.consume_bound(&n(3), &n(4), 600), Ok(()));
     }
 
     #[test]
