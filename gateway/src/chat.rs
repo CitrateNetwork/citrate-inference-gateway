@@ -30,7 +30,9 @@ use x402_axum::X402Paid;
 use crate::auth::ApiKeyCharge;
 use crate::error::GatewayError;
 use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Usage};
-use crate::provider::{dispatch_to_provider, select_provider, ProviderProtocolRequest};
+use crate::provider::{
+    dispatch_to_provider, select_provider, ProviderProtocolRequest, ProviderProtocolResponse,
+};
 use crate::usage::ApiKeyContext;
 use crate::SharedState;
 
@@ -65,6 +67,28 @@ pub(crate) fn clamp_max_tokens(requested: Option<u32>, ceiling: u32) -> Option<u
 /// first attempt is the highest-scored provider; each subsequent
 /// attempt picks the next-best from the remaining candidates.
 const MAX_PROVIDER_ATTEMPTS: usize = 3;
+
+/// Bound provider-reported usage before it is persisted or returned to the
+/// caller. Providers are not authoritative for the request's input/output
+/// budget: the gateway's conservative input estimate and normalized request
+/// ceiling are the outer bounds.
+fn bounded_provider_token_counts(
+    req: &ChatCompletionRequest,
+    prompt: &str,
+    resp: &ProviderProtocolResponse,
+) -> (u32, u32) {
+    let prompt_tokens = resp
+        .input_tokens
+        .unwrap_or_else(|| prompt.split_whitespace().count() as u32)
+        .min(estimate_input_tokens(&req.messages));
+    let completion_limit = clamp_max_tokens(req.max_tokens, max_tokens_ceiling())
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let completion_tokens = resp
+        .output_tokens
+        .unwrap_or_else(|| resp.output.split_whitespace().count() as u32)
+        .min(completion_limit);
+    (prompt_tokens, completion_tokens)
+}
 
 /// Convert a `GatewayError` into an HTTP response with a JSON body.
 impl IntoResponse for GatewayError {
@@ -410,12 +434,8 @@ pub(crate) async fn run_dispatch(
                     providers.retain(|p| p.address != chosen_addr);
                     continue;
                 }
-                let prompt_tokens = resp
-                    .input_tokens
-                    .unwrap_or_else(|| prompt.split_whitespace().count() as u32);
-                let completion_tokens = resp
-                    .output_tokens
-                    .unwrap_or_else(|| resp.output.split_whitespace().count() as u32);
+                let (prompt_tokens, completion_tokens) =
+                    bounded_provider_token_counts(req, &prompt, &resp);
                 return Ok(DispatchOutcome {
                     output: resp.output,
                     prompt,
@@ -529,6 +549,27 @@ mod input_token_estimation_tests {
         assert_eq!(clamp_max_tokens(Some(8192), 8192), Some(8192));
         assert_eq!(clamp_max_tokens(Some(100), 8192), Some(100));
         assert_eq!(clamp_max_tokens(None, 8192), None);
+    }
+
+    #[test]
+    fn provider_reported_usage_is_bounded_by_request() {
+        let req = ChatCompletionRequest {
+            model: "model".into(),
+            messages: vec![msg("user", "hello")],
+            max_tokens: Some(5),
+            stream: false,
+        };
+        let resp = ProviderProtocolResponse {
+            output: "one two three four five six".into(),
+            input_tokens: Some(u32::MAX),
+            output_tokens: Some(u32::MAX),
+            signature: None,
+        };
+
+        let (prompt_tokens, completion_tokens) =
+            bounded_provider_token_counts(&req, "user: hello", &resp);
+        assert_eq!(prompt_tokens, estimate_input_tokens(&req.messages));
+        assert_eq!(completion_tokens, 5);
     }
 
     /// RM-I-3 / WP-I2.1: empty messages list saturates to the

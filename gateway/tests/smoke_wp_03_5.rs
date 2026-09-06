@@ -240,7 +240,9 @@ async fn three_requests_appear_in_usage_totals() {
     assert_eq!(status, 200);
     assert_eq!(body["total_requests"].as_u64(), Some(3));
     assert_eq!(body["total_input_tokens"].as_u64(), Some(21));
-    assert_eq!(body["total_output_tokens"].as_u64(), Some(39));
+    // Provider reports 13, but the request's max_tokens=10 is the authoritative
+    // output bound used for persisted usage.
+    assert_eq!(body["total_output_tokens"].as_u64(), Some(30));
     assert!(body["salt_spent_grains"].is_string(), "grains as U256 string");
     let display = body["salt_spent_display"].as_str().expect("display");
     assert!(display.ends_with(" SALT"), "display suffix, got: {}", display);
@@ -313,6 +315,7 @@ async fn usage_has_daily_breakdown_for_today() {
     let entry = &daily[0];
     assert_eq!(entry["requests"].as_u64(), Some(2));
     assert_eq!(entry["input_tokens"].as_u64(), Some(14));
-    assert_eq!(entry["output_tokens"].as_u64(), Some(26));
+    // Provider reports 13 per request; the gateway clamps to max_tokens=10.
+    assert_eq!(entry["output_tokens"].as_u64(), Some(20));
     assert!(entry["date"].is_string(), "date YYYY-MM-DD");
 }
