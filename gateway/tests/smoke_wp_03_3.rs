@@ -84,6 +84,37 @@ async fn spawn_stub_provider(fail_indices: HashSet<usize>) -> SocketAddr {
     addr
 }
 
+/// Spawn a provider that records the output-token budget it receives.
+async fn spawn_recording_provider(observed: Arc<Mutex<Vec<u32>>>) -> SocketAddr {
+    let app = axum::Router::new().route(
+        "/infer",
+        post(
+            move |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| {
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .expect("observed mutex")
+                        .push(req.max_tokens);
+                    JsonResp(serde_json::json!({
+                        "output": "recorded",
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recorder");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("recorder serve");
+    });
+    addr
+}
+
 // ── Mock chain queries ──────────────────────────────────────────
 
 struct MockChainQueries {
@@ -567,4 +598,69 @@ async fn batch_size_limit_returns_400() {
     let body: Value = resp.json().await.expect("json");
     let msg = body["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("1000"), "got: {}", msg);
+}
+
+/// IGW-B-004 RC-8 tripwire: the batch route must not let an explicit
+/// over-ceiling budget reach pricing or provider dispatch. The sync chat route
+/// is checked in the same test to prove its existing clamp still holds at the
+/// provider boundary.
+#[tokio::test]
+async fn batch_enforces_max_tokens_ceiling_at_dispatch_boundary() {
+    let batch_observed = Arc::new(Mutex::new(Vec::new()));
+    let batch_provider = spawn_recording_provider(batch_observed.clone()).await;
+    let batch_gateway = spawn_gateway(batch_provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let facilitator = H160::from([0xfa; 20]);
+    let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).expect("hex"));
+    let batch_client =
+        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("batch client");
+    let batch_url = format!("http://{}/v1/batch", batch_gateway);
+    let batch_body = serde_json::json!({
+        "requests": [{
+            "model": "llama-3.1-8b",
+            "messages": [{"role": "user", "content": "bounded batch"}],
+            "max_tokens": u32::MAX
+        }]
+    });
+    let response = batch_client
+        .send_paid(reqwest::Client::new().post(&batch_url).json(&batch_body))
+        .await
+        .expect("batch request");
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("batch json");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("max_tokens"), "got: {}", message);
+    assert!(
+        batch_observed.lock().expect("observed mutex").is_empty(),
+        "an over-ceiling batch must not dispatch to a provider"
+    );
+
+    // Use a fresh chain/gateway because the mock settlement is intentionally
+    // single-use. This confirms the existing sync route still clamps before
+    // provider dispatch when presented with the same hostile value.
+    let chat_observed = Arc::new(Mutex::new(Vec::new()));
+    let chat_provider = spawn_recording_provider(chat_observed.clone()).await;
+    let chat_gateway = spawn_gateway(chat_provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chat_client =
+        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("chat client");
+    let chat_url = format!("http://{}/v1/chat/completions", chat_gateway);
+    let chat_body = serde_json::json!({
+        "model": "llama-3.1-8b",
+        "messages": [{"role": "user", "content": "bounded chat"}],
+        "max_tokens": u32::MAX
+    });
+    let response = chat_client
+        .send_paid(reqwest::Client::new().post(&chat_url).json(&chat_body))
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), 200);
+    let dispatched = chat_observed.lock().expect("observed mutex").clone();
+    assert_eq!(dispatched.len(), 1);
+    assert!(
+        dispatched[0] <= 8_192,
+        "chat provider budget exceeded ceiling: {}",
+        dispatched[0]
+    );
 }
