@@ -11,6 +11,7 @@
 //! middleware can buffer the body once, restore it for the handler, and let
 //! this strategy price the exact model and requested output budget.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -88,6 +89,18 @@ impl PricingStrategy for TokenBasedPricing {
         }
         if batch.requests.len() > crate::batch::MAX_BATCH_SIZE {
             return self.fallback_quote().await;
+        }
+        let distinct_models: HashSet<&str> = batch
+            .requests
+            .iter()
+            .map(|request| request.model.as_str())
+            .collect();
+        if distinct_models.len() > crate::batch::MAX_DISTINCT_BATCH_MODELS {
+            return Err(PricingError::NotPriceable(format!(
+                "max {} distinct models per batch (got {})",
+                crate::batch::MAX_DISTINCT_BATCH_MODELS,
+                distinct_models.len()
+            )));
         }
 
         let mut total = U256::zero();

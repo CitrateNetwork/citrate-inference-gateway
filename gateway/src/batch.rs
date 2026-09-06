@@ -24,7 +24,7 @@
 //! Specs: `.agentile/formal/specs/compute/GatewayBatchLifecycle.tla`,
 //! `citrate_v0.01.1/specs/gherkin/gateway_batch.feature`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, State};
@@ -50,6 +50,11 @@ use crate::SharedState;
 
 /// Max requests per batch. Mirrors WP-03.3 spec.
 pub const MAX_BATCH_SIZE: usize = 1000;
+
+/// IGW-B-007: cap distinct model identifiers before any per-slot pricing or
+/// registry lookup. Repeated slots may still use the full batch capacity, but
+/// one submission cannot force unbounded model-name resolution work.
+pub const MAX_DISTINCT_BATCH_MODELS: usize = 32;
 
 // ── State machine types ─────────────────────────────────────────
 
@@ -482,6 +487,18 @@ pub async fn submit_batch_handler(
             "max {} requests per batch (got {})",
             MAX_BATCH_SIZE,
             req.requests.len()
+        )));
+    }
+    let distinct_models: HashSet<&str> = req
+        .requests
+        .iter()
+        .map(|request| request.model.as_str())
+        .collect();
+    if distinct_models.len() > MAX_DISTINCT_BATCH_MODELS {
+        return Err(GatewayError::BadRequest(format!(
+            "max {} distinct models per batch (got {})",
+            MAX_DISTINCT_BATCH_MODELS,
+            distinct_models.len()
         )));
     }
     let max_tokens_ceiling = max_tokens_ceiling();
