@@ -294,6 +294,7 @@ mod tests {
     const TEST_MASTER: [u8; 32] = [7u8; 32];
     use axum::http::Request;
     use std::net::SocketAddr;
+    use std::sync::Mutex;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -338,6 +339,24 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
+        });
+        addr
+    }
+
+    async fn spawn_recording_upstream(paths: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+        let app = Router::new().fallback(any(move |uri: Uri| {
+            let paths = paths.clone();
+            async move {
+                paths.lock().expect("paths mutex").push(uri.path().to_string());
+                (StatusCode::OK, "ok")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording upstream");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("recording upstream serve");
         });
         addr
     }
@@ -561,5 +580,42 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+    }
+
+    /// IGW-B-005 RC-8 tripwire: an authenticated local-proxy request must not
+    /// use raw or percent-encoded dot segments to escape the `/v1/` prefix.
+    #[tokio::test]
+    async fn dot_segments_are_rejected_before_upstream() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream_addr = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("dot-segments", 0, 0).unwrap();
+
+        for path in [
+            "/v1/../x",
+            "/v1/%2e%2e/x",
+            "/v1/a/../../x",
+            "/v1/.%2e/x",
+        ] {
+            let app = router_with(store.clone(), format!("http://{upstream_addr}"));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "path: {path}");
+        }
+
+        assert!(
+            paths.lock().expect("paths mutex").is_empty(),
+            "dot-segment requests must never reach the upstream"
+        );
     }
 }
