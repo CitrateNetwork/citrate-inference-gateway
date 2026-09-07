@@ -32,6 +32,11 @@ struct HonestMockChain {
     /// Set of nonces this mock "has settled." Populated by
     /// wait_for_receipt via side-effecting push.
     settled: Mutex<HashSet<H256>>,
+    /// IGW-B-013: the last payer recovered in `verify_offline`. An honest
+    /// facilitator emits a `PaymentSettled` whose `from` is this payer and
+    /// whose `to` is the gateway treasury; the layer now binds the event to
+    /// the payload, so the mock must round-trip both faithfully.
+    recovered_from: Mutex<Option<H160>>,
 }
 
 impl HonestMockChain {
@@ -39,8 +44,16 @@ impl HonestMockChain {
         Self {
             facilitator,
             settled: Mutex::new(HashSet::new()),
+            recovered_from: Mutex::new(None),
         }
     }
+}
+
+/// The H160 form of `any_addr()` — the configured gateway treasury.
+fn treasury_h160() -> H160 {
+    let mut bytes = [0u8; 20];
+    hex::decode_to_slice(any_addr().trim_start_matches("0x"), &mut bytes).expect("treasury hex");
+    H160::from(bytes)
 }
 
 #[async_trait]
@@ -52,7 +65,9 @@ impl ChainClient for HonestMockChain {
         }
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&precompile_input[32..52]);
-        Ok(Some(H160::from(addr)))
+        let recovered = H160::from(addr);
+        *self.recovered_from.lock().expect("recovered mutex") = Some(recovered);
+        Ok(Some(recovered))
     }
 
     async fn get_nonce(&self, _address: H160) -> Result<u64, X402Error> {
@@ -86,8 +101,14 @@ impl ChainClient for HonestMockChain {
         }
         drop(settled);
 
-        let from = H160::from([0xa1; 20]);
-        let to = H160::from([0xa2; 20]);
+        // IGW-B-013: faithful event — payer is the signer the layer just
+        // recovered, recipient is the gateway treasury.
+        let from = self
+            .recovered_from
+            .lock()
+            .expect("recovered mutex")
+            .unwrap_or_else(|| H160::from([0xb1; 20]));
+        let to = treasury_h160();
         let value = U256::from(995_000_000_000_000_000u128);
         let fee = U256::from(5_000_000_000_000_000u128);
 

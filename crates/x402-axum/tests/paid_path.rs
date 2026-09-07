@@ -9,7 +9,7 @@
 //! against a devnet (gated by env var) in `tests/paid_path_live.rs`.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,8 +21,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use x402_axum::{
-    encode_payment_header, payment_settled_topic, ChainClient, FixedPricing, PaymentPayload,
-    RawLog, TxReceipt, X402Error, X402Layer, X402Paid, X_PAYMENT_HEADER,
+    encode_payment_header, payment_settled_topic, ChainClient, FixedPricing, ObservabilityHook,
+    PaymentPayload, RawLog, RejectedEvent, SettledEvent, TxReceipt, X402Error, X402Layer, X402Paid,
+    X_PAYMENT_HEADER,
 };
 
 // ── Mock chain client ────────────────────────────────────────────
@@ -55,12 +56,14 @@ impl MockChain {
     }
 
     fn build_settled_receipt(&self, payload_nonce: H256) -> TxReceipt {
-        // Build a PaymentSettled log matching our mock. from / to
-        // don't need to round-trip from the actual payload for this
-        // mock — the layer only uses the event to populate X402Paid,
-        // and the tests then assert what it populated.
-        let from = H160::from([0xa1; 20]);
-        let to = H160::from([0xa2; 20]);
+        // Build a PaymentSettled log matching our mock. IGW-B-013: the
+        // layer now BINDS this event to the submitted payload (payer +
+        // recipient-is-treasury + gross-covers-price), so an honest
+        // facilitator's event must round-trip the payer (sample payload
+        // `from` = 0xb1) and pay OUR treasury. Pre-fix this emitted a
+        // synthetic 0xa1/0xa2 that the buggy layer accepted blindly.
+        let from = H160::from([0xb1; 20]);
+        let to = treasury_h160();
         let value = U256::from(995_000_000_000_000_000u128);
         let fee = U256::from(5_000_000_000_000_000u128);
 
@@ -414,6 +417,96 @@ async fn settle_revert_post_serve_keeps_200_operator_bears_loss() {
         status,
         StatusCode::OK,
         "a settle revert AFTER a 2xx serve must not turn the served 200 into a 402"
+    );
+}
+
+/// IGW-B-014: a settlement receipt-poll TIMEOUT after a 2xx serve must not
+/// charge the payer with no service. Under the settle-after-serve ordering
+/// (IGW-B-001) settlement runs only once the inner service has returned 2xx,
+/// so a `SettlePendingTimeout` — the settlement tx broadcast but no receipt
+/// inside the poll window — is an OPERATOR concern, not a client one: the
+/// served 200 is preserved (never downgraded to a 500 "charged, no
+/// service"), and no phantom settlement is recorded. The timeout surfaces
+/// neutrally via `on_rejected("settle pending (timeout)")` for reconciliation.
+/// This pins that the pre-B-001 hazard (timeout → 500 with the nonce burned
+/// and the tx still landing) cannot reappear.
+#[tokio::test]
+async fn settle_receipt_timeout_post_serve_keeps_200_no_phantom_settlement() {
+    #[derive(Default)]
+    struct Recorder {
+        settled: Mutex<usize>,
+        rejected: Mutex<Vec<(String, u16)>>,
+    }
+    #[async_trait::async_trait]
+    impl ObservabilityHook for Recorder {
+        async fn on_settled(&self, _ev: &SettledEvent) {
+            *self.settled.lock().expect("mutex") += 1;
+        }
+        async fn on_rejected(&self, ev: &RejectedEvent) {
+            self.rejected
+                .lock()
+                .expect("mutex")
+                .push((ev.reason.to_string(), ev.http_status));
+        }
+    }
+    impl std::fmt::Debug for Recorder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Recorder")
+        }
+    }
+
+    let mut mock = MockChain::new(facilitator());
+    // Latency far beyond the (default 10s) receipt poll window → the mock
+    // returns SettlePendingTimeout immediately, without a real sleep.
+    mock.artificial_latency_ms = 999_999;
+
+    let hook = Arc::new(Recorder::default());
+    let layer = X402Layer::builder()
+        .chain_id(40204)
+        .facilitator_address(&format!("0x{}", hex::encode(facilitator().as_bytes())))
+        .wsalt_address(any_addr())
+        .treasury(any_addr())
+        .rpc_url("http://unused-the-mock-is-injected")
+        .pricing(FixedPricing::new("1000000000000000000"))
+        .operator_secret_hex(test_secret_hex())
+        .chain_client(mock)
+        .observability(hook.clone())
+        .build()
+        .expect("build layer");
+    let app = Router::new()
+        .route(
+            "/gated",
+            get(|Extension(_paid): Extension<X402Paid>| async move { "served" }),
+        )
+        .layer(layer);
+
+    let mut payload = sample_payload();
+    payload.nonce = issue_nonce(&app).await;
+    let (status, body) = call(app, paid_request(&payload)).await;
+
+    // The client received its service and KEEPS the 200 — a settle timeout
+    // must never turn a served response into a "charged, no service" 500.
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "settle timeout AFTER a 2xx serve must not downgrade the served 200; body={:?}",
+        String::from_utf8_lossy(&body)
+    );
+    // No phantom settlement was recorded (the tx may still land on-chain;
+    // that is the operator's reconciliation concern, not a second charge).
+    assert_eq!(
+        *hook.settled.lock().expect("mutex"),
+        0,
+        "no settlement recorded on timeout"
+    );
+    // The timeout surfaced neutrally for reconciliation.
+    let rejected = hook.rejected.lock().expect("mutex");
+    assert!(
+        rejected
+            .iter()
+            .any(|(reason, _)| reason == "settle pending (timeout)"),
+        "expected a neutral settle-pending-timeout rejection, got: {:?}",
+        rejected
     );
 }
 
