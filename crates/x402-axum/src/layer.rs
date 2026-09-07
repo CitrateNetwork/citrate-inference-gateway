@@ -380,12 +380,7 @@ where
             if payment_header.is_none() {
                 // Unpaid → 402 with challenge. (WP-02.2 path.)
                 drop(inner);
-                let challenge = match make_challenge(
-                    &config,
-                    &nonces,
-                    price,
-                    request_commitment,
-                ) {
+                let challenge = match make_challenge(&config, &nonces, price, request_commitment) {
                     Ok(c) => c,
                     Err(e) => return Ok(build_500_response(&e.to_string())),
                 };
@@ -484,15 +479,11 @@ where
                             payer: None,
                         })
                         .await;
-                    let challenge = match make_challenge(
-                        &config,
-                        &nonces,
-                        price,
-                        request_commitment,
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => return Ok(build_500_response(&e.to_string())),
-                    };
+                    let challenge =
+                        match make_challenge(&config, &nonces, price, request_commitment) {
+                            Ok(c) => c,
+                            Err(e) => return Ok(build_500_response(&e.to_string())),
+                        };
                     // Audit -006: include the error's Display as `detail`
                     // (e.g. the settle tx hash on a revert) so callers
                     // get actionable context beyond the short reason.
@@ -693,10 +684,7 @@ async fn settle_paid_path(
     // follow-up: the current wire format does not surface the payload nonce
     // before the on-chain read.)
     let gross = settled.value.saturating_add(settled.fee);
-    if settled.from != payload.from
-        || settled.to != config.treasury
-        || gross < price
-    {
+    if settled.from != payload.from || settled.to != config.treasury || gross < price {
         return Err(X402Error::FacilitatorReverted(format!(
             "PaymentSettled event does not match submitted payload \
              (event from={:?} to={:?} gross={}; expected from={:?} \
@@ -748,14 +736,12 @@ fn make_challenge(
     })?;
     // Record in the issued-nonce ledger so the paid path can later
     // verify this challenge is ours, unexpired, and single-use.
-    config
-        .nonce_ledger
-        .record_bound(
-            nonce,
-            request_commitment,
-            now_unix + config.challenge_ttl_secs,
-            now_unix,
-        );
+    config.nonce_ledger.record_bound(
+        nonce,
+        request_commitment,
+        now_unix + config.challenge_ttl_secs,
+        now_unix,
+    );
     Ok(built.challenge)
 }
 

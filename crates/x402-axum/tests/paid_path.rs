@@ -494,7 +494,11 @@ async fn settle_receipt_timeout_post_serve_keeps_200_no_phantom_settlement() {
     );
     // No phantom settlement was recorded (the tx may still land on-chain;
     // that is the operator's reconciliation concern, not a second charge).
-    assert_eq!(*hook.settled.lock().expect("mutex"), 0, "no settlement recorded on timeout");
+    assert_eq!(
+        *hook.settled.lock().expect("mutex"),
+        0,
+        "no settlement recorded on timeout"
+    );
     // The timeout surfaced neutrally for reconciliation.
     let rejected = hook.rejected.lock().expect("mutex");
     assert!(

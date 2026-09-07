@@ -15,9 +15,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use x402_axum::{
-    encode_payment_header, payment_settled_topic, ChainClient, CountersObservability,
-    FixedPricing, ObservabilityHook, PaymentPayload, RawLog, RejectedEvent, SettledEvent,
-    TxReceipt, X402Error, X402Layer, X402Paid, X_PAYMENT_HEADER,
+    encode_payment_header, payment_settled_topic, ChainClient, CountersObservability, FixedPricing,
+    ObservabilityHook, PaymentPayload, RawLog, RejectedEvent, SettledEvent, TxReceipt, X402Error,
+    X402Layer, X402Paid, X_PAYMENT_HEADER,
 };
 
 // ── Recording hook — captures every invocation ───────────────────
@@ -59,10 +59,7 @@ impl MockChain {
 
 #[async_trait]
 impl ChainClient for MockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if precompile_input.len() != 265 {
             return Ok(None);
         }
@@ -401,7 +398,11 @@ async fn hook_panic_does_not_leak_to_request() {
     }
 
     let app = build_app(PanickyHook);
-    let res = app.clone().oneshot(paid_request(&app).await).await.expect("call");
+    let res = app
+        .clone()
+        .oneshot(paid_request(&app).await)
+        .await
+        .expect("call");
     // Shouldn't be a 500 in happy path.
     assert_eq!(res.status(), 200);
     // Drain body to avoid leaks.
@@ -424,10 +425,7 @@ async fn divergent_settled_event_is_not_recorded_as_settlement() {
     }
     #[async_trait]
     impl ChainClient for DivergentMock {
-        async fn verify_offline(
-            &self,
-            precompile_input: &[u8],
-        ) -> Result<Option<H160>, X402Error> {
+        async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
             if precompile_input.len() != 265 {
                 return Ok(None);
             }
@@ -441,11 +439,7 @@ async fn divergent_settled_event_is_not_recorded_as_settlement() {
         async fn send_raw_tx(&self, _raw: &[u8]) -> Result<H256, X402Error> {
             Ok(H256::from([0xab; 32]))
         }
-        async fn wait_for_receipt(
-            &self,
-            _tx: H256,
-            _t: Duration,
-        ) -> Result<TxReceipt, X402Error> {
+        async fn wait_for_receipt(&self, _tx: H256, _t: Duration) -> Result<TxReceipt, X402Error> {
             // Divergent event: correct payer, but funds to an attacker
             // recipient rather than the gateway treasury.
             let from = H160::from([0xb1; 20]);
@@ -488,7 +482,9 @@ async fn divergent_settled_event_is_not_recorded_as_settlement() {
         .rpc_url("http://unused-mock")
         .pricing(FixedPricing::new("1000000000000000000"))
         .operator_secret_hex(test_secret_hex())
-        .chain_client(DivergentMock { facilitator: facilitator() })
+        .chain_client(DivergentMock {
+            facilitator: facilitator(),
+        })
         .observability(hook.clone())
         .build()
         .expect("build layer");
@@ -533,7 +529,9 @@ async fn divergent_settled_event_is_not_recorded_as_settlement() {
     // ...and the mismatch surfaced neutrally for reconciliation.
     let rejected = hook.rejected.lock().expect("mutex");
     assert!(
-        rejected.iter().any(|(reason, _)| reason == "on-chain settle failed"),
+        rejected
+            .iter()
+            .any(|(reason, _)| reason == "on-chain settle failed"),
         "expected a neutral facilitator-failure rejection, got: {:?}",
         rejected
     );
