@@ -436,7 +436,7 @@ where
                     // service unwinds here before this point, so no settle
                     // runs — count stays 0.
                     if response.status().is_success() {
-                        match settle_paid_path(&config, &payload).await {
+                        match settle_paid_path(&config, &payload, price).await {
                             Ok(settled) => {
                                 // Charged-and-released: fire observability now
                                 // that the money actually moved (metric count
@@ -633,6 +633,7 @@ async fn validate_paid_path(
 async fn settle_paid_path(
     config: &X402Config,
     payload: &crate::types::PaymentPayload,
+    price: U256,
 ) -> Result<SettledEvent, X402Error> {
     // 5. Build settlement calldata + get operator nonce.
     let calldata = encode_settle_payment(payload);
@@ -676,6 +677,33 @@ async fn settle_paid_path(
             ))
         }
     };
+
+    // 8.5 IGW-B-013: bind the emitted PaymentSettled event to the payload
+    // THIS gateway submitted. `find_payment_settled` returns the FIRST log
+    // from the facilitator address with the right topic0 — pre-fix the layer
+    // trusted its fields blind. A facilitator that emitted a divergent or
+    // additional `PaymentSettled` (e.g. after a contract upgrade, or a second
+    // event in the same tx) would have that event's payer/recipient/amount
+    // recorded as this caller's settlement. Assert the event describes the
+    // payment we actually authorised: same payer, funds to OUR treasury, and
+    // a gross that covers the quoted price. A mismatch is treated as a
+    // facilitator failure — the settle is not recorded. This runs post-2xx
+    // serve, so it never charges an honest payer; it prevents a bogus
+    // settlement from being reported as real. (Nonce-level binding is a
+    // follow-up: the current wire format does not surface the payload nonce
+    // before the on-chain read.)
+    let gross = settled.value.saturating_add(settled.fee);
+    if settled.from != payload.from
+        || settled.to != config.treasury
+        || gross < price
+    {
+        return Err(X402Error::FacilitatorReverted(format!(
+            "PaymentSettled event does not match submitted payload \
+             (event from={:?} to={:?} gross={}; expected from={:?} \
+             to={:?} price>={})",
+            settled.from, settled.to, gross, payload.from, config.treasury, price
+        )));
+    }
 
     // 9. Build the settlement event for observability. Note X402Paid was
     // already attached to the request BEFORE serving (see the outer

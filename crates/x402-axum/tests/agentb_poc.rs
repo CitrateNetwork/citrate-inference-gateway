@@ -60,8 +60,11 @@ impl CountingChain {
     }
 
     fn settled_receipt(&self) -> TxReceipt {
-        let from = H160::from([0xa1; 20]);
-        let to = H160::from([0xa2; 20]);
+        // IGW-B-013: the layer binds the PaymentSettled event to the
+        // submitted payload, so an honest facilitator event carries the
+        // real payer (sample payload `from` = 0xb1) and OUR treasury.
+        let from = H160::from([0xb1; 20]);
+        let to = treasury_h160();
         let value = U256::from(995_000_000_000_000_000u128);
         let fee = U256::from(5_000_000_000_000_000u128);
 

@@ -101,8 +101,12 @@ impl ChainClient for MockChain {
         }
         drop(ns);
 
-        let from = H160::from([0xa1; 20]);
-        let to = H160::from([0xa2; 20]);
+        // IGW-B-013: the layer binds the PaymentSettled event to the
+        // submitted payload (payer + recipient-is-treasury + gross ≥
+        // price), so an honest facilitator's event round-trips the payer
+        // (sample payload `from` = 0xb1) and credits OUR treasury.
+        let from = H160::from([0xb1; 20]);
+        let to = treasury_h160();
         let value = U256::from(995_000_000_000_000_000u128);
         let fee = U256::from(5_000_000_000_000_000u128);
 
@@ -261,8 +265,10 @@ async fn happy_path_fires_on_settled_exactly_once() {
     assert_eq!(settled.len(), 1);
     let ev = &settled[0];
     // Gherkin scenario #10: event fields include payer, amount_wei
-    // (grains), tx_hash.
-    assert_eq!(ev.payer, H160::from([0xa1; 20]));
+    // (grains), tx_hash. IGW-B-013: the recorded payer is now the payload
+    // signer (0xb1), bound to the submitted payment — pre-fix the layer
+    // recorded whatever `from` the facilitator event carried (0xa1).
+    assert_eq!(ev.payer, H160::from([0xb1; 20]));
     assert_eq!(ev.amount_wei, U256::from(995_000_000_000_000_000u128));
     assert_eq!(ev.fee_wei, U256::from(5_000_000_000_000_000u128));
     assert_ne!(ev.tx_hash, H256::zero());
@@ -400,4 +406,135 @@ async fn hook_panic_does_not_leak_to_request() {
     assert_eq!(res.status(), 200);
     // Drain body to avoid leaks.
     let _ = res.into_body().collect().await;
+}
+
+/// IGW-B-013 tripwire: a facilitator that emits a `PaymentSettled` whose
+/// recipient is NOT this gateway's treasury (a divergent / attacker event)
+/// must NOT be recorded as this caller's settlement. The layer binds the
+/// event to the submitted payload; a mismatch is treated as a facilitator
+/// failure. The client still keeps its already-served 200 (settle runs
+/// post-serve), but `on_settled` never fires and `on_rejected` records the
+/// neutral "on-chain settle failed" reason for reconciliation.
+#[tokio::test]
+async fn divergent_settled_event_is_not_recorded_as_settlement() {
+    // Mock: valid signature (so VALIDATE passes) but the PaymentSettled it
+    // returns pays a WRONG recipient (0xba…, not the configured treasury).
+    struct DivergentMock {
+        facilitator: H160,
+    }
+    #[async_trait]
+    impl ChainClient for DivergentMock {
+        async fn verify_offline(
+            &self,
+            precompile_input: &[u8],
+        ) -> Result<Option<H160>, X402Error> {
+            if precompile_input.len() != 265 {
+                return Ok(None);
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&precompile_input[32..52]);
+            Ok(Some(H160::from(addr)))
+        }
+        async fn get_nonce(&self, _a: H160) -> Result<u64, X402Error> {
+            Ok(0)
+        }
+        async fn send_raw_tx(&self, _raw: &[u8]) -> Result<H256, X402Error> {
+            Ok(H256::from([0xab; 32]))
+        }
+        async fn wait_for_receipt(
+            &self,
+            _tx: H256,
+            _t: Duration,
+        ) -> Result<TxReceipt, X402Error> {
+            // Divergent event: correct payer, but funds to an attacker
+            // recipient rather than the gateway treasury.
+            let from = H160::from([0xb1; 20]);
+            let wrong_to = H160::from([0xba; 20]);
+            let value = U256::from(995_000_000_000_000_000u128);
+            let fee = U256::from(5_000_000_000_000_000u128);
+            let mut padded_from = [0u8; 32];
+            padded_from[12..32].copy_from_slice(from.as_bytes());
+            let mut padded_to = [0u8; 32];
+            padded_to[12..32].copy_from_slice(wrong_to.as_bytes());
+            let mut data = Vec::with_capacity(96);
+            let mut buf = [0u8; 32];
+            value.to_big_endian(&mut buf);
+            data.extend_from_slice(&buf);
+            fee.to_big_endian(&mut buf);
+            data.extend_from_slice(&buf);
+            data.extend_from_slice(H256::from([0x77; 32]).as_bytes());
+            Ok(TxReceipt {
+                status: true,
+                block_number: 9,
+                logs: vec![RawLog {
+                    address: self.facilitator,
+                    topics: vec![
+                        payment_settled_topic(),
+                        H256::from(padded_from),
+                        H256::from(padded_to),
+                    ],
+                    data,
+                }],
+            })
+        }
+    }
+
+    let hook = Arc::new(RecordingHook::default());
+    let layer = X402Layer::builder()
+        .chain_id(40204)
+        .facilitator_address(&format!("0x{}", hex::encode(facilitator().as_bytes())))
+        .wsalt_address(any_addr())
+        .treasury(any_addr())
+        .rpc_url("http://unused-mock")
+        .pricing(FixedPricing::new("1000000000000000000"))
+        .operator_secret_hex(test_secret_hex())
+        .chain_client(DivergentMock { facilitator: facilitator() })
+        .observability(hook.clone())
+        .build()
+        .expect("build layer");
+    let app = Router::new()
+        .route(
+            "/gated",
+            get(|Extension(paid): Extension<X402Paid>| async move {
+                format!("ok {}", hex::encode(paid.nonce.as_bytes()))
+            }),
+        )
+        .layer(layer);
+
+    // Unpaid handshake → challenge nonce → paid request.
+    let res = app
+        .clone()
+        .oneshot(unpaid_request())
+        .await
+        .expect("handshake");
+    let body = res.into_body().collect().await.expect("body").to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("challenge json");
+    let nonce_hex = v["x402"]["nonce"].as_str().expect("challenge nonce");
+    let bytes = hex::decode(nonce_hex.trim_start_matches("0x")).expect("nonce hex");
+    let mut payload = sample_payload();
+    payload.nonce = H256::from_slice(&bytes);
+    let req = Request::builder()
+        .uri("/gated")
+        .header(X_PAYMENT_HEADER, encode_payment_header(&payload))
+        .body(Body::empty())
+        .expect("req");
+    let res = app.oneshot(req).await.expect("paid call");
+    // Client keeps its served 200 — settle runs post-serve.
+    assert_eq!(res.status(), 200, "served 200 must not be downgraded");
+    let _ = res.into_body().collect().await;
+
+    // The divergent event was NOT recorded as a settlement...
+    let settled = hook.settled.lock().expect("mutex");
+    assert_eq!(
+        settled.len(),
+        0,
+        "a PaymentSettled to a non-treasury recipient must NOT be recorded"
+    );
+    // ...and the mismatch surfaced neutrally for reconciliation.
+    let rejected = hook.rejected.lock().expect("mutex");
+    assert!(
+        rejected.iter().any(|(reason, _)| reason == "on-chain settle failed"),
+        "expected a neutral facilitator-failure rejection, got: {:?}",
+        rejected
+    );
 }
