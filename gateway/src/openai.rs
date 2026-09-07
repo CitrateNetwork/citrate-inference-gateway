@@ -84,7 +84,7 @@ impl Usage {
         Self {
             prompt_tokens: prompt,
             completion_tokens: completion,
-            total_tokens: prompt + completion,
+            total_tokens: prompt.saturating_add(completion),
         }
     }
 }

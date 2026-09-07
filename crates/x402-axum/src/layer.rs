@@ -15,7 +15,8 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
-use ethereum_types::{H160, U256};
+use ethereum_types::{H160, H256, U256};
+use sha3::{Digest, Keccak256};
 
 use crate::calldata::encode_settle_payment;
 use crate::chain::{ChainClient, HttpChainClient};
@@ -26,7 +27,7 @@ use crate::header::{decode as decode_payment_header, X_PAYMENT_HEADER};
 use crate::ledger::NonceLedger;
 use crate::nonce::NonceSource;
 use crate::observability::{NoopObservability, ObservabilityHook, RejectedEvent, SettledEvent};
-use crate::pricing::PricingStrategy;
+use crate::pricing::{buffer_request_body, request_for_pricing, PricingStrategy};
 use crate::receipt::find_payment_settled;
 use crate::types::X402Paid;
 
@@ -357,8 +358,15 @@ where
                 return fut.await;
             }
 
+            let request_body = match buffer_request_body(&mut req).await {
+                Ok(bytes) => bytes,
+                Err(e) => return Ok(build_400_response(&e)),
+            };
+            let request_commitment = request_commitment(&req, &request_body);
+            let pricing_request = request_for_pricing(&req, request_body);
+
             // Price first — 400 on unpriceable.
-            let price = match config.pricing.price_for(&req).await {
+            let price = match config.pricing.price_for(&pricing_request).await {
                 Ok(p) => p,
                 Err(e) => return Ok(build_400_response(&e.to_string())),
             };
@@ -372,7 +380,12 @@ where
             if payment_header.is_none() {
                 // Unpaid → 402 with challenge. (WP-02.2 path.)
                 drop(inner);
-                let challenge = match make_challenge(&config, &nonces, price) {
+                let challenge = match make_challenge(
+                    &config,
+                    &nonces,
+                    price,
+                    request_commitment,
+                ) {
                     Ok(c) => c,
                     Err(e) => return Ok(build_500_response(&e.to_string())),
                 };
@@ -391,7 +404,7 @@ where
             // invariant is `settle ⟹ serve`: money moves iff the inner
             // response status is a success.
             let header_value = payment_header.expect("checked above");
-            match validate_paid_path(&config, &header_value, price).await {
+            match validate_paid_path(&config, &header_value, price, &request_commitment).await {
                 ValidateOutcome::Validated(payload) => {
                     // Attach X402Paid BEFORE serving — inner handlers price
                     // and gate against it (chat.rs Underfunded check,
@@ -471,7 +484,12 @@ where
                             payer: None,
                         })
                         .await;
-                    let challenge = match make_challenge(&config, &nonces, price) {
+                    let challenge = match make_challenge(
+                        &config,
+                        &nonces,
+                        price,
+                        request_commitment,
+                    ) {
                         Ok(c) => c,
                         Err(e) => return Ok(build_500_response(&e.to_string())),
                     };
@@ -531,6 +549,7 @@ async fn validate_paid_path(
     config: &X402Config,
     header_value: &str,
     price: U256,
+    request_commitment: &H256,
 ) -> ValidateOutcome {
     // 1. Parse header → PaymentPayload.
     let payload = match decode_payment_header(header_value) {
@@ -556,7 +575,7 @@ async fn validate_paid_path(
     // acceptable behavior.
     if config
         .nonce_ledger
-        .consume(&payload.nonce, now_unix_secs())
+        .consume_bound(&payload.nonce, request_commitment, now_unix_secs())
         .is_err()
     {
         return ValidateOutcome::Reject(X402Error::ChallengeNotIssued);
@@ -677,6 +696,7 @@ fn make_challenge(
     config: &X402Config,
     nonces: &NonceSource,
     amount_wei: U256,
+    request_commitment: H256,
 ) -> Result<crate::types::PaymentChallenge, X402Error> {
     // Audit -003 (SECREM-02 6.4a): nonce minting fails CLOSED. If the
     // OS entropy source is down, the challenge is refused (the caller
@@ -696,13 +716,38 @@ fn make_challenge(
         nonce,
         now_unix,
         ttl_secs: config.challenge_ttl_secs,
+        request_commitment,
     })?;
     // Record in the issued-nonce ledger so the paid path can later
     // verify this challenge is ours, unexpired, and single-use.
     config
         .nonce_ledger
-        .record(nonce, now_unix + config.challenge_ttl_secs, now_unix);
+        .record_bound(
+            nonce,
+            request_commitment,
+            now_unix + config.challenge_ttl_secs,
+            now_unix,
+        );
     Ok(built.challenge)
+}
+
+fn request_commitment(req: &Request<Body>, body: &[u8]) -> H256 {
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| req.uri().path());
+    let mut hasher = Keccak256::new();
+    hasher.update(b"CITRATE-X402-REQUEST-V1");
+    update_len_prefixed(&mut hasher, req.method().as_str().as_bytes());
+    update_len_prefixed(&mut hasher, path.as_bytes());
+    update_len_prefixed(&mut hasher, body);
+    H256::from_slice(&hasher.finalize())
+}
+
+fn update_len_prefixed(hasher: &mut Keccak256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn build_error_response(err: X402Error) -> Response<Body> {

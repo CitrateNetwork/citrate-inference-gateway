@@ -15,10 +15,11 @@
 use async_trait::async_trait;
 use ethereum_types::{H160, H256, U256};
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::ContractAddresses;
 use crate::error::GatewayError;
@@ -30,11 +31,30 @@ use crate::error::GatewayError;
 /// don't hammer the chain.
 const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// PIL-47c: process-wide cache of name → modelHash, populated lazily
-/// on first miss in `resolve_model_name`. Held under a tokio RwLock so
-/// reads are non-blocking when the cache is warm.
-static MODEL_NAME_CACHE: Lazy<RwLock<Option<(std::time::Instant, std::collections::HashMap<String, H256>)>>> =
+/// PIL-47c / IGW-B-007: process-wide cache of name → modelHash, populated
+/// lazily on first miss in `resolve_model_name`. `None` values are short-lived
+/// negative entries, so repeated unknown names do not re-enumerate the chain.
+/// Held under a tokio RwLock so reads are non-blocking when the cache is warm.
+static MODEL_NAME_CACHE: Lazy<
+    RwLock<Option<(std::time::Instant, HashMap<String, Option<H256>>)>>,
+> = Lazy::new(|| RwLock::new(None));
+
+/// IGW-B-007: only one cache refresh may enumerate ModelRegistry at a time.
+/// Callers arriving during a refresh re-check the cache after acquiring this
+/// guard and observe the result from that refresh.
+static MODEL_CACHE_REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// IGW-B-007: `/v1/models` is unauthenticated, so retain its complete model
+/// listing for the same short TTL and serialize refreshes with name lookups.
+static MODEL_LIST_CACHE: Lazy<RwLock<Option<(std::time::Instant, Vec<ModelInfo>)>>> =
     Lazy::new(|| RwLock::new(None));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedModelLookup {
+    Hit(H256),
+    Negative,
+    Miss,
+}
 
 /// One provider listing returned by `list_providers`.
 #[derive(Debug, Clone, Serialize)]
@@ -190,22 +210,28 @@ impl HttpChainQueries {
 
     /// PIL-47c: look up `name` in the in-memory model-name cache. Returns
     /// `None` on miss or expiry; the caller is expected to re-populate via
-    /// [`Self::refresh_model_cache`].
-    async fn cached_model_hash(&self, name: &str) -> Option<H256> {
+    /// [`Self::refresh_model_cache`]. Positive and negative cache entries are
+    /// distinguished so a known miss is not treated as a refresh request.
+    async fn cached_model_hash(&self, name: &str) -> CachedModelLookup {
         let guard = MODEL_NAME_CACHE.read().await;
-        if let Some((fetched_at, ref map)) = *guard {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return map.get(name).copied();
-            }
+        let Some((fetched_at, map)) = guard.as_ref() else {
+            return CachedModelLookup::Miss;
+        };
+        if fetched_at.elapsed() >= MODEL_CACHE_TTL {
+            return CachedModelLookup::Miss;
         }
-        None
+        match map.get(name) {
+            Some(Some(hash)) => CachedModelLookup::Hit(*hash),
+            Some(None) => CachedModelLookup::Negative,
+            None => CachedModelLookup::Miss,
+        }
     }
 
     /// PIL-47c: replace the cache with a freshly-built map. Holds the
     /// write lock only for the swap.
     async fn refresh_model_cache(
         &self,
-        name_to_hash: std::collections::HashMap<String, H256>,
+        name_to_hash: HashMap<String, Option<H256>>,
     ) {
         let mut guard = MODEL_NAME_CACHE.write().await;
         *guard = Some((std::time::Instant::now(), name_to_hash));
@@ -271,12 +297,26 @@ impl ChainQueries for HttpChainQueries {
         //
         // Cached on the gateway side via [`MODEL_NAME_CACHE`] so we don't
         // hammer the chain RPC on every chat request; cache TTL is
-        // `MODEL_CACHE_TTL` (30 s).
-        if let Some(h) = self.cached_model_hash(name).await {
-            return Ok(h);
+        // `MODEL_CACHE_TTL` (30 s). Negative entries are cached too.
+        match self.cached_model_hash(name).await {
+            CachedModelLookup::Hit(h) => return Ok(h),
+            CachedModelLookup::Negative => {
+                return Err(GatewayError::UnknownModel(name.to_string()))
+            }
+            CachedModelLookup::Miss => {}
         }
 
-        // Cache miss or expired — repopulate.
+        // Cache miss or expired — serialize the refresh and re-check after
+        // waiting so concurrent callers cannot each enumerate the registry.
+        let _refresh_guard = MODEL_CACHE_REFRESH_LOCK.lock().await;
+        match self.cached_model_hash(name).await {
+            CachedModelLookup::Hit(h) => return Ok(h),
+            CachedModelLookup::Negative => {
+                return Err(GatewayError::UnknownModel(name.to_string()))
+            }
+            CachedModelLookup::Miss => {}
+        }
+
         let mut data = Vec::with_capacity(4);
         data.extend_from_slice(&selector("getAllModelHashes()"));
         let result = self
@@ -285,8 +325,8 @@ impl ChainQueries for HttpChainQueries {
             .map_err(|e| GatewayError::UnknownModel(format!("{} ({})", name, e)))?;
         let hashes = decode_bytes32_array(&result)?;
 
-        let mut name_to_hash: std::collections::HashMap<String, H256> =
-            std::collections::HashMap::with_capacity(hashes.len());
+        let mut name_to_hash: HashMap<String, Option<H256>> =
+            HashMap::with_capacity(hashes.len() + 1);
         for h in hashes {
             // getModel(bytes32) returns (address, string name, string framework,
             // string version, string ipfsCID, uint256 inferencePrice,
@@ -305,16 +345,17 @@ impl ChainQueries for HttpChainQueries {
             if let Ok(model_name) = decode_string_at_offset_word(&result, 1) {
                 // Empty name = uninitialized slot (model deleted / never set).
                 if !model_name.is_empty() {
-                    name_to_hash.insert(model_name, h);
+                    name_to_hash.insert(model_name, Some(h));
                 }
             }
         }
 
-        self.refresh_model_cache(name_to_hash.clone()).await;
-        name_to_hash
-            .get(name)
-            .copied()
-            .ok_or_else(|| GatewayError::UnknownModel(name.to_string()))
+        let resolved = name_to_hash.get(name).copied().flatten();
+        if resolved.is_none() {
+            name_to_hash.insert(name.to_string(), None);
+        }
+        self.refresh_model_cache(name_to_hash).await;
+        resolved.ok_or_else(|| GatewayError::UnknownModel(name.to_string()))
     }
 
     async fn estimate_cost(
@@ -393,6 +434,25 @@ impl ChainQueries for HttpChainQueries {
     /// failed `getAllModelHashes` bubbles up — the caller decides
     /// whether to surface 503 or degrade to an empty list.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, GatewayError> {
+        {
+            let guard = MODEL_LIST_CACHE.read().await;
+            if let Some((fetched_at, models)) = guard.as_ref() {
+                if fetched_at.elapsed() < MODEL_CACHE_TTL {
+                    return Ok(models.clone());
+                }
+            }
+        }
+
+        let _refresh_guard = MODEL_CACHE_REFRESH_LOCK.lock().await;
+        {
+            let guard = MODEL_LIST_CACHE.read().await;
+            if let Some((fetched_at, models)) = guard.as_ref() {
+                if fetched_at.elapsed() < MODEL_CACHE_TTL {
+                    return Ok(models.clone());
+                }
+            }
+        }
+
         // Step 1: enumerate hashes.
         let mut data = Vec::with_capacity(4);
         data.extend_from_slice(&selector("getAllModelHashes()"));
@@ -441,6 +501,8 @@ impl ChainQueries for HttpChainQueries {
                 is_active,
             });
         }
+        let mut guard = MODEL_LIST_CACHE.write().await;
+        *guard = Some((std::time::Instant::now(), out.clone()));
         Ok(out)
     }
 }

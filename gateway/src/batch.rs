@@ -24,7 +24,7 @@
 //! Specs: `.agentile/formal/specs/compute/GatewayBatchLifecycle.tla`,
 //! `citrate_v0.01.1/specs/gherkin/gateway_batch.feature`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, State};
@@ -39,7 +39,10 @@ use uuid::Uuid;
 use x402_axum::X402Paid;
 
 use crate::auth::ApiKeyCharge;
-use crate::chat::{json_response, quote_chat_request_cost, run_dispatch, DEFAULT_MAX_TOKENS};
+use crate::chat::{
+    clamp_max_tokens, json_response, max_tokens_ceiling, quote_chat_request_cost, run_dispatch,
+    DEFAULT_MAX_TOKENS,
+};
 use crate::error::GatewayError;
 use crate::openai::{ChatCompletionRequest, ChatCompletionResponse};
 use crate::usage::ApiKeyContext;
@@ -47,6 +50,11 @@ use crate::SharedState;
 
 /// Max requests per batch. Mirrors WP-03.3 spec.
 pub const MAX_BATCH_SIZE: usize = 1000;
+
+/// IGW-B-007: cap distinct model identifiers before any per-slot pricing or
+/// registry lookup. Repeated slots may still use the full batch capacity, but
+/// one submission cannot force unbounded model-name resolution work.
+pub const MAX_DISTINCT_BATCH_MODELS: usize = 32;
 
 // ── State machine types ─────────────────────────────────────────
 
@@ -481,6 +489,19 @@ pub async fn submit_batch_handler(
             req.requests.len()
         )));
     }
+    let distinct_models: HashSet<&str> = req
+        .requests
+        .iter()
+        .map(|request| request.model.as_str())
+        .collect();
+    if distinct_models.len() > MAX_DISTINCT_BATCH_MODELS {
+        return Err(GatewayError::BadRequest(format!(
+            "max {} distinct models per batch (got {})",
+            MAX_DISTINCT_BATCH_MODELS,
+            distinct_models.len()
+        )));
+    }
+    let max_tokens_ceiling = max_tokens_ceiling();
     for (i, r) in req.requests.iter().enumerate() {
         if r.messages.is_empty() {
             return Err(GatewayError::BadRequest(format!(
@@ -488,12 +509,24 @@ pub async fn submit_batch_handler(
                 i
             )));
         }
+        if r.max_tokens
+            .is_some_and(|requested| requested > max_tokens_ceiling)
+        {
+            return Err(GatewayError::BadRequest(format!(
+                "requests[{}].max_tokens exceeds the maximum output-token ceiling of {}",
+                i, max_tokens_ceiling
+            )));
+        }
     }
 
     let mut total_required = U256::zero();
     let mut largest_requested_tokens = DEFAULT_MAX_TOKENS;
     let mut slots = Vec::with_capacity(req.requests.len());
-    for request in req.requests {
+    for mut request in req.requests {
+        // Batch requests have already been rejected above when an explicit
+        // value exceeds the ceiling. Normalize the optional value here so the
+        // stored slot and its later dispatch cannot diverge from the quote.
+        request.max_tokens = clamp_max_tokens(request.max_tokens, max_tokens_ceiling);
         let (quoted_cost_grains, requested_tokens) =
             quote_chat_request_cost(&state, &request).await?;
         let (next_total, overflow) = total_required.overflowing_add(quoted_cost_grains);

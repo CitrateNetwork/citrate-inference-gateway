@@ -15,6 +15,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::GatewayError;
@@ -182,17 +183,40 @@ pub async fn dispatch_to_provider(
             resp.status()
         )));
     }
-    let bytes = resp.bytes().await.map_err(|e| {
-        GatewayError::ProviderUnavailable(format!("{}: response read failed: {e}", provider.endpoint))
-    })?;
-    if bytes.len() > MAX_PROVIDER_RESPONSE_BYTES {
-        return Err(GatewayError::ProviderUnavailable(format!(
-            "{}: response too large ({} bytes > {} bytes)",
-            provider.endpoint,
-            bytes.len(),
-            MAX_PROVIDER_RESPONSE_BYTES
-        )));
+
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_PROVIDER_RESPONSE_BYTES as u64 {
+            return Err(GatewayError::ProviderUnavailable(format!(
+                "{}: response too large ({} bytes > {} bytes)",
+                provider.endpoint, content_length, MAX_PROVIDER_RESPONSE_BYTES
+            )));
+        }
     }
+
+    let mut stream = resp.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            GatewayError::ProviderUnavailable(format!(
+                "{}: response read failed: {e}",
+                provider.endpoint
+            ))
+        })?;
+        let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+            GatewayError::ProviderUnavailable(format!(
+                "{}: response too large (exceeded {} bytes)",
+                provider.endpoint, MAX_PROVIDER_RESPONSE_BYTES
+            ))
+        })?;
+        if next_len > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(GatewayError::ProviderUnavailable(format!(
+                "{}: response too large (exceeded {} bytes)",
+                provider.endpoint, MAX_PROVIDER_RESPONSE_BYTES
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
     serde_json::from_slice::<ProviderProtocolResponse>(&bytes).map_err(|e| {
         GatewayError::ProviderUnavailable(format!(
             "{}: malformed response: {}",

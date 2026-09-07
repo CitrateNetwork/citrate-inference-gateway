@@ -33,7 +33,11 @@ use tokio::net::TcpListener;
 
 use citrate_gateway::queries::ChainQueries;
 use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
-use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
+use x402_axum::keys::{derive_secp256k1_address, sign_digest_secp256k1};
+use x402_axum::{
+    encode_payment_header, eip712_digest, transfer_with_authorization_struct_hash, ChainClient,
+    RawLog, TxReceipt, X402Client, X402Error, X_PAYMENT_HEADER,
+};
 
 /// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
 /// addresses (the placeholder default was removed from the builders).
@@ -80,6 +84,37 @@ async fn spawn_stub_provider(fail_indices: HashSet<usize>) -> SocketAddr {
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("stub serve");
+    });
+    addr
+}
+
+/// Spawn a provider that records the output-token budget it receives.
+async fn spawn_recording_provider(observed: Arc<Mutex<Vec<u32>>>) -> SocketAddr {
+    let app = axum::Router::new().route(
+        "/infer",
+        post(
+            move |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| {
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .expect("observed mutex")
+                        .push(req.max_tokens);
+                    JsonResp(serde_json::json!({
+                        "output": "recorded",
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recorder");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("recorder serve");
     });
     addr
 }
@@ -230,6 +265,59 @@ fn any_addr() -> &'static str {
     "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b"
 }
 
+fn parse_addr(value: &str) -> H160 {
+    let bytes = hex::decode(value.trim_start_matches("0x")).expect("address hex");
+    H160::from_slice(&bytes)
+}
+
+/// Sign a valid x402 challenge for a caller-selected amount. The batch
+/// underfunding tests use this to keep the authorization below the exact
+/// request-aware quote while retaining a valid nonce, recipient, and EIP-712
+/// signature.
+fn payment_header_for_amount(
+    challenge: &Value,
+    secret: &[u8; 32],
+    amount: U256,
+) -> String {
+    let payer = derive_secp256k1_address(secret).expect("payer address");
+    let recipient = parse_addr(challenge["x402"]["recipient"].as_str().expect("recipient"));
+    let wsalt = parse_addr(TEST_WSALT);
+    let valid_after = U256::from(challenge["x402"]["valid_after"].as_u64().expect("valid_after"));
+    let valid_before = U256::from(challenge["x402"]["valid_before"].as_u64().expect("valid_before"));
+    let nonce_bytes = hex::decode(
+        challenge["x402"]["nonce"]
+            .as_str()
+            .expect("nonce")
+            .trim_start_matches("0x"),
+    )
+    .expect("nonce hex");
+    let nonce = H256::from_slice(&nonce_bytes);
+    let domain = x402_axum::wsalt_domain_separator(40204, wsalt);
+    let struct_hash = transfer_with_authorization_struct_hash(
+        payer,
+        recipient,
+        amount,
+        valid_after,
+        valid_before,
+        nonce,
+    );
+    let digest = eip712_digest(domain, struct_hash);
+    let mut digest_bytes = [0u8; 32];
+    digest_bytes.copy_from_slice(digest.as_bytes());
+    let (v, r, s) = sign_digest_secp256k1(secret, &digest_bytes).expect("signature");
+    encode_payment_header(&x402_axum::PaymentPayload {
+        from: payer,
+        to: recipient,
+        value: amount,
+        valid_after,
+        valid_before,
+        nonce,
+        v,
+        r: H256::from(r),
+        s: H256::from(s),
+    })
+}
+
 async fn spawn_gateway(provider_addr: SocketAddr) -> SocketAddr {
     std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
@@ -273,6 +361,32 @@ async fn submit_batch_requests(gateway: SocketAddr, requests: Vec<Value>) -> req
     client.send_paid(req).await.expect("submit")
 }
 
+/// Submit a batch with an intentionally underfunded but valid authorization.
+async fn submit_batch_underfunded(
+    gateway: SocketAddr,
+    requests: Vec<Value>,
+    amount: U256,
+) -> reqwest::Response {
+    let url = format!("http://{}/v1/batch", gateway);
+    let body = serde_json::json!({"requests": requests});
+    let http = reqwest::Client::new();
+    let challenge_response = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("challenge request");
+    assert_eq!(challenge_response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge: Value = challenge_response.json().await.expect("challenge json");
+    let header = payment_header_for_amount(&challenge, &payer_secret(), amount);
+    http.post(&url)
+        .header(X_PAYMENT_HEADER, header)
+        .json(&body)
+        .send()
+        .await
+        .expect("underfunded batch retry")
+}
+
 /// Submit a batch of `n` chat-completion requests and return
 /// `(batch_id, read_token)`. Auto-pays via X402Client. The read token
 /// (2026-05-31 audit -004) is required on every subsequent read.
@@ -314,11 +428,15 @@ async fn batch_underfunded_request_count_rejected_402() {
             })
         })
         .collect();
-    let resp = submit_batch_requests(gateway, requests).await;
+    let resp = submit_batch_underfunded(gateway, requests, U256::from(1u64)).await;
     assert_eq!(resp.status(), 402);
     let body: Value = resp.json().await.expect("json");
-    let msg = body["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("underfunded"), "got: {}", msg);
+    let body_text = body.to_string();
+    assert!(
+        body_text.contains("underfunded") || body_text.contains("below price"),
+        "got: {}",
+        body_text
+    );
 }
 
 #[tokio::test]
@@ -332,11 +450,15 @@ async fn batch_underfunded_long_prompt_rejected_402() {
         "messages": [{"role": "user", "content": "A".repeat(32 * 1024)}],
         "max_tokens": 10
     })];
-    let resp = submit_batch_requests(gateway, requests).await;
+    let resp = submit_batch_underfunded(gateway, requests, U256::from(1u64)).await;
     assert_eq!(resp.status(), 402);
     let body: Value = resp.json().await.expect("json");
-    let msg = body["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("underfunded"), "got: {}", msg);
+    let body_text = body.to_string();
+    assert!(
+        body_text.contains("underfunded") || body_text.contains("below price"),
+        "got: {}",
+        body_text
+    );
 }
 
 /// Poll until terminal state or timeout. Presents the submit-time read
@@ -567,4 +689,69 @@ async fn batch_size_limit_returns_400() {
     let body: Value = resp.json().await.expect("json");
     let msg = body["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("1000"), "got: {}", msg);
+}
+
+/// IGW-B-004 RC-8 tripwire: the batch route must not let an explicit
+/// over-ceiling budget reach pricing or provider dispatch. The sync chat route
+/// is checked in the same test to prove its existing clamp still holds at the
+/// provider boundary.
+#[tokio::test]
+async fn batch_enforces_max_tokens_ceiling_at_dispatch_boundary() {
+    let batch_observed = Arc::new(Mutex::new(Vec::new()));
+    let batch_provider = spawn_recording_provider(batch_observed.clone()).await;
+    let batch_gateway = spawn_gateway(batch_provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let facilitator = H160::from([0xfa; 20]);
+    let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).expect("hex"));
+    let batch_client =
+        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("batch client");
+    let batch_url = format!("http://{}/v1/batch", batch_gateway);
+    let batch_body = serde_json::json!({
+        "requests": [{
+            "model": "llama-3.1-8b",
+            "messages": [{"role": "user", "content": "bounded batch"}],
+            "max_tokens": u32::MAX
+        }]
+    });
+    let response = batch_client
+        .send_paid(reqwest::Client::new().post(&batch_url).json(&batch_body))
+        .await
+        .expect("batch request");
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("batch json");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("max_tokens"), "got: {}", message);
+    assert!(
+        batch_observed.lock().expect("observed mutex").is_empty(),
+        "an over-ceiling batch must not dispatch to a provider"
+    );
+
+    // Use a fresh chain/gateway because the mock settlement is intentionally
+    // single-use. This confirms the existing sync route still clamps before
+    // provider dispatch when presented with the same hostile value.
+    let chat_observed = Arc::new(Mutex::new(Vec::new()));
+    let chat_provider = spawn_recording_provider(chat_observed.clone()).await;
+    let chat_gateway = spawn_gateway(chat_provider).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chat_client =
+        X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("chat client");
+    let chat_url = format!("http://{}/v1/chat/completions", chat_gateway);
+    let chat_body = serde_json::json!({
+        "model": "llama-3.1-8b",
+        "messages": [{"role": "user", "content": "bounded chat"}],
+        "max_tokens": u32::MAX
+    });
+    let response = chat_client
+        .send_paid(reqwest::Client::new().post(&chat_url).json(&chat_body))
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), 200);
+    let dispatched = chat_observed.lock().expect("observed mutex").clone();
+    assert_eq!(dispatched.len(), 1);
+    assert!(
+        dispatched[0] <= 8_192,
+        "chat provider budget exceeded ceiling: {}",
+        dispatched[0]
+    );
 }

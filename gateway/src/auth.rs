@@ -39,7 +39,7 @@ use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
 
-use x402_axum::{PricingStrategy, X402Paid};
+use x402_axum::{buffer_request_body, request_for_pricing, PricingStrategy, X402Paid};
 
 /// RM-G2.3 / WP-G2.5 (audit F-3): hash the bearer key before
 /// storing or looking up. Pre-fix we keyed `ApiKeyStore` by the
@@ -531,7 +531,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let store = self.store.clone();
         let pricing = self.pricing.clone();
         // Clone-before-replace pattern (same as X402Layer).
@@ -561,8 +561,14 @@ where
                 return Ok(build_401("api key revoked"));
             }
 
+            let request_body = match buffer_request_body(&mut req).await {
+                Ok(bytes) => bytes,
+                Err(e) => return Ok(build_400(&e)),
+            };
+            let pricing_request = request_for_pricing(&req, request_body);
+
             // Price the request — same strategy x402 would use.
-            let price = match pricing.price_for(&req).await {
+            let price = match pricing.price_for(&pricing_request).await {
                 Ok(p) => p,
                 Err(e) => return Ok(build_400(&e.to_string())),
             };

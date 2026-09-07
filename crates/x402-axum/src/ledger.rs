@@ -17,14 +17,12 @@
 //! single gateway process (see `GATEWAY_DEPLOY_HANDOFF.md`); revisit when
 //! that changes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use ethereum_types::H256;
 
-/// Upper bound on outstanding (unconsumed, unexpired) challenges. At the
-/// default 300 s TTL this allows ~330 challenge mints per second sustained
-/// before eviction kicks in — far above any legitimate load.
+/// Upper bound on outstanding (unconsumed, unexpired) challenges.
 pub const DEFAULT_MAX_OUTSTANDING: usize = 100_000;
 
 /// Why a nonce was refused.
@@ -34,53 +32,145 @@ pub enum NonceLedgerError {
     Unknown,
     /// Issued, but its challenge TTL has elapsed.
     Expired,
+    /// The payment reused a valid nonce for a different method/path/body.
+    RequestMismatch,
 }
 
 /// Thread-safe ledger of issued challenge nonces → expiry (unix seconds).
 pub struct NonceLedger {
-    inner: Mutex<HashMap<H256, u64>>,
+    inner: Mutex<LedgerState>,
     max_outstanding: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LedgerEntry {
+    expires_at: u64,
+    sequence: u64,
+    request_commitment: H256,
+}
+
+struct LedgerState {
+    entries: HashMap<H256, LedgerEntry>,
+    insertion_order: BTreeMap<u64, H256>,
+    next_sequence: u64,
 }
 
 impl NonceLedger {
     pub fn new(max_outstanding: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(LedgerState {
+                entries: HashMap::new(),
+                insertion_order: BTreeMap::new(),
+                next_sequence: 0,
+            }),
             max_outstanding,
         }
     }
 
     /// Record a freshly minted challenge nonce. Prunes expired entries; if
-    /// the ledger is still full, evicts the soonest-to-expire entry so a
-    /// mint can never fail (the evicted challenge simply re-challenges).
+    /// the ledger is still full, evicts the newest live entry. Preserving
+    /// older challenges prevents an unpaid challenge flood from invalidating
+    /// a payer's already-issued approval window.
     pub fn record(&self, nonce: H256, expires_at: u64, now: u64) {
-        let mut map = self.inner.lock().expect("nonce ledger poisoned");
-        if map.len() >= self.max_outstanding {
-            map.retain(|_, exp| *exp > now);
+        self.record_bound(nonce, H256::zero(), expires_at, now);
+    }
+
+    /// Record a challenge nonce bound to one exact request commitment.
+    pub fn record_bound(
+        &self,
+        nonce: H256,
+        request_commitment: H256,
+        expires_at: u64,
+        now: u64,
+    ) {
+        if self.max_outstanding == 0 {
+            return;
         }
-        if map.len() >= self.max_outstanding {
-            if let Some(soonest) = map.iter().min_by_key(|(_, exp)| **exp).map(|(n, _)| *n) {
-                map.remove(&soonest);
+
+        let mut state = self.inner.lock().expect("nonce ledger poisoned");
+
+        // A repeated nonce is not expected from the challenge generator, but
+        // removing it first keeps the two indexes consistent if that ever
+        // occurs.
+        if let Some(previous) = state.entries.remove(&nonce) {
+            state.insertion_order.remove(&previous.sequence);
+        }
+
+        if state.entries.len() >= self.max_outstanding {
+            let expired_sequences: Vec<_> = state
+                .entries
+                .iter()
+                .filter_map(|(_, entry)| (entry.expires_at <= now).then_some(entry.sequence))
+                .collect();
+            for sequence in expired_sequences {
+                state.insertion_order.remove(&sequence);
             }
+            state.entries.retain(|_, entry| entry.expires_at > now);
         }
-        map.insert(nonce, expires_at);
+
+        while state.entries.len() >= self.max_outstanding {
+            let Some((&sequence, &candidate)) = state.insertion_order.iter().next_back() else {
+                break;
+            };
+            state.insertion_order.remove(&sequence);
+            state.entries.remove(&candidate);
+        }
+
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        state.entries.insert(
+            nonce,
+            LedgerEntry {
+                expires_at,
+                sequence,
+                request_commitment,
+            },
+        );
+        state.insertion_order.insert(sequence, nonce);
     }
 
     /// Consume an issued nonce: present + unexpired → removed and Ok.
     /// Removal happens on first use, so a second payment with the same
     /// nonce — even before the first settles — sees `Unknown`.
     pub fn consume(&self, nonce: &H256, now: u64) -> Result<(), NonceLedgerError> {
-        let mut map = self.inner.lock().expect("nonce ledger poisoned");
-        match map.remove(nonce) {
+        self.consume_bound(nonce, &H256::zero(), now)
+    }
+
+    /// Consume an issued nonce only when it is still live and is being used
+    /// for the exact request that minted it. A commitment mismatch leaves the
+    /// nonce available for the legitimate retry.
+    pub fn consume_bound(
+        &self,
+        nonce: &H256,
+        request_commitment: &H256,
+        now: u64,
+    ) -> Result<(), NonceLedgerError> {
+        let mut state = self.inner.lock().expect("nonce ledger poisoned");
+        match state.entries.get(nonce).copied() {
             None => Err(NonceLedgerError::Unknown),
-            Some(expires_at) if expires_at <= now => Err(NonceLedgerError::Expired),
-            Some(_) => Ok(()),
+            Some(entry) if entry.expires_at <= now => {
+                state.entries.remove(nonce);
+                state.insertion_order.remove(&entry.sequence);
+                Err(NonceLedgerError::Expired)
+            }
+            Some(entry) if entry.request_commitment != *request_commitment => {
+                Err(NonceLedgerError::RequestMismatch)
+            }
+            Some(entry) => {
+                state.entries.remove(nonce);
+                state.insertion_order.remove(&entry.sequence);
+                Ok(())
+            }
         }
     }
 
     /// Outstanding (recorded, not yet consumed) nonce count.
     pub fn outstanding(&self) -> usize {
-        self.inner.lock().expect("nonce ledger poisoned").len()
+        self.inner
+            .lock()
+            .expect("nonce ledger poisoned")
+            .entries
+            .len()
     }
 }
 
@@ -115,7 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn full_ledger_prunes_expired_then_evicts_soonest() {
+    fn request_mismatch_does_not_consume_live_nonce() {
+        let ledger = NonceLedger::new(8);
+        ledger.record_bound(n(3), n(4), 1_000, 500);
+        assert_eq!(
+            ledger.consume_bound(&n(3), &n(5), 600),
+            Err(NonceLedgerError::RequestMismatch)
+        );
+        assert_eq!(ledger.consume_bound(&n(3), &n(4), 600), Ok(()));
+    }
+
+    #[test]
+    fn full_ledger_prunes_expired_then_evicts_newest() {
         let ledger = NonceLedger::new(2);
         ledger.record(n(1), 100, 0); // will be expired by now=200
         ledger.record(n(2), 1_000, 0);
@@ -123,10 +224,11 @@ mod tests {
         ledger.record(n(3), 2_000, 200);
         assert_eq!(ledger.outstanding(), 2);
         assert_eq!(ledger.consume(&n(1), 200), Err(NonceLedgerError::Unknown));
-        // Full with nothing expired → soonest expiry (n(2)) evicted.
+        // Full with nothing expired → newest entry (n(3)) evicted, preserving
+        // the older live challenge n(2).
         ledger.record(n(4), 3_000, 200);
-        assert_eq!(ledger.consume(&n(2), 200), Err(NonceLedgerError::Unknown));
-        assert_eq!(ledger.consume(&n(3), 200), Ok(()));
+        assert_eq!(ledger.consume(&n(2), 200), Ok(()));
+        assert_eq!(ledger.consume(&n(3), 200), Err(NonceLedgerError::Unknown));
         assert_eq!(ledger.consume(&n(4), 200), Ok(()));
     }
 }

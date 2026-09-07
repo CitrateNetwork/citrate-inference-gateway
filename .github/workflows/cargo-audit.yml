@@ -31,10 +31,6 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
-        # REM-16b (arkworks bump needed):
-        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI injection
-        #   via ark-relations 0.4 transitive. See audit.toml.
-        run: |
-          cargo audit \
-            --color always \
-            --ignore RUSTSEC-2025-0055
+        # The runner validates every exception's expiry/reason and mirrors it
+        # against audit.toml before invoking cargo audit --deny warnings.
+        run: python3 scripts/ci/run_cargo_audit.py
