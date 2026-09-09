@@ -36,7 +36,7 @@ Community Use" means:
    d. the deployment remains at or below 25 nodes and 250 user accounts or
       wallet accounts;
    e. any fork or derivative removes or replaces Citrate, Citrate OpenWallet,
-      SALT, Citrate Inc., and related branding unless separately licensed in
+      SALT, and related Citrate branding unless separately licensed in
       writing.
 
 For clarity, the Additional Use Grant does not permit, without separate written
@@ -47,7 +47,7 @@ permission from Citrate Inc.:
 - any use in connection with a revenue-generating or fee-generating offering;
 - any production use by or for a commercial entity except as expressly allowed
   above;
-- use of Citrate, Citrate OpenWallet, SALT, Citrate Inc. marks, logos, or
+- use of Citrate, Citrate OpenWallet, SALT marks, logos, or
   confusingly similar branding;
 - offering commercial support, managed hosting, or institutional rollout
   services built on the Licensed Work.
@@ -57,17 +57,17 @@ Partnerships@Citrate.ai
 
 Change Date: 2030-04-01
 
-Change License: GPL-2.0-or-later
+Change License: Apache-2.0
 
 Notice on patents, trademarks, and reserved rights:
 
-This License does not grant trademark rights. See TRADEMARK_POLICY.md.
+This License does not grant trademark rights. See TRADEMARK.md.
 No express or implied patent license is granted except as may be required by law.
 Certain mechanisms and designs embodied in the Licensed Work, including but not
 limited to consensus mechanisms, AI-native precompile interfaces, ZK verifiable
 compute flows, embedded-node application architecture, and agent harness
 architecture, may be the subject of filed, pending, or future patent claims or
-applications by Citrate Inc. or its affiliates. See PATENT_NOTICE.md.
+applications by Citrate Inc. or its affiliates. See PATENTS.md.
 
 ---
 
