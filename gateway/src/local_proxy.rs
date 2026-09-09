@@ -68,6 +68,13 @@ pub struct LocalProxyState {
     /// case (`http://127.0.0.1:8181`). On the production droplet this
     /// is `<DGX-tailscale>, <local-CPU>`.
     pub upstreams: Vec<String>,
+    /// Optional dedicated upstream(s) for `/v1/embeddings`. The chat
+    /// upstreams serve a generative model (Gemma) that does not answer
+    /// the embeddings endpoint; embeddings are served by a separate
+    /// llama-server (bge-m3) on its own port. When non-empty, embeddings
+    /// requests are routed here instead of `upstreams`; when empty they
+    /// fall back to `upstreams` (preserving prior behavior).
+    pub embed_upstreams: Vec<String>,
     /// HTTP client used to talk to the upstream(s).
     pub http: reqwest::Client,
 }
@@ -90,8 +97,16 @@ impl LocalProxyState {
         Self {
             store,
             upstreams,
+            embed_upstreams: Vec::new(),
             http,
         }
+    }
+
+    /// Set dedicated `/v1/embeddings` upstream(s). Empty is a no-op
+    /// (embeddings keep falling back to the chat upstreams).
+    pub fn with_embed_upstreams(mut self, embed_upstreams: Vec<String>) -> Self {
+        self.embed_upstreams = embed_upstreams;
+        self
     }
 }
 
@@ -201,9 +216,21 @@ async fn proxy_handler(
     // Try each upstream in order. Connection-level failure or a 5xx
     // status falls over to the next. 2xx/3xx/4xx from an upstream is
     // authoritative — return immediately.
+    // Route embeddings to the dedicated bge-m3 upstream when configured;
+    // the chat upstreams (Gemma) don't answer /v1/embeddings. Everything
+    // else (chat completions, /v1/models) uses the chat upstreams. Match
+    // the path segment, not a substring, so only the embeddings route is
+    // diverted.
+    let is_embeddings = uri.path().rsplit('/').next() == Some("embeddings");
+    let selected_upstreams = if is_embeddings && !state.embed_upstreams.is_empty() {
+        &state.embed_upstreams
+    } else {
+        &state.upstreams
+    };
+
     let mut last_err: Option<String> = None;
     let mut upstream_resp = None;
-    for upstream in &state.upstreams {
+    for upstream in selected_upstreams {
         let url = format!("{}{}", upstream.trim_end_matches('/'), path_q);
         let attempt = state
             .http
@@ -584,6 +611,82 @@ mod tests {
             .unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains(r#""content":"OK""#), "got: {s}");
+    }
+
+    /// `/v1/embeddings` goes to the dedicated embed upstream (bge-m3);
+    /// `/v1/chat/completions` stays on the chat upstream (Gemma). Neither
+    /// crosses over.
+    #[tokio::test]
+    async fn embeddings_route_to_embed_upstream() {
+        let chat_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let embed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chat_addr = spawn_recording_upstream(chat_paths.clone()).await;
+        let embed_addr = spawn_recording_upstream(embed_paths.clone()).await;
+
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("embed-route", 0, 0).unwrap();
+        let state = LocalProxyState::new(store, vec![format!("http://{chat_addr}")])
+            .with_embed_upstreams(vec![format!("http://{embed_addr}")]);
+        let app = build_local_proxy_router(state);
+
+        for path in ["/v1/embeddings", "/v1/chat/completions"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "path {path}");
+        }
+
+        let embed_hits = embed_paths.lock().unwrap().clone();
+        let chat_hits = chat_paths.lock().unwrap().clone();
+        assert_eq!(embed_hits, vec!["/v1/embeddings".to_string()], "embed upstream");
+        assert_eq!(
+            chat_hits,
+            vec!["/v1/chat/completions".to_string()],
+            "chat upstream"
+        );
+    }
+
+    /// With no embed upstream configured, `/v1/embeddings` falls back to the
+    /// chat upstreams (prior behavior — no silent black hole).
+    #[tokio::test]
+    async fn embeddings_fall_back_to_chat_upstream_when_unset() {
+        let chat_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chat_addr = spawn_recording_upstream(chat_paths.clone()).await;
+
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("embed-fallback", 0, 0).unwrap();
+        let state = LocalProxyState::new(store, vec![format!("http://{chat_addr}")]);
+        let app = build_local_proxy_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            chat_paths.lock().unwrap().clone(),
+            vec!["/v1/embeddings".to_string()]
+        );
     }
 
     #[tokio::test]

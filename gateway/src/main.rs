@@ -61,6 +61,16 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     if upstreams.is_empty() {
         return Err("CITRATE_GATEWAY_UPSTREAM_URL must list at least one upstream".into());
     }
+    // Optional dedicated upstream(s) for /v1/embeddings. The chat upstreams
+    // serve a generative model (Gemma) that does not answer the embeddings
+    // endpoint; bge-m3 runs on its own llama-server. Unset → embeddings fall
+    // back to the chat upstreams (prior behavior).
+    let embed_upstreams: Vec<String> = env::var("CITRATE_GATEWAY_EMBED_UPSTREAM_URL")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let keystore_path = env::var("CITRATE_GATEWAY_KEYSTORE_PATH")
         .unwrap_or_else(|_| "/var/lib/citrate-gateway/keystore".to_string());
     // Default to loopback in local-proxy mode — Caddy terminates TLS and
@@ -74,7 +84,8 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key_source): (Arc<PersistentKeyStore>, _) =
         citrate_gateway::keyvault::open_store(&keystore_path)?;
     tracing::info!(key_source = %key_source, "money-store master key sourced");
-    let state = LocalProxyState::new(store, upstreams.clone());
+    let state =
+        LocalProxyState::new(store, upstreams.clone()).with_embed_upstreams(embed_upstreams.clone());
     let app = build_local_proxy_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -85,6 +96,7 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         addr = %listener.local_addr()?,
         upstreams = ?upstreams,
+        embed_upstreams = ?embed_upstreams,
         keystore = %keystore_path,
         mode = "local-proxy",
         "gateway listening"
