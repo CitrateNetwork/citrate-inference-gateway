@@ -7,3 +7,45 @@ release/
 !.env.example
 *.log
 .DS_Store
+
+# ─────────────────────────────────────────────────────────────────────
+# Open-source hygiene — secret material & internal records (added 2026-09)
+# History was scrubbed of these; this block prevents re-introduction.
+# ─────────────────────────────────────────────────────────────────────
+
+# Secret material — never in a public repo
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.p8
+*.der
+id_rsa
+id_ed25519
+*_private*.pem
+*private_key*
+*jwks*.json
+**/secrets.json
+**/secrets.yaml
+**/secrets.yml
+**/secrets.toml
+mnemonic*
+*seed-phrase*
+*seed_phrase*
+
+# Internal process / institutional-knowledge records — not for public repos
+.agentile/
+handoffs/
+**/*HANDOFF*
+**/*_HANDOFF*
+**/*INCIDENT*
+**/*EXEC_STATUS*
+**/*COUNSEL*
+**/*DEPLOY_LOG*
