@@ -96,4 +96,4 @@ version published in this repository is authoritative.
 
 ---
 
-© 2026 Citrate Inc.. All rights reserved.
+© 2026 Citrate Inc. All rights reserved.

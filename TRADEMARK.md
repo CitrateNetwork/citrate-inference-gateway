@@ -47,7 +47,7 @@ accurate, non-misleading, and do not imply endorsement:
 - Internal documentation that names the marks to identify the upstream project.
 
 When making nominative use, please attribute as: *"Citrate and Citrate OpenWallet
-are trademarks of Citrate Inc.."*
+are trademarks of Citrate Inc."*
 
 ## Forks and derivatives
 
@@ -79,4 +79,4 @@ Citrate Inc. actively monitors and enforces its marks.
 
 ---
 
-© 2026 Citrate Inc.. All rights reserved.
+© 2026 Citrate Inc. All rights reserved.
