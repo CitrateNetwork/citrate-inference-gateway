@@ -1,0 +1,69 @@
+Citrate Network
+Citrate-Labs federation
+© 2026 Citrate Inc. All rights reserved.
+
+This product and its companion components — including but not limited to citrate-chain,
+citrate-native, citrate-learning-center, citrate-wallet-extension, citrate-buyer-webapp,
+citrate-dashboard, citrate-boeing-shell, citrate-inference-gateway, citrate-compute-pool,
+citrate-agent-runtime, citrate-simulation, citrate-sdk-js, citrate-sdk-python,
+citrate-sdk-marketplace, citrate-docs, citrate-commercial, citrate-compliance,
+citrate-federation, and citrate-agentile-archive — together constitute the "Citrate Network"
+and are collectively the "Licensed Work."
+
+The Licensed Work is licensed under the Business Source License 1.1 with the Citrate
+Additional Use Grant. See LICENSE.
+
+Reservation of rights
+=====================
+
+Except for the limited rights granted in the LICENSE and any separately negotiated written
+agreement, Citrate Inc. reserves all right, title, and interest in and to the Licensed
+Work, including without limitation:
+
+  * copyrights in source code, binaries, generated artifacts, documentation, design
+    assets, formal specifications, audit reports, training materials, and the curated
+    organization of the federation itself;
+  * patent rights in mechanisms, designs, protocols, architectures, and interfaces
+    embodied or described in the Licensed Work, whether issued, pending, or filed in
+    the future;
+  * trademarks, service marks, trade names, logos, and trade dress associated with
+    Citrate, Citrate OpenWallet, SALT, and the federation's
+    components;
+  * trade secrets and confidential know-how disclosed in connection with the Licensed
+    Work or its operation;
+  * sui generis database rights in any compiled datasets, registries, and indexes
+    distributed with the Licensed Work.
+
+Defense of intellectual property
+================================
+
+Citrate Inc. actively monitors and enforces its intellectual-property rights. Use of
+the Licensed Work outside the scope of the LICENSE — including any commercial, hosted,
+managed, white-labeled, or revenue-generating use, or any use that violates the trademark
+or patent reservations described in PATENTS.md and TRADEMARK.md — is unauthorized and
+will be pursued through all available legal channels.
+
+Contributors
+============
+
+Contributions to the Licensed Work are accepted under the Contributor License Agreement
+referenced in CONTRIBUTING.md. By submitting a contribution, contributors grant Citrate Inc. a perpetual, worldwide, royalty-free license to relicense and sublicense
+the contribution as part of the Licensed Work, and represent that the contribution is
+either their original work or properly attributed.
+
+Third-party components
+======================
+
+The Licensed Work incorporates third-party components that are separately licensed under
+their own terms (typically Apache-2.0, MIT, BSD, or compatible OSI-approved licenses).
+Those components are not subject to the Citrate Additional Use Grant; see each
+component's accompanying license file for the governing terms.
+
+Contact
+=======
+
+Partnerships, commercial licensing, IP, and enforcement inquiries:
+  Partnerships@Citrate.ai
+
+Security and vulnerability disclosure:
+  security@citrate.ai  (see SECURITY.md)
