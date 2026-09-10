@@ -41,7 +41,6 @@ mnemonic*
 *seed_phrase*
 
 # Internal process / institutional-knowledge records — not for public repos
-.agentile/
 handoffs/
 **/*HANDOFF*
 **/*_HANDOFF*
