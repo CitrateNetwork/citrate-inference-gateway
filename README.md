@@ -1,5 +1,7 @@
 # citrate-inference-gateway
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > An OpenAI-compatible HTTP gateway for the Citrate Network — serve
 > `/v1/chat/completions`, `/v1/embeddings`, and `/v1/batch` either by proxying a
 > local model server or by dispatching x402-gated jobs onto the on-chain compute
