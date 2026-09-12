@@ -71,6 +71,22 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    // Optional dedicated Whisper backend(s) for POST /v1/audio/transcriptions.
+    // These speak the OpenAI transcription shape (whisper.cpp whisper-server /
+    // faster-whisper). Unlike embeddings, STT does NOT fall back to the chat
+    // upstreams — unset → the STT route returns a clean 503. The upstream
+    // subpath defaults to /v1/audio/transcriptions and is overridable via
+    // CITRATE_GATEWAY_STT_SUBPATH for backends that only expose /inference.
+    let stt_upstreams: Vec<String> = env::var("CITRATE_GATEWAY_STT_URL")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let stt_subpath = env::var("CITRATE_GATEWAY_STT_SUBPATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let keystore_path = env::var("CITRATE_GATEWAY_KEYSTORE_PATH")
         .unwrap_or_else(|_| "/var/lib/citrate-gateway/keystore".to_string());
     // Default to loopback in local-proxy mode — Caddy terminates TLS and
@@ -84,8 +100,9 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key_source): (Arc<PersistentKeyStore>, _) =
         citrate_gateway::keyvault::open_store(&keystore_path)?;
     tracing::info!(key_source = %key_source, "money-store master key sourced");
-    let state =
-        LocalProxyState::new(store, upstreams.clone()).with_embed_upstreams(embed_upstreams.clone());
+    let state = LocalProxyState::new(store, upstreams.clone())
+        .with_embed_upstreams(embed_upstreams.clone())
+        .with_stt(stt_upstreams.clone(), stt_subpath.clone());
     let app = build_local_proxy_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -97,6 +114,8 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
         addr = %listener.local_addr()?,
         upstreams = ?upstreams,
         embed_upstreams = ?embed_upstreams,
+        stt_upstreams = ?stt_upstreams,
+        stt_subpath = %stt_subpath.as_deref().unwrap_or("/v1/audio/transcriptions"),
         keystore = %keystore_path,
         mode = "local-proxy",
         "gateway listening"

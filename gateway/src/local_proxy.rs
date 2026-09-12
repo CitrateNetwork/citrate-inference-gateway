@@ -12,6 +12,12 @@
 //! - Anything under `/v1/*` — requires a valid `cgk_` bearer; proxied
 //!   verbatim to `CITRATE_GATEWAY_UPSTREAM_URL`. SSE responses stream
 //!   through chunk-by-chunk (no buffering).
+//! - `POST /v1/audio/transcriptions` — same `cgk_` bearer gate; the
+//!   multipart body (OpenAI Whisper shape: `file` + optional `model` /
+//!   `language` / `response_format`) is forwarded verbatim to a dedicated
+//!   Whisper backend (`CITRATE_GATEWAY_STT_URL`, subpath overridable via
+//!   `CITRATE_GATEWAY_STT_SUBPATH`). Unlike embeddings this does NOT fall
+//!   back to the chat upstreams; when unconfigured the route returns 503.
 //!
 //! # Outcomes
 //!
@@ -19,6 +25,8 @@
 //! - Unknown or revoked key → **401**.
 //! - Per-second rate exceeded → **429** + `Retry-After: 1`.
 //! - Daily quota exceeded → **429** + `Retry-After: <seconds-until-UTC-midnight>`.
+//! - `POST /v1/audio/transcriptions` with `CITRATE_GATEWAY_STT_URL` unset
+//!   → **503** `{"error":{"message":"STT not configured","type":"stt_unavailable"}}`.
 //! - Upstream unreachable / 5xx → **502**.
 //! - Otherwise → upstream's status + body forwarded.
 
@@ -57,6 +65,22 @@ const HOP_BY_HOP: &[&str] = &[
 /// stops a malformed client from forcing the proxy to buffer megabytes.
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 
+/// Cap on `POST /v1/audio/transcriptions` bodies. Audio uploads are the one
+/// route where the 8 MiB chat cap is too small — OpenAI's own Whisper API
+/// accepts files up to 25 MB, so we allow 32 MiB of multipart body. The body
+/// is still buffered (not streamed) so the upstream-failover retry loop can
+/// re-send it, matching the existing passthrough style.
+const MAX_STT_BODY: usize = 32 * 1024 * 1024;
+
+/// Default upstream subpath the STT route forwards to. whisper.cpp's
+/// `whisper-server` and faster-whisper's OpenAI-compatible server both serve
+/// `/v1/audio/transcriptions`; operators fronting a backend that only exposes
+/// `/inference` override this via `CITRATE_GATEWAY_STT_SUBPATH`.
+const DEFAULT_STT_SUBPATH: &str = "/v1/audio/transcriptions";
+
+/// The one route (OpenAI Whisper shape) diverted to the STT backend.
+const STT_TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
+
 /// Shared state for the local-proxy router. Cheap to clone (all Arc / Client).
 #[derive(Clone)]
 pub struct LocalProxyState {
@@ -75,6 +99,17 @@ pub struct LocalProxyState {
     /// requests are routed here instead of `upstreams`; when empty they
     /// fall back to `upstreams` (preserving prior behavior).
     pub embed_upstreams: Vec<String>,
+    /// Dedicated upstream(s) for `POST /v1/audio/transcriptions`. These speak
+    /// the OpenAI Whisper transcription shape (whisper.cpp `whisper-server` /
+    /// faster-whisper). Sourced from `CITRATE_GATEWAY_STT_URL`. Unlike
+    /// `embed_upstreams`, STT does NOT fall back to the chat upstreams — a
+    /// generative Gemma llama-server cannot answer a transcription request —
+    /// so when this is empty the STT route returns a clean 503 rather than
+    /// forwarding to a backend that would 404/500.
+    pub stt_upstreams: Vec<String>,
+    /// Upstream subpath STT requests are forwarded to. Defaults to
+    /// [`DEFAULT_STT_SUBPATH`]; overridable via `CITRATE_GATEWAY_STT_SUBPATH`.
+    pub stt_subpath: String,
     /// HTTP client used to talk to the upstream(s).
     pub http: reqwest::Client,
 }
@@ -98,6 +133,8 @@ impl LocalProxyState {
             store,
             upstreams,
             embed_upstreams: Vec::new(),
+            stt_upstreams: Vec::new(),
+            stt_subpath: DEFAULT_STT_SUBPATH.to_string(),
             http,
         }
     }
@@ -106,6 +143,19 @@ impl LocalProxyState {
     /// (embeddings keep falling back to the chat upstreams).
     pub fn with_embed_upstreams(mut self, embed_upstreams: Vec<String>) -> Self {
         self.embed_upstreams = embed_upstreams;
+        self
+    }
+
+    /// Set dedicated `POST /v1/audio/transcriptions` upstream(s) and,
+    /// optionally, the upstream subpath to forward to. Empty `stt_upstreams`
+    /// leaves the STT route returning 503 (unconfigured — it does NOT fall
+    /// back to the chat upstreams). An empty/whitespace `stt_subpath` keeps
+    /// the [`DEFAULT_STT_SUBPATH`] default.
+    pub fn with_stt(mut self, stt_upstreams: Vec<String>, stt_subpath: Option<String>) -> Self {
+        self.stt_upstreams = stt_upstreams;
+        if let Some(sub) = stt_subpath.filter(|s| !s.trim().is_empty()) {
+            self.stt_subpath = sub;
+        }
         self
     }
 }
@@ -205,7 +255,12 @@ async fn proxy_handler(
     forward.remove(header::HOST);
     strip_hop_by_hop(&mut forward);
 
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+    // STT (`POST /v1/audio/transcriptions`) carries an audio upload, so it
+    // gets the larger MAX_STT_BODY cap; every other route keeps the 8 MiB chat
+    // cap. Detected here so the cap is chosen before the body is buffered.
+    let is_stt = is_stt_transcriptions(&method, uri.path());
+    let max_body = if is_stt { MAX_STT_BODY } else { MAX_REQUEST_BODY };
+    let body_bytes = match axum::body::to_bytes(body, max_body).await {
         Ok(b) => b,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
     };
@@ -221,17 +276,34 @@ async fn proxy_handler(
     // else (chat completions, /v1/models) uses the chat upstreams. Match
     // the path segment, not a substring, so only the embeddings route is
     // diverted.
+    // STT is routed to its own Whisper backend and, unlike embeddings, never
+    // falls back to the chat upstreams (Gemma can't transcribe audio) — an
+    // unconfigured STT backend is a clean 503, not a forward that would
+    // 404/500. STT also forwards to a fixed (overridable) subpath rather than
+    // echoing the request path, so a whisper-server exposing `/inference`
+    // instead of `/v1/audio/transcriptions` is reachable via config alone.
     let is_embeddings = uri.path().rsplit('/').next() == Some("embeddings");
-    let selected_upstreams = if is_embeddings && !state.embed_upstreams.is_empty() {
-        &state.embed_upstreams
+    let (selected_upstreams, forward_subpath): (&Vec<String>, Option<&str>) = if is_stt {
+        if state.stt_upstreams.is_empty() {
+            return stt_unavailable();
+        }
+        (&state.stt_upstreams, Some(state.stt_subpath.as_str()))
+    } else if is_embeddings && !state.embed_upstreams.is_empty() {
+        (&state.embed_upstreams, None)
     } else {
-        &state.upstreams
+        (&state.upstreams, None)
     };
 
     let mut last_err: Option<String> = None;
     let mut upstream_resp = None;
     for upstream in selected_upstreams {
-        let url = format!("{}{}", upstream.trim_end_matches('/'), path_q);
+        // STT forwards to the configured subpath; every other route echoes the
+        // client path (+ query). `path_and_query` for STT is ignored because
+        // Whisper params travel as multipart form fields, not query string.
+        let url = match forward_subpath {
+            Some(subpath) => format!("{}{}", upstream.trim_end_matches('/'), subpath),
+            None => format!("{}{}", upstream.trim_end_matches('/'), path_q),
+        };
         let attempt = state
             .http
             .request(reqw_method.clone(), &url)
@@ -357,6 +429,31 @@ fn rate_limited(retry_after_secs: u64, msg: &str) -> Response<Body> {
     if let Ok(v) = retry_after_secs.to_string().parse() {
         r.headers_mut().insert(header::RETRY_AFTER, v);
     }
+    r
+}
+
+/// True for the one OpenAI Whisper route we divert to the STT backend:
+/// `POST /v1/audio/transcriptions`. GET/other methods on the same path fall
+/// through to the normal passthrough (and thus the chat upstreams).
+fn is_stt_transcriptions(method: &Method, path: &str) -> bool {
+    *method == Method::POST && path == STT_TRANSCRIPTIONS_PATH
+}
+
+/// 503 returned when `POST /v1/audio/transcriptions` is requested but no STT
+/// backend is configured (`CITRATE_GATEWAY_STT_URL` unset). Carries the
+/// documented `type` discriminator so callers can distinguish it from a
+/// generic gateway error. Never panics.
+fn stt_unavailable() -> Response<Body> {
+    let body = serde_json::json!({
+        "error": { "message": "STT not configured", "type": "stt_unavailable" }
+    })
+    .to_string();
+    let mut r = Response::new(Body::from(body));
+    *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().expect("static"),
+    );
     r
 }
 
@@ -766,6 +863,154 @@ mod tests {
         assert!(
             paths.lock().expect("paths mutex").is_empty(),
             "dot-segment requests must never reach the upstream"
+        );
+    }
+
+    /// `POST /v1/audio/transcriptions` with no STT backend configured returns
+    /// a clean 503 (documented `type`) and never forwards to the chat
+    /// upstreams — a Gemma llama-server can't transcribe audio.
+    #[tokio::test]
+    async fn stt_unconfigured_returns_503() {
+        let chat_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chat_addr = spawn_recording_upstream(chat_paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("stt-unset", 0, 0).unwrap();
+        // No `.with_stt(...)` — STT is unconfigured.
+        let state = LocalProxyState::new(store, vec![format!("http://{chat_addr}")]);
+        let app = build_local_proxy_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=X")
+                    .body(Body::from("--X--\r\n"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains(r#""type":"stt_unavailable""#), "got: {s}");
+        assert!(s.contains("STT not configured"), "got: {s}");
+        assert!(
+            chat_paths.lock().unwrap().is_empty(),
+            "STT must never fall through to the chat upstream"
+        );
+    }
+
+    /// With an STT backend configured, `POST /v1/audio/transcriptions` is
+    /// forwarded to the STT upstream (default subpath), NOT the chat upstream.
+    #[tokio::test]
+    async fn stt_routes_to_stt_upstream() {
+        let chat_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stt_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chat_addr = spawn_recording_upstream(chat_paths.clone()).await;
+        let stt_addr = spawn_recording_upstream(stt_paths.clone()).await;
+
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("stt-route", 0, 0).unwrap();
+        let state = LocalProxyState::new(store, vec![format!("http://{chat_addr}")])
+            .with_stt(vec![format!("http://{stt_addr}")], None);
+        let app = build_local_proxy_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=X")
+                    .body(Body::from("--X--\r\n"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            stt_paths.lock().unwrap().clone(),
+            vec!["/v1/audio/transcriptions".to_string()],
+            "STT upstream"
+        );
+        assert!(
+            chat_paths.lock().unwrap().is_empty(),
+            "chat upstream must not see the STT request"
+        );
+    }
+
+    /// `CITRATE_GATEWAY_STT_SUBPATH` override: the STT request is forwarded to
+    /// the configured subpath (e.g. whisper.cpp's `/inference`) rather than the
+    /// default `/v1/audio/transcriptions`.
+    #[tokio::test]
+    async fn stt_subpath_override_is_respected() {
+        let stt_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stt_addr = spawn_recording_upstream(stt_paths.clone()).await;
+
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("stt-subpath", 0, 0).unwrap();
+        let state = LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()])
+            .with_stt(
+                vec![format!("http://{stt_addr}")],
+                Some("/inference".to_string()),
+            );
+        let app = build_local_proxy_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=X")
+                    .body(Body::from("--X--\r\n"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            stt_paths.lock().unwrap().clone(),
+            vec!["/inference".to_string()]
+        );
+    }
+
+    /// The STT diversion is POST-only: a `GET /v1/audio/transcriptions` is a
+    /// normal passthrough to the chat upstreams, so it is unaffected by STT
+    /// config (and 503 gating).
+    #[tokio::test]
+    async fn stt_diversion_is_post_only() {
+        let chat_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chat_addr = spawn_recording_upstream(chat_paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("stt-get", 0, 0).unwrap();
+        // STT unconfigured — a POST would 503, but a GET must pass through.
+        let state = LocalProxyState::new(store, vec![format!("http://{chat_addr}")]);
+        let app = build_local_proxy_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            chat_paths.lock().unwrap().clone(),
+            vec!["/v1/audio/transcriptions".to_string()]
         );
     }
 }
