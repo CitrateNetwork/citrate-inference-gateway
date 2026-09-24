@@ -60,7 +60,7 @@ jobs:
     env:
       # Exposed so the SSH-setup steps below can self-skip on repos that have
       # no cross-repo SSH git deps (e.g. citrate-chain). Repos that consume
-      # private sibling crates via ssh:// host aliases (gui-native, boeing-shell)
+      # private sibling crates via ssh:// host aliases (gui-native, defense_prime-shell)
       # set these deploy-key secrets and the steps activate.
       CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
       LEARNING_CENTER_DEPLOY_KEY: ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}

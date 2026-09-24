@@ -24,10 +24,10 @@ description  = "Citrate inference gateway — x402-settled OpenAI-compatible pro
 long-description = """
 Operator daemon that fronts a fleet of inference workers behind an OpenAI-compatible HTTPS API with x402 settlement on the Citrate chain. Intended for operators running model-serving infrastructure who want on-chain settlement and rate-limiting without rolling their own.
 """
-authors  = ["Citrate Labs <support@citrate.ai>"]
+authors  = ["Citrate Inc. <support@citrate.ai>"]
 homepage = "https://citrate.ai"
 category = "DeveloperTool"
-copyright = "© 2026 Citrate Labs. BUSL-1.1."
+copyright = "© 2026 Citrate Inc. BUSL-1.1."
 # Output formats. cargo-packager skips formats whose toolchain isn't
 # present on the build host: Linux runners produce deb + appimage,
 # macOS produces app + dmg, Windows produces msi + nsis. (rpm landed

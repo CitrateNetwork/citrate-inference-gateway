@@ -24,9 +24,9 @@ in the archive.
 ## What to read, in order
 
 1. **This file** (you're here).
-2. **Federation control plane** — [`citrate-federation/agentile/AGENT_ENTRY.md`](https://github.com/CitrateNetwork/citrate-federation/blob/main/agentile/AGENT_ENTRY.md). The active control-plane entry.
-3. **Active sprint** — [`citrate-federation/agentile/CURRENT.md`](https://github.com/CitrateNetwork/citrate-federation/blob/main/agentile/CURRENT.md). What is the federation working on right now?
-4. **Core rules** — [`citrate-federation/agentile/rules/CORE_RULES.md`](https://github.com/CitrateNetwork/citrate-federation/blob/main/agentile/rules/CORE_RULES.md). Non-negotiables across the federation.
+2. **Federation control plane** — `citrate-federation/agentile/AGENT_ENTRY.md` (maintainers only; private). The active control-plane entry.
+3. **Active sprint** — `citrate-federation/agentile/CURRENT.md` (maintainers only; private). What is the federation working on right now?
+4. **Core rules** — `citrate-federation/agentile/rules/CORE_RULES.md` (maintainers only; private). Non-negotiables across the federation.
 5. **Pre-split historical context** — [`citrate-agentile-archive`](https://github.com/CitrateNetwork/citrate-agentile-archive). Read **only** when investigating the May-2026 monorepo split or earlier history.
 6. **Org defaults (SECURITY, CoC, AUDIT_POSTURE)** — [`CitrateNetwork/.github`](https://github.com/CitrateNetwork/.github).
 
@@ -60,7 +60,7 @@ live here.
 
 ## Cross-repo references
 
-- **Manifest pin**: `manifest.toml` in [`citrate-federation`](https://github.com/CitrateNetwork/citrate-federation)
+- **Manifest pin**: `manifest.toml` in `citrate-federation` (maintainers only; private)
   is the canonical truth for which rev of this repo the federation is
   pinned to.
 - **Org policy**: [`CitrateNetwork/.github`](https://github.com/CitrateNetwork/.github) holds
