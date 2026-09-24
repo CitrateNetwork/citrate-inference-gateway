@@ -99,7 +99,7 @@ halo2curves = { version = "0.7.0", default-features = false, features = ["bn256-
 # (PSL-02: hoisted from per-member declarations into the workspace). When
 # chain publishes to crates.io after its first audited release, replace
 # the git spec with a semver string and bump rev pin to a real version.
-citrate-wallet-core = { git = "ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain", rev = "f4a07811940a0962325d18e8ba44fea0ff50a3b4" }
+citrate-wallet-core = { git = "https://github.com/CitrateNetwork/citrate-chain", rev = "f4a07811940a0962325d18e8ba44fea0ff50a3b4" }
 
 [profile.release]
 opt-level = 3
