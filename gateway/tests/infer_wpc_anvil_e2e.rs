@@ -102,7 +102,7 @@ async fn start_anvil() -> Option<Anvil> {
 
 async fn receipt_from(url: &str, tx: &str) -> Option<H160> {
     let http = reqwest::Client::new();
-    for _ in 0..50 {
+    for _ in 0..300 {
         let resp = http
             .post(url)
             .json(
