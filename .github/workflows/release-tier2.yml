@@ -73,7 +73,7 @@ jobs:
       # at launch with "Library not loaded: …liblzma.5.dylib … different Team IDs".
       LZMA_API_STATIC: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.inputs.release_tag || github.ref }}
           submodules: recursive
@@ -84,7 +84,7 @@ jobs:
       # can clone them. Skipped when the deploy-key secrets are absent (chain).
       - name: Setup SSH agent (cross-repo deploy keys)
         if: ${{ env.AGENT_RUNTIME_DEPLOY_KEY != '' }}
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
         with:
           ssh-private-key: |
             ${{ secrets.CHAIN_DEPLOY_KEY }}
@@ -125,8 +125,9 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # Bundled AI model — fetched per build, not stored in git (5 GB+).
@@ -134,7 +135,7 @@ jobs:
       # Cached across runs by the .gguf.sha256 + checked against it.
       - name: Cache bundled models
         id: cache-models
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: branding/models/*.gguf
           key: gguf-${{ hashFiles('branding/models/*.gguf.sha256') }}
@@ -232,7 +233,7 @@ jobs:
           Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -339,7 +340,7 @@ jobs:
           ls -la
 
       - name: Upload artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tier2-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/packages/*
@@ -353,7 +354,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine tag
         id: tag
@@ -371,7 +372,7 @@ jobs:
           fi
 
       - name: Download all artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -383,7 +384,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign installers (keyless OIDC)
         run: |
@@ -397,7 +398,7 @@ jobs:
           done
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           draft: false
