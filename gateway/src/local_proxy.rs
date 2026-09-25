@@ -1572,4 +1572,29 @@ mod tests {
             DEFAULT_MAX_CONCURRENT_UPSTREAM
         );
     }
+
+    /// An upstream 5xx falls over to the next upstream (kills the cargo-mutants
+    /// survivor on the failover guard found while mutating PBA-L3b-003/-004).
+    #[tokio::test]
+    async fn upstream_5xx_falls_over_to_the_next_upstream() {
+        let failing = serve_app(Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        ))
+        .await;
+        let good = spawn_upstream(false).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("5xx", 0, 0).unwrap();
+        let app = build_local_proxy_router(LocalProxyState::new(
+            store,
+            vec![format!("http://{failing}"), format!("http://{good}")],
+        ));
+        let resp = app.oneshot(chat(&id)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&b).contains(r#""content":"OK""#));
+    }
 }
