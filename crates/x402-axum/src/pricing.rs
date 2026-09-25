@@ -22,9 +22,7 @@ pub const MAX_PRICING_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Buffer a request body once and make it available to the pricing strategy
 /// without consuming the body that the downstream handler must receive.
-pub async fn buffer_request_body(
-    request: &mut http::Request<Body>,
-) -> Result<Bytes, String> {
+pub async fn buffer_request_body(request: &mut http::Request<Body>) -> Result<Bytes, String> {
     let body = std::mem::replace(request.body_mut(), Body::empty());
     let bytes = axum::body::to_bytes(body, MAX_PRICING_BODY_BYTES)
         .await
@@ -36,10 +34,7 @@ pub async fn buffer_request_body(
 /// Build the send-safe, body-buffered request view passed to a pricing
 /// strategy. The original request body remains restored for the downstream
 /// handler, while `Bytes` lets a strategy inspect it across async awaits.
-pub fn request_for_pricing(
-    request: &http::Request<Body>,
-    body: Bytes,
-) -> http::Request<Bytes> {
+pub fn request_for_pricing(request: &http::Request<Body>, body: Bytes) -> http::Request<Bytes> {
     let mut view = http::Request::new(body);
     *view.method_mut() = request.method().clone();
     *view.uri_mut() = request.uri().clone();
@@ -72,10 +67,7 @@ pub trait PricingStrategy: Send + Sync + std::fmt::Debug {
     /// Return the wei amount this body-buffered request costs, or an error if
     /// the request cannot be priced. `Bytes` is intentional: strategies may
     /// perform async oracle calls without holding a non-`Sync` streaming body.
-    async fn price_for(
-        &self,
-        request: &http::Request<Bytes>,
-    ) -> Result<U256, PricingError>;
+    async fn price_for(&self, request: &http::Request<Bytes>) -> Result<U256, PricingError>;
 }
 
 /// A strategy that charges the same wei amount for every request.
@@ -102,10 +94,7 @@ impl FixedPricing {
 
 #[async_trait]
 impl PricingStrategy for FixedPricing {
-    async fn price_for(
-        &self,
-        _request: &http::Request<Bytes>,
-    ) -> Result<U256, PricingError> {
+    async fn price_for(&self, _request: &http::Request<Bytes>) -> Result<U256, PricingError> {
         U256::from_dec_str(&self.amount_wei)
             .map_err(|e| PricingError::NotPriceable(format!("invalid amount: {}", e)))
     }

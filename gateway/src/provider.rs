@@ -77,8 +77,8 @@ pub fn result_binding_digest(
     let mut h = Keccak256::new();
     h.update(RESULT_SIG_DOMAIN);
     h.update(model_hash.as_bytes());
-    h.update(&prompt_hash);
-    h.update(&output_hash);
+    h.update(prompt_hash);
+    h.update(output_hash);
     h.finalize().into()
 }
 
@@ -158,11 +158,8 @@ pub async fn dispatch_to_provider(
     req: &ProviderProtocolRequest,
     timeout: Duration,
 ) -> Result<ProviderProtocolResponse, GatewayError> {
-    let guarded = validate_provider_endpoint(
-        &provider.endpoint,
-        allow_private_provider_endpoints(),
-    )
-    .await?;
+    let guarded =
+        validate_provider_endpoint(&provider.endpoint, allow_private_provider_endpoints()).await?;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
@@ -504,7 +501,9 @@ mod tests {
         let mh = ethereum_types::H256::from([0x11; 32]);
         let (addr, sig) = sign_binding(mh, "prompt", "output");
         let other_mh = ethereum_types::H256::from([0x22; 32]);
-        assert!(!verify_result_binding(addr, other_mh, "prompt", "output", &sig));
+        assert!(!verify_result_binding(
+            addr, other_mh, "prompt", "output", &sig
+        ));
     }
 
     #[test]

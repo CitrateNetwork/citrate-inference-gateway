@@ -85,13 +85,7 @@ impl UsageStore {
 
     /// Record a successful request. Atomic: one write lock covers
     /// the read-modify-write so concurrent emitters don't clobber.
-    pub async fn record(
-        &self,
-        key_id: &str,
-        input_tokens: u32,
-        output_tokens: u32,
-        grains: U256,
-    ) {
+    pub async fn record(&self, key_id: &str, input_tokens: u32, output_tokens: u32, grains: U256) {
         let date = today_utc_yyyy_mm_dd();
         let mut guard = self.rows.write().await;
         let row = guard
@@ -146,10 +140,7 @@ pub struct UsageResponse {
 /// 401. Unlike the x402-protected endpoints, this one does NOT fall
 /// through to an x402 challenge on missing auth — usage data is a
 /// per-identity resource and identity is proven only by the key.
-pub async fn usage_handler(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn usage_handler(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let Some(key_id) = extract_bearer(&headers) else {
         return error(
             StatusCode::UNAUTHORIZED,
@@ -162,9 +153,7 @@ pub async fn usage_handler(
     // revocation makes the contract simple: once revoked, no access.
     match state.keys.get(&key_id).await {
         None => return error(StatusCode::UNAUTHORIZED, "unknown api key"),
-        Some(r) if r.revoked => {
-            return error(StatusCode::UNAUTHORIZED, "api key revoked")
-        }
+        Some(r) if r.revoked => return error(StatusCode::UNAUTHORIZED, "api key revoked"),
         Some(_) => {}
     }
 
@@ -241,7 +230,6 @@ fn civil_date(secs: u64) -> String {
 
 /// Convenience alias consumed by handlers + lib wiring.
 pub type SharedUsage = Arc<UsageStore>;
-
 
 #[cfg(test)]
 mod tests {

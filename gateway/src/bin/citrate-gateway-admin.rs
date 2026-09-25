@@ -32,10 +32,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
 use citrate_gateway::keystore::PersistentKeyStore;
 use citrate_gateway::signer::{EncryptedFileSigner, OperatorWallet};
 use citrate_gateway::{keyvault, migrate};
+use clap::{Parser, Subcommand};
 use ethereum_types::{H160, U256};
 
 #[derive(Parser)]
@@ -160,7 +160,10 @@ enum Cmd {
 }
 
 /// Resolve a password from an inline value or a file (trimmed). Errors if neither.
-fn resolve_password(password: Option<String>, password_file: Option<String>) -> Result<String, String> {
+fn resolve_password(
+    password: Option<String>,
+    password_file: Option<String>,
+) -> Result<String, String> {
     if let Some(p) = password {
         return Ok(p);
     }
@@ -181,7 +184,7 @@ fn main() -> ExitCode {
             out,
             password,
             password_file,
-        } => return operator_keygen(out, password, password_file),
+        } => operator_keygen(out, password, password_file),
         Cmd::OperatorDispatch {
             rpc,
             chain_id,
@@ -193,20 +196,18 @@ fn main() -> ExitCode {
             payment_wei,
             max_price_wei,
             job_spec,
-        } => {
-            return operator_dispatch(OperatorDispatchArgs {
-                rpc,
-                chain_id,
-                pool,
-                keystore,
-                password,
-                password_file,
-                pool_id,
-                payment_wei,
-                max_price_wei,
-                job_spec,
-            })
-        }
+        } => operator_dispatch(OperatorDispatchArgs {
+            rpc,
+            chain_id,
+            pool,
+            keystore,
+            password,
+            password_file,
+            pool_id,
+            payment_wei,
+            max_price_wei,
+            job_spec,
+        }),
         // migrate-encrypt must run BEFORE a normal encrypted open (which
         // would refuse the plaintext store it exists to fix).
         Cmd::MigrateEncrypt { dry_run } => {
@@ -348,7 +349,11 @@ fn run_keystore_cmd(keystore_path: &str, key_file_flag: Option<&str>, cmd: Cmd) 
 /// ENCRYPT-S1: drive [`citrate_gateway::migrate::migrate_encrypt`] and print
 /// an operator-readable report. Dry runs never write (not even a generated
 /// key); real runs source the key through the normal chain.
-fn migrate_encrypt_cmd(keystore_path: &str, key_file_flag: Option<&str>, dry_run: bool) -> ExitCode {
+fn migrate_encrypt_cmd(
+    keystore_path: &str,
+    key_file_flag: Option<&str>,
+    dry_run: bool,
+) -> ExitCode {
     // Dry run: a key is optional (only used to verify an already-encrypted
     // store is under OUR key). Real run: required, generation allowed.
     let master = if dry_run {
@@ -388,13 +393,21 @@ fn migrate_encrypt_cmd(keystore_path: &str, key_file_flag: Option<&str>, dry_run
                 migrate::SourceState::AlreadyEncrypted => {
                     eprintln!(
                         "keystore at {keystore_path} is ALREADY encrypted{} — nothing to do",
-                        if master.is_some() { " (under this key)" } else { "" }
+                        if master.is_some() {
+                            " (under this key)"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 migrate::SourceState::Plaintext => {
                     eprintln!(
                         "{}: plaintext keystore, {} rows:",
-                        if report.dry_run { "DRY RUN" } else { "MIGRATED" },
+                        if report.dry_run {
+                            "DRY RUN"
+                        } else {
+                            "MIGRATED"
+                        },
                         report.entries
                     );
                     for (ns, n) in &report.per_namespace {
@@ -422,7 +435,11 @@ fn migrate_encrypt_cmd(keystore_path: &str, key_file_flag: Option<&str>, dry_run
 }
 
 /// DEV/TESTNET: generate a fresh encrypted V3 keystore + print the operator address.
-fn operator_keygen(out: String, password: Option<String>, password_file: Option<String>) -> ExitCode {
+fn operator_keygen(
+    out: String,
+    password: Option<String>,
+    password_file: Option<String>,
+) -> ExitCode {
     let password = match resolve_password(password, password_file) {
         Ok(p) => p,
         Err(e) => {
@@ -547,16 +564,14 @@ fn operator_dispatch(a: OperatorDispatchArgs) -> ExitCode {
         );
         // Dry-run: the spend cap is intentionally wide open (U256::MAX) — the
         // blast-radius bound is exercised by the gateway, not this one-off tool.
-        let wallet = OperatorWallet::new(
-            Arc::new(signer),
-            a.rpc,
-            a.chain_id,
-            pool,
-            U256::MAX,
-            100,
-        );
+        let wallet = OperatorWallet::new(Arc::new(signer), a.rpc, a.chain_id, pool, U256::MAX, 100);
         match wallet
-            .dispatch_pool_compute(U256::from(a.pool_id), a.job_spec.as_bytes(), max_price, payment)
+            .dispatch_pool_compute(
+                U256::from(a.pool_id),
+                a.job_spec.as_bytes(),
+                max_price,
+                payment,
+            )
             .await
         {
             Ok(hash) => {

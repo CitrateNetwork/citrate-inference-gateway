@@ -46,7 +46,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          # Pinned, and kept equal to rust-toolchain.toml.
+          toolchain: 1.98.1
           components: clippy,rustfmt
 
       - name: Install system deps
@@ -56,16 +57,14 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-        continue-on-error: true  # surface fmt drift but don't block
 
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-        continue-on-error: true  # pre-existing warnings — sprint follow-up
 
-      # continue-on-error because tokio runtime hangs at shutdown after
-      # tests visibly pass (Sprint 1 cleanup item).
+      # Blocking (PBA R2): the tokio-shutdown hang that justified
+      # continue-on-error is gone, so a failing test now fails the job.
       - name: cargo test
-        continue-on-error: true
+        timeout-minutes: 40
         env:
           CARGO_INCREMENTAL: 0
           CARGO_BUILD_JOBS: 2

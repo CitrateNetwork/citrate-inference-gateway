@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ethereum_types::{H160, H256, U256};
 
-use crate::digest::{eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator};
+use crate::digest::{
+    eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator,
+};
 use crate::error::X402Error;
 use crate::types::PaymentChallenge;
 
@@ -59,9 +61,7 @@ pub struct BuiltChallenge {
 /// no time peeking, no randomness — all inputs flow in.
 pub fn build_challenge(inputs: ChallengeInputs) -> Result<BuiltChallenge, X402Error> {
     if inputs.amount_wei.is_zero() {
-        return Err(X402Error::Internal(
-            "challenge amount must be > 0".into(),
-        ));
+        return Err(X402Error::Internal("challenge amount must be > 0".into()));
     }
     if inputs.ttl_secs == 0 {
         return Err(X402Error::Internal("ttl must be > 0".into()));

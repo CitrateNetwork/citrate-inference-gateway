@@ -40,7 +40,7 @@ const TRANSFER_WITH_AUTHORIZATION_TYPE: &str =
 fn keccak(input: &[u8]) -> H256 {
     let mut h = Keccak256::new();
     h.update(input);
-    H256::from_slice(h.finalize().as_slice())
+    H256::from_slice(&h.finalize()[..])
 }
 
 fn u256_to_be_bytes(n: U256) -> [u8; 32] {

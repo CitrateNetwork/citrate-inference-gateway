@@ -67,7 +67,11 @@ async fn health_returns_200_even_when_chain_is_unreachable() {
         .body(Body::empty())
         .expect("build request");
     let (status, body) = call(app, req).await;
-    assert_eq!(status, StatusCode::OK, "health must be 200 even with bad chain");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "health must be 200 even with bad chain"
+    );
     let json: Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(json["ok"].as_bool(), Some(true));
 }
@@ -93,7 +97,10 @@ async fn models_endpoint_returns_openai_shape() {
     for entry in data {
         assert_eq!(entry["object"].as_str(), Some("model"));
         assert!(entry["id"].is_string(), "model entry must have string id");
-        assert!(entry["created"].is_number(), "model entry must have created timestamp");
+        assert!(
+            entry["created"].is_number(),
+            "model entry must have created timestamp"
+        );
     }
 }
 
@@ -107,7 +114,11 @@ async fn models_endpoint_does_not_require_payment() {
         .body(Body::empty())
         .expect("build request");
     let (status, _) = call(app, req).await;
-    assert_eq!(status, StatusCode::OK, "no x402 challenge for free endpoint");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "no x402 challenge for free endpoint"
+    );
 }
 
 #[tokio::test]

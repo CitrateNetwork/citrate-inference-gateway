@@ -49,9 +49,7 @@ pub fn score_provider(p: &ProviderInfo) -> u128 {
 
 /// Score a pool. Higher = better.
 pub fn score_pool(p: &PoolEntry) -> u128 {
-    let salt = (p.total_stake_grains
-        / U256::from(1_000_000_000_000_000_000u128))
-    .as_u128();
+    let salt = (p.total_stake_grains / U256::from(1_000_000_000_000_000_000u128)).as_u128();
     let rep = u128::from(p.min_member_reputation_bps);
     rep.saturating_mul(salt)
 }
@@ -132,16 +130,16 @@ mod tests {
 
     #[test]
     fn high_pool_beats_individual() {
-        let p = provider(9000, 10);   // score = 90_000
-        let pl = pool(9500, 100);     // score = 950_000
+        let p = provider(9000, 10); // score = 90_000
+        let pl = pool(9500, 100); // score = 950_000
         let out = select_dispatch_target(&[p], &[pl]).expect("some");
         assert!(matches!(out, DispatchTarget::Pool(_)));
     }
 
     #[test]
     fn weak_pool_loses_to_individual() {
-        let p = provider(9000, 100);  // score = 900_000
-        let pl = pool(5000, 10);      // score = 50_000
+        let p = provider(9000, 100); // score = 900_000
+        let pl = pool(5000, 10); // score = 50_000
         let out = select_dispatch_target(&[p], &[pl]).expect("some");
         assert!(matches!(out, DispatchTarget::Individual(_)));
     }

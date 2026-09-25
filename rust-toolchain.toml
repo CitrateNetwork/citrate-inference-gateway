@@ -1,3 +1,6 @@
+# Pinned (PBA R2): CI and local builds must use the same compiler and clippy,
+# or a lint that exists on one and not the other turns the now-blocking gate
+# red on an unchanged tree. Bump deliberately, with a full fmt/clippy/test run.
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

@@ -62,7 +62,7 @@ pub fn sign_settlement_tx(
     let sighash = Keccak256::digest(&signable);
 
     let (sig, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) = signing_key
-        .sign_prehash(sighash.as_slice())
+        .sign_prehash(&sighash[..])
         .map_err(|e| X402Error::Internal(format!("sign failed: {}", e)))?;
 
     // v per EIP-155: chainId * 2 + 35 + recoveryByte.
@@ -294,8 +294,13 @@ mod tests {
     async fn signer_trait_path_is_byte_identical_to_local() {
         let local = sign_settlement_tx(sample_tx(), &any_secret()).expect("local sign");
         let signer = LocalSigner::from_secret(any_secret()).expect("signer");
-        let via_trait = sign_settlement_tx_with(&signer, sample_tx()).await.expect("trait sign");
-        assert_eq!(local.raw, via_trait.raw, "Signer path must equal local signing byte-for-byte");
+        let via_trait = sign_settlement_tx_with(&signer, sample_tx())
+            .await
+            .expect("trait sign");
+        assert_eq!(
+            local.raw, via_trait.raw,
+            "Signer path must equal local signing byte-for-byte"
+        );
     }
 
     /// WP-C: `recover_id` (used by the KMS signer, which gets only `(r,s)`)
@@ -306,10 +311,19 @@ mod tests {
         let hash = [0xcd; 32];
         let sig = signer.sign_hash(&hash).await.expect("sign");
 
-        assert_eq!(ecrecover(&hash, &sig.r, &sig.s, sig.recovery_id), Some(signer.address()));
-        assert_eq!(recover_id(&hash, &sig.r, &sig.s, signer.address()), Some(sig.recovery_id));
+        assert_eq!(
+            ecrecover(&hash, &sig.r, &sig.s, sig.recovery_id),
+            Some(signer.address())
+        );
+        assert_eq!(
+            recover_id(&hash, &sig.r, &sig.s, signer.address()),
+            Some(sig.recovery_id)
+        );
         // A mismatched address recovers nothing.
-        assert_eq!(recover_id(&hash, &sig.r, &sig.s, H160::from([0x99; 20])), None);
+        assert_eq!(
+            recover_id(&hash, &sig.r, &sig.s, H160::from([0x99; 20])),
+            None
+        );
     }
 
     #[test]

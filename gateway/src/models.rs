@@ -63,9 +63,7 @@ pub struct ModelsResponse {
 /// `ComputePool` entries. Inactive models are filtered out; failed
 /// chain queries degrade to an empty list per the resilience
 /// contract at the top of this module.
-pub async fn models_handler(
-    State(state): State<SharedState>,
-) -> Json<ModelsResponse> {
+pub async fn models_handler(State(state): State<SharedState>) -> Json<ModelsResponse> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

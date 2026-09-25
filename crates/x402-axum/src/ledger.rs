@@ -56,6 +56,7 @@ struct LedgerState {
 }
 
 impl NonceLedger {
+    /// An empty ledger that holds at most `max_outstanding` unexpired nonces.
     pub fn new(max_outstanding: usize) -> Self {
         Self {
             inner: Mutex::new(LedgerState {
@@ -76,13 +77,7 @@ impl NonceLedger {
     }
 
     /// Record a challenge nonce bound to one exact request commitment.
-    pub fn record_bound(
-        &self,
-        nonce: H256,
-        request_commitment: H256,
-        expires_at: u64,
-        now: u64,
-    ) {
+    pub fn record_bound(&self, nonce: H256, request_commitment: H256, expires_at: u64, now: u64) {
         if self.max_outstanding == 0 {
             return;
         }
@@ -99,8 +94,8 @@ impl NonceLedger {
         if state.entries.len() >= self.max_outstanding {
             let expired_sequences: Vec<_> = state
                 .entries
-                .iter()
-                .filter_map(|(_, entry)| (entry.expires_at <= now).then_some(entry.sequence))
+                .values()
+                .filter_map(|entry| (entry.expires_at <= now).then_some(entry.sequence))
                 .collect();
             for sequence in expired_sequences {
                 state.insertion_order.remove(&sequence);

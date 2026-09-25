@@ -35,7 +35,7 @@ use citrate_gateway::queries::ChainQueries;
 use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use x402_axum::keys::{derive_secp256k1_address, sign_digest_secp256k1};
 use x402_axum::{
-    encode_payment_header, eip712_digest, transfer_with_authorization_struct_hash, ChainClient,
+    eip712_digest, encode_payment_header, transfer_with_authorization_struct_hash, ChainClient,
     RawLog, TxReceipt, X402Client, X402Error, X_PAYMENT_HEADER,
 };
 
@@ -43,7 +43,6 @@ use x402_axum::{
 /// addresses (the placeholder default was removed from the builders).
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
-
 
 // ── Stub provider with selective failure ────────────────────────
 
@@ -274,16 +273,20 @@ fn parse_addr(value: &str) -> H160 {
 /// underfunding tests use this to keep the authorization below the exact
 /// request-aware quote while retaining a valid nonce, recipient, and EIP-712
 /// signature.
-fn payment_header_for_amount(
-    challenge: &Value,
-    secret: &[u8; 32],
-    amount: U256,
-) -> String {
+fn payment_header_for_amount(challenge: &Value, secret: &[u8; 32], amount: U256) -> String {
     let payer = derive_secp256k1_address(secret).expect("payer address");
     let recipient = parse_addr(challenge["x402"]["recipient"].as_str().expect("recipient"));
     let wsalt = parse_addr(TEST_WSALT);
-    let valid_after = U256::from(challenge["x402"]["valid_after"].as_u64().expect("valid_after"));
-    let valid_before = U256::from(challenge["x402"]["valid_before"].as_u64().expect("valid_before"));
+    let valid_after = U256::from(
+        challenge["x402"]["valid_after"]
+            .as_u64()
+            .expect("valid_after"),
+    );
+    let valid_before = U256::from(
+        challenge["x402"]["valid_before"]
+            .as_u64()
+            .expect("valid_before"),
+    );
     let nonce_bytes = hex::decode(
         challenge["x402"]["nonce"]
             .as_str()

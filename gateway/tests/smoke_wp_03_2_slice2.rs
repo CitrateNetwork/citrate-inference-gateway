@@ -20,15 +20,14 @@ use ethereum_types::{H160, H256, U256};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use citrate_gateway::queries::ChainQueries;
+use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 
 /// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
 /// addresses (the placeholder default was removed from the builders).
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
-
 
 // ── Stub providers with controllable behavior ────────────────────
 
@@ -43,29 +42,34 @@ enum StubBehavior {
 async fn spawn_stub(behavior: StubBehavior) -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(move |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
-            match behavior {
-                StubBehavior::Ok => (
-                    StatusCode::OK,
-                    JsonResp(serde_json::json!({
-                        "output": format!("OK: {}", req.prompt),
-                        "input_tokens": 1,
-                        "output_tokens": 1,
-                    })),
-                )
-                    .into_response(),
-                StubBehavior::HttpFiveHundred => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonResp(serde_json::json!({"error": "stub 500"})),
-                )
-                    .into_response(),
-                StubBehavior::Timeout => {
-                    tokio::time::sleep(Duration::from_secs(120)).await;
-                    (StatusCode::OK, JsonResp(serde_json::json!({"output": "late"})))
-                        .into_response()
+        post(
+            move |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
+                match behavior {
+                    StubBehavior::Ok => (
+                        StatusCode::OK,
+                        JsonResp(serde_json::json!({
+                            "output": format!("OK: {}", req.prompt),
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                        })),
+                    )
+                        .into_response(),
+                    StubBehavior::HttpFiveHundred => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        JsonResp(serde_json::json!({"error": "stub 500"})),
+                    )
+                        .into_response(),
+                    StubBehavior::Timeout => {
+                        tokio::time::sleep(Duration::from_secs(120)).await;
+                        (
+                            StatusCode::OK,
+                            JsonResp(serde_json::json!({"output": "late"})),
+                        )
+                            .into_response()
+                    }
                 }
-            }
-        }),
+            },
+        ),
     );
     use axum::response::IntoResponse;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
@@ -122,10 +126,7 @@ impl HonestMockChain {
 
 #[async_trait]
 impl ChainClient for HonestMockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if precompile_input.len() != 265 {
             return Ok(None);
         }
@@ -139,11 +140,7 @@ impl ChainClient for HonestMockChain {
     async fn send_raw_tx(&self, _: &[u8]) -> Result<H256, X402Error> {
         Ok(H256::from([0xab; 32]))
     }
-    async fn wait_for_receipt(
-        &self,
-        _: H256,
-        _: Duration,
-    ) -> Result<TxReceipt, X402Error> {
+    async fn wait_for_receipt(&self, _: H256, _: Duration) -> Result<TxReceipt, X402Error> {
         let nonce = H256::from([0x77; 32]);
         let mut s = self.settled.lock().expect("mutex");
         if !s.insert(nonce) {
@@ -246,9 +243,7 @@ async fn spawn_gateway(providers: Vec<ProviderInfo>) -> SocketAddr {
     addr
 }
 
-async fn paid_chat(
-    gateway_addr: SocketAddr,
-) -> reqwest::Response {
+async fn paid_chat(gateway_addr: SocketAddr) -> reqwest::Response {
     let facilitator = H160::from([0xfa; 20]);
     let wsalt = H160::from_slice(&hex::decode(&any_addr()[2..]).unwrap());
     let client = X402Client::try_new(payer_secret(), wsalt, facilitator, 40204).expect("client");
@@ -338,11 +333,7 @@ async fn no_providers_returns_503() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let resp = paid_chat(gw).await;
-    assert_eq!(
-        resp.status(),
-        503,
-        "empty provider list → 503 NoProviders"
-    );
+    assert_eq!(resp.status(), 503, "empty provider list → 503 NoProviders");
     let body: Value = resp.json().await.expect("json");
     let msg = body["error"]["message"].as_str().unwrap_or("");
     assert!(

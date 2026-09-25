@@ -36,7 +36,13 @@ impl Drop for Anvil {
 
 fn anvil_bin() -> Option<String> {
     for c in ["anvil", "/home/saul/.foundry/bin/anvil"] {
-        if Command::new(c).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+        if Command::new(c)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
             return Some(c.to_string());
         }
     }
@@ -52,7 +58,13 @@ async fn start_anvil() -> Option<Anvil> {
     let bin = anvil_bin()?;
     let port = free_port();
     let child = Command::new(bin)
-        .args(["--port", &port.to_string(), "--chain-id", &ANVIL_CHAIN_ID.to_string(), "--silent"])
+        .args([
+            "--port",
+            &port.to_string(),
+            "--chain-id",
+            &ANVIL_CHAIN_ID.to_string(),
+            "--silent",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -93,7 +105,9 @@ async fn receipt_from(url: &str, tx: &str) -> Option<H160> {
     for _ in 0..50 {
         let resp = http
             .post(url)
-            .json(&json!({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx],"id":1}))
+            .json(
+                &json!({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx],"id":1}),
+            )
             .send()
             .await
             .ok()?;
@@ -130,7 +144,12 @@ async fn dispatch_pool_compute_signs_and_lands_on_anvil() {
     let operator = w.address();
 
     let tx = w
-        .dispatch_pool_compute(U256::from(1u64), b"job-spec", U256::from(1000u64), U256::from(1000u64))
+        .dispatch_pool_compute(
+            U256::from(1u64),
+            b"job-spec",
+            U256::from(1000u64),
+            U256::from(1000u64),
+        )
         .await
         .expect("dispatch");
 
@@ -153,7 +172,8 @@ async fn concurrent_dispatches_serialize_nonces() {
     for i in 0..5u64 {
         let w = Arc::clone(&w);
         handles.push(tokio::spawn(async move {
-            w.dispatch_pool_compute(U256::from(i), b"x", U256::from(1u64), U256::from(1u64)).await
+            w.dispatch_pool_compute(U256::from(i), b"x", U256::from(1u64), U256::from(1u64))
+                .await
         }));
     }
     let mut hashes = Vec::new();
@@ -167,7 +187,10 @@ async fn concurrent_dispatches_serialize_nonces() {
     uniq.dedup();
     assert_eq!(uniq.len(), 5, "5 distinct txs (no nonce reuse)");
     for h in &hashes {
-        assert!(receipt_from(&anvil.url, h).await.is_some(), "each dispatch must mine");
+        assert!(
+            receipt_from(&anvil.url, h).await.is_some(),
+            "each dispatch must mine"
+        );
     }
 }
 
@@ -182,9 +205,15 @@ async fn reclaim_expired_job_signs_and_lands_on_anvil() {
     let w = wallet(&anvil.url);
     let operator = w.address();
 
-    let tx = w.reclaim_expired_job(U256::from(7u64)).await.expect("reclaim");
+    let tx = w
+        .reclaim_expired_job(U256::from(7u64))
+        .await
+        .expect("reclaim");
     let from = receipt_from(&anvil.url, &format!("0x{}", hex::encode(tx.as_bytes())))
         .await
         .expect("mined");
-    assert_eq!(from, operator, "reclaim must be signed by the operator (the requester)");
+    assert_eq!(
+        from, operator,
+        "reclaim must be signed by the operator (the requester)"
+    );
 }

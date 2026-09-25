@@ -36,11 +36,17 @@ fn model_budget_exhausts_independently() {
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
 
-    store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set");
+    store
+        .set_model_budget(&k, "llama-3.1-8b", salt(5))
+        .expect("set");
 
     // Spend the llama budget down to 0.
-    store.debit_model_budget(&k, "llama-3.1-8b", salt(3)).expect("debit 3");
-    store.debit_model_budget(&k, "llama-3.1-8b", salt(2)).expect("debit 2");
+    store
+        .debit_model_budget(&k, "llama-3.1-8b", salt(3))
+        .expect("debit 3");
+    store
+        .debit_model_budget(&k, "llama-3.1-8b", salt(2))
+        .expect("debit 2");
 
     // Further llama spend is refused; the remaining budget is reported.
     match store.debit_model_budget(&k, "llama-3.1-8b", salt(1)) {
@@ -49,7 +55,9 @@ fn model_budget_exhausts_independently() {
     }
 
     // An uncapped model is unaffected (no budget set → no-op Ok).
-    store.debit_model_budget(&k, "mistral-7b", salt(1000)).expect("uncapped ok");
+    store
+        .debit_model_budget(&k, "mistral-7b", salt(1000))
+        .expect("uncapped ok");
 }
 
 /// A refund credits the model bucket it was debited from — not the overall, not
@@ -59,15 +67,35 @@ fn refund_attributes_to_the_right_model_bucket() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
-    store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set llama");
-    store.set_model_budget(&k, "mistral-7b", salt(5)).expect("set mistral");
+    store
+        .set_model_budget(&k, "llama-3.1-8b", salt(5))
+        .expect("set llama");
+    store
+        .set_model_budget(&k, "mistral-7b", salt(5))
+        .expect("set mistral");
 
-    store.debit_model_budget(&k, "llama-3.1-8b", salt(4)).expect("debit"); // llama -> 1
-    store.refund_model_budget(&k, "llama-3.1-8b", salt(4)).expect("refund"); // llama -> 5
+    store
+        .debit_model_budget(&k, "llama-3.1-8b", salt(4))
+        .expect("debit"); // llama -> 1
+    store
+        .refund_model_budget(&k, "llama-3.1-8b", salt(4))
+        .expect("refund"); // llama -> 5
 
-    assert_eq!(store.get_model_budget(&k, "llama-3.1-8b").expect("get").expect("set"), salt(5));
+    assert_eq!(
+        store
+            .get_model_budget(&k, "llama-3.1-8b")
+            .expect("get")
+            .expect("set"),
+        salt(5)
+    );
     // mistral untouched
-    assert_eq!(store.get_model_budget(&k, "mistral-7b").expect("get").expect("set"), salt(5));
+    assert_eq!(
+        store
+            .get_model_budget(&k, "mistral-7b")
+            .expect("get")
+            .expect("set"),
+        salt(5)
+    );
 }
 
 /// An uncapped model debit is a no-op and never creates a budget.
@@ -76,10 +104,17 @@ fn uncapped_model_is_passthrough() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
-    store.debit_model_budget(&k, "gpt-whatever", salt(10)).expect("uncapped ok");
-    assert!(store.get_model_budget(&k, "gpt-whatever").expect("get").is_none());
+    store
+        .debit_model_budget(&k, "gpt-whatever", salt(10))
+        .expect("uncapped ok");
+    assert!(store
+        .get_model_budget(&k, "gpt-whatever")
+        .expect("get")
+        .is_none());
     // refund on an uncapped model is also a harmless no-op
-    store.refund_model_budget(&k, "gpt-whatever", salt(10)).expect("refund ok");
+    store
+        .refund_model_budget(&k, "gpt-whatever", salt(10))
+        .expect("refund ok");
 }
 
 /// Budgets are durable across a restart.
@@ -90,11 +125,21 @@ fn model_budget_survives_restart() {
     {
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
         k = key(&store);
-        store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("set");
-        store.debit_model_budget(&k, "llama-3.1-8b", salt(3)).expect("debit"); // -> 2
+        store
+            .set_model_budget(&k, "llama-3.1-8b", salt(5))
+            .expect("set");
+        store
+            .debit_model_budget(&k, "llama-3.1-8b", salt(3))
+            .expect("debit"); // -> 2
     }
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_model_budget(&k, "llama-3.1-8b").expect("get").expect("set"), salt(2));
+    assert_eq!(
+        store
+            .get_model_budget(&k, "llama-3.1-8b")
+            .expect("get")
+            .expect("set"),
+        salt(2)
+    );
 }
 
 /// Concurrent debits of one model budget never overspend.
@@ -103,18 +148,34 @@ fn concurrent_model_debits_never_overspend() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
-    store.set_model_budget(&k, "llama-3.1-8b", salt(300)).expect("set");
+    store
+        .set_model_budget(&k, "llama-3.1-8b", salt(300))
+        .expect("set");
 
     let threads: Vec<_> = (0..50)
         .map(|_| {
             let store = Arc::clone(&store);
             let k = k.clone();
-            thread::spawn(move || store.debit_model_budget(&k, "llama-3.1-8b", salt(10)).is_ok())
+            thread::spawn(move || {
+                store
+                    .debit_model_budget(&k, "llama-3.1-8b", salt(10))
+                    .is_ok()
+            })
         })
         .collect();
-    let ok = threads.into_iter().map(|t| t.join().expect("join")).filter(|&b| b).count();
+    let ok = threads
+        .into_iter()
+        .map(|t| t.join().expect("join"))
+        .filter(|&b| b)
+        .count();
     assert_eq!(ok, 30, "exactly floor(300/10) debits commit");
-    assert_eq!(store.get_model_budget(&k, "llama-3.1-8b").expect("get").expect("set"), salt(0));
+    assert_eq!(
+        store
+            .get_model_budget(&k, "llama-3.1-8b")
+            .expect("get")
+            .expect("set"),
+        salt(0)
+    );
 }
 
 /// `get_model_budgets` enumerates all capped models for a key.
@@ -123,9 +184,19 @@ fn list_model_budgets_enumerates() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
     let k = key(&store);
-    store.set_model_budget(&k, "llama-3.1-8b", salt(5)).expect("a");
-    store.set_model_budget(&k, "mistral-7b", salt(9)).expect("b");
+    store
+        .set_model_budget(&k, "llama-3.1-8b", salt(5))
+        .expect("a");
+    store
+        .set_model_budget(&k, "mistral-7b", salt(9))
+        .expect("b");
     let mut got = store.get_model_budgets(&k).expect("list");
     got.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(got, vec![("llama-3.1-8b".to_string(), salt(5)), ("mistral-7b".to_string(), salt(9))]);
+    assert_eq!(
+        got,
+        vec![
+            ("llama-3.1-8b".to_string(), salt(5)),
+            ("mistral-7b".to_string(), salt(9))
+        ]
+    );
 }

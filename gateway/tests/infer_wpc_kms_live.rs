@@ -37,7 +37,10 @@ async fn kms_live_sign_recovers_operator_address() {
         .await
         .expect("load AWS KMS signer (check creds + kms:GetPublicKey on the key)");
     let address = signer.address();
-    eprintln!("KMS operator address: 0x{}", hex::encode(address.as_bytes()));
+    eprintln!(
+        "KMS operator address: 0x{}",
+        hex::encode(address.as_bytes())
+    );
 
     let hash = [0x11u8; 32];
     let sig = signer

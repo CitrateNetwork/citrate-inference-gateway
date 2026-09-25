@@ -254,8 +254,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kf = dir.path().join("store.key");
         let hex_key = "11".repeat(32);
-        let (key, source) =
-            load_store_key_with(Some(format!(" {hex_key}\n")), &kf, false).unwrap();
+        let (key, source) = load_store_key_with(Some(format!(" {hex_key}\n")), &kf, false).unwrap();
         assert_eq!(key, [0x11u8; 32]);
         assert_eq!(source, KeySource::Env);
         assert!(!kf.exists(), "env tier must not touch the key file");
@@ -267,7 +266,10 @@ mod tests {
         let kf = dir.path().join("store.key");
         let err = load_store_key_with(Some("not-hex".into()), &kf, true).unwrap_err();
         assert!(matches!(err, KeyvaultError::BadEnvKey));
-        assert!(!kf.exists(), "a malformed env key must not trigger generation");
+        assert!(
+            !kf.exists(),
+            "a malformed env key must not trigger generation"
+        );
     }
 
     #[test]

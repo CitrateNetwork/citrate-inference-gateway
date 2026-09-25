@@ -54,22 +54,34 @@ async fn keystore_roundtrips_to_operator_address() {
     let path = write_keystore(&ANVIL_ACCT0, PASSWORD);
     let signer = EncryptedFileSigner::from_keystore(&path, PASSWORD).expect("load keystore");
 
-    let expected = LocalSigner::from_secret(ANVIL_ACCT0).expect("local").address();
-    assert_eq!(signer.address(), expected, "keystore must decrypt to the operator EOA");
+    let expected = LocalSigner::from_secret(ANVIL_ACCT0)
+        .expect("local")
+        .address();
+    assert_eq!(
+        signer.address(),
+        expected,
+        "keystore must decrypt to the operator EOA"
+    );
 
     // And it actually signs: the recovered signer matches the operator.
     let hash = [7u8; 32];
     let sig = Signer::sign_hash(&signer, &hash).await.expect("sign");
     let recovered =
         x402_axum::sign_tx::ecrecover(&hash, &sig.r, &sig.s, sig.recovery_id).expect("recover");
-    assert_eq!(recovered, expected, "signature must recover to the operator");
+    assert_eq!(
+        recovered, expected,
+        "signature must recover to the operator"
+    );
 }
 
 #[tokio::test]
 async fn wrong_password_is_rejected() {
     let path = write_keystore(&ANVIL_ACCT0, PASSWORD);
     let err = EncryptedFileSigner::from_keystore(&path, "not the password");
-    assert!(err.is_err(), "a bad password must fail closed, not load a wrong key");
+    assert!(
+        err.is_err(),
+        "a bad password must fail closed, not load a wrong key"
+    );
 }
 
 #[tokio::test]
@@ -79,14 +91,23 @@ async fn from_env_fails_closed_without_optin_then_builds_with_it() {
     let path = write_keystore(&ANVIL_ACCT0, PASSWORD);
     std::env::set_var("CITRATE_GATEWAY_OPERATOR_KEYSTORE", &path);
     std::env::set_var("CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD", PASSWORD);
-    std::env::set_var("CITRATE_GATEWAY_COMPUTE_POOL", "0xcccccccccccccccccccccccccccccccccccccccc");
-    std::env::set_var("CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI", "1000000000000000000000");
+    std::env::set_var(
+        "CITRATE_GATEWAY_COMPUTE_POOL",
+        "0xcccccccccccccccccccccccccccccccccccccccc",
+    );
+    std::env::set_var(
+        "CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI",
+        "1000000000000000000000",
+    );
     std::env::remove_var("CITRATE_GATEWAY_KMS_KEY_ID");
 
     // No opt-in → fail closed (the encrypted-file signer is never silent).
     std::env::remove_var("CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER");
     let denied = OperatorWallet::from_env("http://127.0.0.1:1", ANVIL_CHAIN_ID).await;
-    assert!(denied.is_err(), "keystore without ALLOW_LOCAL_SIGNER=1 must error");
+    assert!(
+        denied.is_err(),
+        "keystore without ALLOW_LOCAL_SIGNER=1 must error"
+    );
 
     // Explicit opt-in → builds a wallet bound to the keystore operator.
     std::env::set_var("CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER", "1");
@@ -94,8 +115,14 @@ async fn from_env_fails_closed_without_optin_then_builds_with_it() {
         .await
         .expect("from_env ok")
         .expect("Some(wallet)");
-    let expected = LocalSigner::from_secret(ANVIL_ACCT0).expect("local").address();
-    assert_eq!(wallet.address(), expected, "wallet must use the keystore operator key");
+    let expected = LocalSigner::from_secret(ANVIL_ACCT0)
+        .expect("local")
+        .address();
+    assert_eq!(
+        wallet.address(),
+        expected,
+        "wallet must use the keystore operator key"
+    );
 
     for k in [
         "CITRATE_GATEWAY_OPERATOR_KEYSTORE",
@@ -123,7 +150,13 @@ impl Drop for Anvil {
 
 fn anvil_bin() -> Option<String> {
     for c in ["anvil", "/home/saul/.foundry/bin/anvil"] {
-        if Command::new(c).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+        if Command::new(c)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
             return Some(c.to_string());
         }
     }
@@ -139,7 +172,13 @@ async fn start_anvil() -> Option<Anvil> {
     let bin = anvil_bin()?;
     let port = free_port();
     let child = Command::new(bin)
-        .args(["--port", &port.to_string(), "--chain-id", &ANVIL_CHAIN_ID.to_string(), "--silent"])
+        .args([
+            "--port",
+            &port.to_string(),
+            "--chain-id",
+            &ANVIL_CHAIN_ID.to_string(),
+            "--silent",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -169,7 +208,9 @@ async fn receipt_from(url: &str, tx: &str) -> Option<H160> {
     for _ in 0..50 {
         let resp = http
             .post(url)
-            .json(&json!({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx],"id":1}))
+            .json(
+                &json!({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx],"id":1}),
+            )
             .send()
             .await
             .ok()?;
@@ -204,11 +245,19 @@ async fn encrypted_signer_dispatch_lands_on_anvil() {
     );
 
     let tx = wallet
-        .dispatch_pool_compute(U256::from(1u64), b"dry-run", U256::from(1000u64), U256::from(1000u64))
+        .dispatch_pool_compute(
+            U256::from(1u64),
+            b"dry-run",
+            U256::from(1000u64),
+            U256::from(1000u64),
+        )
         .await
         .expect("dispatch");
 
     let tx_hex = format!("0x{}", hex::encode(tx.as_bytes()));
     let from = receipt_from(&anvil.url, &tx_hex).await.expect("mined");
-    assert_eq!(from, operator, "tx must be signed by the encrypted-file operator");
+    assert_eq!(
+        from, operator,
+        "tx must be signed by the encrypted-file operator"
+    );
 }
