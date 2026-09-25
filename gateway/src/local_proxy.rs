@@ -21,6 +21,10 @@
 //!
 //! # Outcomes
 //!
+//! - A path outside the upstream allowlist ([`ALLOWED_UPSTREAM_PATHS`]) →
+//!   **404**; a path carrying `\`, a percent-encoded `.`, `/` or `\`, or a dot
+//!   segment → **400** (PBA-L3b-004). Both are refused before the key is
+//!   charged or anything is forwarded.
 //! - Missing / malformed `Authorization` → **401**.
 //! - Unknown or revoked key → **401**.
 //! - Per-second rate exceeded → **429** + `Retry-After: 1`.
@@ -80,6 +84,19 @@ const DEFAULT_STT_SUBPATH: &str = "/v1/audio/transcriptions";
 
 /// The one route (OpenAI Whisper shape) diverted to the STT backend.
 const STT_TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
+
+/// PBA-L3b-004: the only upstream routes the proxy forwards, matched exactly
+/// against the raw request path (query string excluded). Everything else is
+/// 404 before the key is charged. An allowlist rather than a blocklist because
+/// the upstream (llama-server) also serves `/slots`, `/props`, `/metrics` and
+/// friends, which a `cgk_` key must never reach however the path is spelled.
+pub const ALLOWED_UPSTREAM_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/models",
+    STT_TRANSCRIPTIONS_PATH,
+];
 
 /// Shared state for the local-proxy router. Cheap to clone (all Arc / Client).
 #[derive(Clone)]
@@ -199,11 +216,15 @@ async fn proxy_handler(
     };
 
     // The proxy is mounted under /v1/, but the outbound URL builder and
-    // upstream HTTP stack may normalize dot segments. Reject them at this
-    // boundary before quota consumption or forwarding so neither raw nor
-    // percent-encoded traversal can escape the intended route prefix.
-    if contains_dot_segment(uri.path()) {
-        return json_error(StatusCode::BAD_REQUEST, "dot-segment path is not allowed");
+    // upstream HTTP stack may normalize dot segments — and reqwest treats `\`
+    // as a separator, so `/v1/..\slots` reached the upstream as `/slots`
+    // (PBA-L3b-004). Reject every traversal spelling at this boundary, then
+    // forward only allowlisted routes, before quota consumption or forwarding.
+    if path_is_unsafe(uri.path()) {
+        return json_error(StatusCode::BAD_REQUEST, "path is not allowed");
+    }
+    if !ALLOWED_UPSTREAM_PATHS.contains(&uri.path()) {
+        return json_error(StatusCode::NOT_FOUND, "unknown route");
     }
 
     let consumed = match state.store.try_consume(&key_id) {
@@ -368,6 +389,20 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// PBA-L3b-004: any spelling of path traversal. A raw `\` (reqwest and many
+/// servers treat it as `/`), a percent-encoded `.`, `/` or `\` (no legitimate
+/// allowlisted route needs one), or a dot segment after decoding.
+fn path_is_unsafe(path: &str) -> bool {
+    if path.contains('\\') {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    if ["%2e", "%2f", "%5c"].iter().any(|enc| lower.contains(enc)) {
+        return true;
+    }
+    contains_dot_segment(path)
 }
 
 fn contains_dot_segment(path: &str) -> bool {
@@ -1014,5 +1049,136 @@ mod tests {
             chat_paths.lock().unwrap().clone(),
             vec!["/v1/audio/transcriptions".to_string()]
         );
+    }
+    // ── PBA-L3b-004: path traversal past /v1/ ─────────────────────────
+
+    /// Serve `app` on an ephemeral port (a real socket, so the request line
+    /// reaches axum byte-for-byte, the way the audit PoC sent it).
+    async fn serve_app(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        addr
+    }
+
+    /// Send a raw `POST <raw_path>` and return the numeric status.
+    async fn raw_post_status(gw: SocketAddr, raw_path: &str, bearer: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(gw).await.unwrap();
+        let req = format!(
+            "POST {raw_path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {bearer}\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// The audit PoC, inverted. Before the fix every one of these returned 200
+    /// and the upstream saw `/slots` and `/props`.
+    #[tokio::test]
+    async fn pba_l3b_004_backslash_dot_segment_cannot_escape_v1() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream_addr = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("bs", 0, 0).unwrap();
+        let gw = serve_app(router_with(
+            store.clone(),
+            format!("http://{upstream_addr}"),
+        ))
+        .await;
+        for raw_path in [
+            "/v1/..\\slots",
+            "/v1/%2e%2e%5cslots",
+            "/v1/x\\..\\..\\props",
+            "/v1/..%5Cslots",
+        ] {
+            assert_eq!(
+                raw_post_status(gw, raw_path, &id).await,
+                400,
+                "{raw_path:?}"
+            );
+        }
+        let seen = paths.lock().unwrap().clone();
+        assert!(seen.is_empty(), "nothing may reach the upstream: {seen:?}");
+    }
+
+    /// Tripwire: every traversal spelling is refused (400), a route outside the
+    /// allowlist is 404, nothing reaches the upstream, and none of it charges
+    /// the key (a 1-request daily quota is still available afterwards).
+    #[tokio::test]
+    async fn pba_l3b_004_traversal_spelling_table() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream_addr = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("table", 0, 1).unwrap();
+        let gw = serve_app(router_with(
+            store.clone(),
+            format!("http://{upstream_addr}"),
+        ))
+        .await;
+        let table: &[(&str, u16)] = &[
+            // backslash, raw and encoded (`..\`, `%5c`)
+            ("/v1/..\\slots", 400),
+            ("/v1/x\\..\\..\\props", 400),
+            ("/v1/chat\\completions", 400),
+            ("/v1/chat/completions/..\\..\\slots", 400),
+            ("/v1/..%5cslots", 400),
+            ("/v1/..%5Cslots", 400),
+            ("/v1/%5c..%5cslots", 400),
+            // encoded dots (`%2e%2e`) and encoded slash
+            ("/v1/%2e%2e/slots", 400),
+            ("/v1/%2E%2E/props", 400),
+            ("/v1/%2e%2e%5cslots", 400),
+            ("/v1/.%2e/slots", 400),
+            ("/v1/%2e/chat/completions", 400),
+            ("/v1/chat%2fcompletions", 400),
+            ("/v1/chat%2Fcompletions", 400),
+            // plain dot segments
+            ("/v1/../slots", 400),
+            ("/v1/chat/completions/../../slots", 400),
+            ("/v1/./chat/completions", 400),
+            // well-formed but not an allowlisted upstream route
+            ("/v1/slots", 404),
+            ("/v1/props", 404),
+            ("/v1/metrics", 404),
+            ("/v1/chat/completions/extra", 404),
+            ("/v1/models/../../slots", 400),
+        ];
+        for (raw_path, want) in table {
+            assert_eq!(
+                raw_post_status(gw, raw_path, &id).await,
+                *want,
+                "{raw_path:?}"
+            );
+        }
+        assert!(
+            paths.lock().unwrap().is_empty(),
+            "no rejected path may be forwarded"
+        );
+        // The rejections were free: the key's single daily request is intact.
+        assert_eq!(raw_post_status(gw, "/v1/chat/completions", &id).await, 200);
+        assert_eq!(raw_post_status(gw, "/v1/chat/completions", &id).await, 429);
+    }
+
+    #[test]
+    fn pba_l3b_004_every_allowlisted_route_passes_the_path_check() {
+        for p in ALLOWED_UPSTREAM_PATHS {
+            assert!(!path_is_unsafe(p), "{p}");
+        }
+        assert!(path_is_unsafe("/v1/a\\b"));
+        assert!(path_is_unsafe("/v1/%2E"));
+        assert!(path_is_unsafe("/v1/%2F"));
+        assert!(path_is_unsafe("/v1/%5C"));
+        assert!(!path_is_unsafe("/v1/%41"));
     }
 }
