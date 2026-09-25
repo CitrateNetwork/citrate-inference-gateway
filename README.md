@@ -129,7 +129,9 @@ See the full multi-repo bring-up: https://docs.citrate.ai/local-stack
   `CITRATE_GATEWAY_EMBED_UPSTREAM_URL`, `CITRATE_GATEWAY_KEYSTORE_PATH`
   (default `/var/lib/citrate-gateway/keystore`), `GATEWAY_STORE_KEY` /
   `GATEWAY_STORE_KEY_FILE` (money-store master key; encrypted at rest, ENCRYPT-S1),
-  `CITRATE_GATEWAY_MAX_TOKENS` (generation ceiling, default 2048),
+  `CITRATE_GATEWAY_MAX_TOKENS` (per-request generation budget, default 2048, split
+  across prompts x `n`; more than 8 generations in one request, or a generation body
+  that is not a parseable JSON object, is 400),
   `CITRATE_GATEWAY_MAX_CONCURRENT_PER_KEY` (default 4; the next request is 429),
   `CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM` (fair shared queue, default 32).
 - marketplace: `CITRATE_GATEWAY_RPC_URL` (default `http://127.0.0.1:8545`),

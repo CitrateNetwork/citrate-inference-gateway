@@ -367,8 +367,14 @@ async fn proxy_handler(
     };
     // PBA-L3b-003: a key is metered per request, so a request must not be able
     // to ask for an unbounded generation.
+    // Fail closed: a body this proxy cannot parse and clamp is refused, never
+    // forwarded as-is (llama-server's parser accepts JSON that serde_json
+    // rejects, e.g. nesting deeper than 128 or `1e400`).
     let body_bytes = if is_generation(&method, uri.path()) {
-        clamp_generation_budget(body_bytes, state.max_tokens)
+        match clamp_generation_budget(&body_bytes, state.max_tokens) {
+            Ok(b) => b,
+            Err(msg) => return json_error(StatusCode::BAD_REQUEST, msg),
+        }
     } else {
         body_bytes
     };
@@ -512,32 +518,67 @@ fn is_generation(method: &Method, path: &str) -> bool {
     *method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions")
 }
 
-/// PBA-L3b-003: clamp every generation-length field in a JSON body to `cap`,
-/// and add `max_tokens: cap` when the body names none. A field that is not a
-/// non-negative integer at most `cap` (including llama.cpp's `-1` =
-/// "unlimited", and non-numbers) is replaced by `cap`. A body that is not a
-/// JSON object is forwarded unchanged: the upstream rejects it.
-fn clamp_generation_budget(body: Bytes, cap: u64) -> Bytes {
-    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(&body)
-    else {
-        return body;
+/// PBA-L3b-003: most generations one request may ask for (prompts x `n`).
+/// llama-server fans a prompt array (and `n`) out into one task each, so each
+/// one multiplies the cost of a single metered request.
+pub const MAX_GENERATIONS_PER_REQUEST: u64 = 8;
+
+/// How many generations a body asks for: the number of prompts (a string or a
+/// token-id array is one; an array of strings or token arrays is one each)
+/// times `n` / `best_of`. `Err` for a shape this proxy will not meter.
+fn generation_count(obj: &serde_json::Map<String, serde_json::Value>) -> Result<u64, &'static str> {
+    let prompts = match obj.get("prompt") {
+        Some(serde_json::Value::Array(items)) if items.iter().all(|i| i.is_number()) => 1,
+        Some(serde_json::Value::Array(items)) => items.len() as u64,
+        _ => 1,
     };
+    let mut per_prompt = 1u64;
+    for field in ["n", "best_of"] {
+        match obj.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) => match v.as_u64() {
+                Some(k) => per_prompt = per_prompt.max(k),
+                None => return Err("n / best_of must be a non-negative integer"),
+            },
+        }
+    }
+    Ok(prompts.max(1).saturating_mul(per_prompt.max(1)))
+}
+
+/// PBA-L3b-003: bound what one request can generate. The request's total
+/// budget is `cap` tokens, split evenly across its generations (see
+/// [`generation_count`]); more than [`MAX_GENERATIONS_PER_REQUEST`] is
+/// refused. Every generation-length field that is not a non-negative integer
+/// within the per-generation budget (including llama.cpp's `-1` = "unlimited",
+/// and non-numbers) is set to it, and a body naming none gets `max_tokens`.
+///
+/// Fails closed: a body that is not a JSON object serde_json can parse is an
+/// `Err` (the caller answers 400), never forwarded unclamped.
+fn clamp_generation_budget(body: &Bytes, cap: u64) -> Result<Bytes, &'static str> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return Err("request body must be a JSON object");
+    };
+    let generations = generation_count(&obj)?;
+    if generations > MAX_GENERATIONS_PER_REQUEST {
+        return Err("too many generations in one request (prompts x n)");
+    }
+    let per = (cap / generations).max(1);
     let mut named = false;
     for field in GENERATION_LIMIT_FIELDS {
         if let Some(v) = obj.get_mut(*field) {
             named = true;
-            if !matches!(v.as_u64(), Some(n) if n <= cap) {
-                *v = serde_json::Value::from(cap);
+            if !matches!(v.as_u64(), Some(n) if n <= per) {
+                *v = serde_json::Value::from(per);
             }
         }
     }
     if !named {
-        obj.insert("max_tokens".to_string(), serde_json::Value::from(cap));
+        obj.insert("max_tokens".to_string(), serde_json::Value::from(per));
     }
-    match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Bytes::from(v),
-        Err(_) => body,
-    }
+    serde_json::to_vec(&serde_json::Value::Object(obj))
+        .map(Bytes::from)
+        .map_err(|_| "request body could not be re-encoded")
 }
 
 fn contains_dot_segment(path: &str) -> bool {
@@ -1402,16 +1443,164 @@ mod tests {
         );
     }
 
+    /// Fail closed (verifier finding): a generation body the proxy cannot
+    /// parse and clamp is refused, including JSON that llama-server would parse
+    /// but serde_json will not (nesting deeper than 128, `1e400`).
     #[test]
-    fn pba_l3b_003_clamp_leaves_non_object_bodies_alone() {
-        for raw in [&b"not json"[..], b"[1,2]", b"42", b""] {
-            let out = clamp_generation_budget(Bytes::copy_from_slice(raw), 10);
-            assert_eq!(&out[..], raw);
+    fn pba_l3b_003_clamp_refuses_what_it_cannot_parse() {
+        let deep = format!(
+            r#"{{"max_tokens":999999,"messages":[],"x":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let bodies: Vec<Vec<u8>> = vec![
+            b"not json".to_vec(),
+            b"[1,2]".to_vec(),
+            b"42".to_vec(),
+            b"".to_vec(),
+            deep.into_bytes(),
+            br#"{"n_predict":999999,"temperature":1e400}"#.to_vec(),
+        ];
+        for raw in bodies {
+            assert!(
+                clamp_generation_budget(&Bytes::from(raw.clone()), 10).is_err(),
+                "{}",
+                String::from_utf8_lossy(&raw)
+            );
         }
         assert!(is_generation(&Method::POST, "/v1/completions"));
         assert!(is_generation(&Method::POST, "/v1/chat/completions"));
         assert!(!is_generation(&Method::GET, "/v1/chat/completions"));
         assert!(!is_generation(&Method::POST, "/v1/embeddings"));
+    }
+
+    /// Verifier PoC `verify_clamp_fail_open_on_unparseable_json`, inverted,
+    /// through the router: the upstream receives nothing and the client 400.
+    #[tokio::test]
+    async fn pba_l3b_003_unparseable_generation_body_is_400_and_not_forwarded() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("fail-closed", 0, 0).unwrap();
+        let app = router_with(store, format!("http://{upstream}"));
+        let deep = format!(
+            r#"{{"max_tokens":999999,"x":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        for body in [
+            deep,
+            r#"{"n_predict":999999,"temperature":1e400}"#.to_string(),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(paths.lock().unwrap().is_empty(), "nothing may be forwarded");
+    }
+
+    /// Prompt arrays and `n` multiply one request's cost; the budget is split
+    /// across generations and more than MAX_GENERATIONS_PER_REQUEST is refused.
+    #[test]
+    fn pba_l3b_003_prompt_arrays_and_n_share_one_budget() {
+        let clamp = |b: &str| {
+            clamp_generation_budget(&Bytes::from(b.to_string()), 800)
+                .map(|o| serde_json::from_slice::<serde_json::Value>(&o).unwrap())
+        };
+        let v = clamp(r#"{"prompt":["a","b","c","d"],"max_tokens":800}"#).unwrap();
+        assert_eq!(v["max_tokens"], 200, "4 prompts share 800");
+        let v = clamp(r#"{"prompt":["a","b"]}"#).unwrap();
+        assert_eq!(v["max_tokens"], 400);
+        let v = clamp(r#"{"prompt":[1,2,3,4,5]}"#).unwrap();
+        assert_eq!(
+            v["max_tokens"], 800,
+            "one token-id prompt is one generation"
+        );
+        let v = clamp(r#"{"prompt":[[1,2],[3]],"n":2}"#).unwrap();
+        assert_eq!(v["max_tokens"], 200, "2 prompts x n=2");
+        let v = clamp(r#"{"messages":[],"n":4,"max_tokens":100}"#).unwrap();
+        assert_eq!(
+            v["max_tokens"], 100,
+            "under the per-generation budget is kept"
+        );
+        let v = clamp(r#"{"prompt":"x","best_of":8}"#).unwrap();
+        assert_eq!(v["max_tokens"], 100);
+        assert!(clamp(r#"{"prompt":["a","b","c","d","e","f","g","h","i"]}"#).is_err());
+        assert!(clamp(r#"{"prompt":["a","b"],"n":5}"#).is_err());
+        assert!(clamp(r#"{"prompt":"x","n":-1}"#).is_err());
+        assert!(clamp(r#"{"prompt":"x","n":"many"}"#).is_err());
+        let v = clamp(r#"{"prompt":"x","n":null}"#).unwrap();
+        assert_eq!(v["max_tokens"], 800);
+        // A tiny cap never rounds a generation down to zero.
+        let o = clamp_generation_budget(&Bytes::from(r#"{"prompt":["a","b","c"]}"#), 2).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o).unwrap();
+        assert_eq!(v["max_tokens"], 1);
+        assert_eq!(generation_count(&serde_json::Map::new()), Ok(1));
+    }
+
+    /// Verifier hand-mutant G4 survived: nothing pinned that the concurrency
+    /// slot is held until the response body has been streamed, not merely
+    /// until the headers arrived. An upstream that sends its headers and a
+    /// first chunk, then stalls, must keep the key's only slot busy.
+    #[tokio::test]
+    async fn pba_l3b_003_slot_is_held_until_the_stream_ends() {
+        let gate = Arc::new(Semaphore::new(0));
+        let g = gate.clone();
+        let upstream = serve_app(Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let g = g.clone();
+                async move {
+                    let chunks = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: first\n\n"))
+                    })
+                    .chain(futures_util::stream::once(async move {
+                        let _p = g.acquire().await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"))
+                    }));
+                    Response::new(Body::from_stream(chunks))
+                }
+            }),
+        ))
+        .await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let key = store.create_key("stream", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(64, 1, 8),
+        );
+        // Headers are back, the body is still streaming.
+        let first = app.clone().oneshot(chat(&key)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(chat(&key)))
+            .await
+            .expect("the surplus request must be refused at once")
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the slot must stay held while the stream is open"
+        );
+        gate.add_permits(1);
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+        // Stream finished: the slot is free again.
+        let third = spawn_chat(&app, &key);
+        gate.add_permits(1);
+        assert_eq!(third.await.unwrap(), StatusCode::OK);
     }
 
     /// An upstream whose chat-completions handler blocks until `gate` has a
