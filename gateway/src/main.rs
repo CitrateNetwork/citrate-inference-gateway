@@ -13,6 +13,23 @@
 //! Defaulting to the existing marketplace mode keeps `gateway.citrate.ai`
 //! unchanged while letting `infer.citrate.ai` flip to the local-proxy
 //! build independently. (See PLANSET.md §"Target topology".)
+//!
+//! ## What this binary does NOT serve (PBA-L3b-I03)
+//!
+//! Neither mode mounts the paid-request routes. The x402 payment router
+//! (`citrate_gateway::build_router_with`, backed by the `x402-axum` crate) and
+//! the API-key debit / refund router (`citrate_gateway::build_router_with_auth`)
+//! exist in the library and are exercised by tests, but `main` builds only:
+//!
+//! - marketplace: [`build_router`], i.e. `/health`, `/v1/models`, `/metrics`,
+//!   plus the unpaid open-chat pilot routes only under the dev profile on a
+//!   loopback bind (FUA-GATEWAY-01); no payment is taken or settled;
+//! - local-proxy: `cgk_` bearer keys with request-count metering; no payment.
+//!
+//! Findings against the x402 and API-key-debit code are therefore latent-code
+//! findings, not live exposure, until a release wires those routers here.
+//! Wiring them is a product decision and was deliberately left out of the
+//! pre-bounty remediation; the bounty scope should say the same.
 
 use std::env;
 use std::sync::Arc;
@@ -100,9 +117,23 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key_source): (Arc<PersistentKeyStore>, _) =
         citrate_gateway::keyvault::open_store(&keystore_path)?;
     tracing::info!(key_source = %key_source, "money-store master key sourced");
+    // PBA-L3b-003: generation ceiling and concurrency limits.
+    let max_tokens = env_number(
+        "CITRATE_GATEWAY_MAX_TOKENS",
+        citrate_gateway::local_proxy::DEFAULT_MAX_TOKENS,
+    )?;
+    let max_per_key = env_number(
+        "CITRATE_GATEWAY_MAX_CONCURRENT_PER_KEY",
+        citrate_gateway::local_proxy::DEFAULT_MAX_CONCURRENT_PER_KEY as u64,
+    )? as usize;
+    let max_upstream = env_number(
+        "CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM",
+        citrate_gateway::local_proxy::DEFAULT_MAX_CONCURRENT_UPSTREAM as u64,
+    )? as usize;
     let state = LocalProxyState::new(store, upstreams.clone())
         .with_embed_upstreams(embed_upstreams.clone())
-        .with_stt(stt_upstreams.clone(), stt_subpath.clone());
+        .with_stt(stt_upstreams.clone(), stt_subpath.clone())
+        .with_limits(max_tokens, max_per_key, max_upstream);
     let app = build_local_proxy_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -117,11 +148,27 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
         stt_upstreams = ?stt_upstreams,
         stt_subpath = %stt_subpath.as_deref().unwrap_or("/v1/audio/transcriptions"),
         keystore = %keystore_path,
+        max_tokens,
+        max_concurrent_per_key = max_per_key,
+        max_concurrent_upstream = max_upstream,
         mode = "local-proxy",
         "gateway listening"
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// A positive integer from the environment, or `default` when unset. A value
+/// that does not parse, or is zero, fails the boot rather than silently
+/// removing a limit.
+fn env_number(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Err(_) => Ok(default),
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!("{name}={raw:?} must be a positive integer").into()),
+        },
+    }
 }
 
 async fn run_marketplace() -> Result<(), Box<dyn std::error::Error>> {

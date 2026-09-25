@@ -521,6 +521,8 @@ pub async fn submit_batch_handler(
 
     let mut total_required = U256::zero();
     let mut largest_requested_tokens = DEFAULT_MAX_TOKENS;
+    // PBA-L3b-I01 (CodeQL uncontrolled-allocation lead, refuted): the
+    // capacity is bounded by the MAX_BATCH_SIZE check above.
     let mut slots = Vec::with_capacity(req.requests.len());
     for mut request in req.requests {
         // Batch requests have already been rejected above when an explicit

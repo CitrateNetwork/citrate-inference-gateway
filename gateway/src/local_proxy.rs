@@ -21,6 +21,13 @@
 //!
 //! # Outcomes
 //!
+//! - A path outside the upstream allowlist ([`ALLOWED_UPSTREAM_PATHS`]) →
+//!   **404**; a path carrying `\`, a percent-encoded `.`, `/` or `\`, or a dot
+//!   segment → **400** (PBA-L3b-004). Both are refused before the key is
+//!   charged or anything is forwarded.
+//! - More than `max_concurrent_per_key` requests in flight on one key →
+//!   **429** + `Retry-After: 1` (PBA-L3b-003).
+//! - Upstream capacity exhausted for [`UPSTREAM_QUEUE_WAIT`] → **503**.
 //! - Missing / malformed `Authorization` → **401**.
 //! - Unknown or revoked key → **401**.
 //! - Per-second rate exceeded → **429** + `Retry-After: 1`.
@@ -30,6 +37,7 @@
 //! - Upstream unreachable / 5xx → **502**.
 //! - Otherwise → upstream's status + body forwarded.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +47,8 @@ use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{any, get};
 use axum::Router;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::{Any as CorsAny, CorsLayer};
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
@@ -81,6 +90,42 @@ const DEFAULT_STT_SUBPATH: &str = "/v1/audio/transcriptions";
 /// The one route (OpenAI Whisper shape) diverted to the STT backend.
 const STT_TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 
+/// PBA-L3b-004: the only upstream routes the proxy forwards, matched exactly
+/// against the raw request path (query string excluded). Everything else is
+/// 404 before the key is charged. An allowlist rather than a blocklist because
+/// the upstream (llama-server) also serves `/slots`, `/props`, `/metrics` and
+/// friends, which a `cgk_` key must never reach however the path is spelled.
+pub const ALLOWED_UPSTREAM_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/models",
+    STT_TRANSCRIPTIONS_PATH,
+];
+
+/// PBA-L3b-003: default ceiling on tokens one generation may request. A body
+/// asking for more (or for "unlimited", llama.cpp's `n_predict: -1`) is clamped
+/// to it, and a body that names no limit gets it. Overridable with
+/// `CITRATE_GATEWAY_MAX_TOKENS`.
+pub const DEFAULT_MAX_TOKENS: u64 = 2048;
+
+/// PBA-L3b-003: default number of requests one key may have in flight. The
+/// N+1th gets 429. Overridable with `CITRATE_GATEWAY_MAX_CONCURRENT_PER_KEY`.
+pub const DEFAULT_MAX_CONCURRENT_PER_KEY: usize = 4;
+
+/// PBA-L3b-003: default number of requests in flight to the upstreams across
+/// all keys. Waiters queue first-come first-served (tokio's semaphore is
+/// fair), and because each key can hold at most `max_concurrent_per_key` places
+/// in that queue, one key cannot starve the others. Overridable with
+/// `CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM`.
+pub const DEFAULT_MAX_CONCURRENT_UPSTREAM: usize = 32;
+
+/// How long a request waits for upstream capacity before a 503.
+pub const UPSTREAM_QUEUE_WAIT: Duration = Duration::from_secs(60);
+
+/// Body fields that set a generation's length (OpenAI, and llama.cpp native).
+const GENERATION_LIMIT_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "n_predict"];
+
 /// Shared state for the local-proxy router. Cheap to clone (all Arc / Client).
 #[derive(Clone)]
 pub struct LocalProxyState {
@@ -112,6 +157,15 @@ pub struct LocalProxyState {
     pub stt_subpath: String,
     /// HTTP client used to talk to the upstream(s).
     pub http: reqwest::Client,
+    /// PBA-L3b-003: generation-length ceiling (see [`DEFAULT_MAX_TOKENS`]).
+    pub max_tokens: u64,
+    /// PBA-L3b-003: in-flight requests allowed per key.
+    pub max_concurrent_per_key: usize,
+    /// PBA-L3b-003: one semaphore per key hash, created on the key's first
+    /// authenticated request (so only valid keys ever get an entry).
+    per_key_slots: Arc<parking_lot::Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// PBA-L3b-003: shared, fair upstream capacity.
+    upstream_slots: Arc<Semaphore>,
 }
 
 impl LocalProxyState {
@@ -136,7 +190,36 @@ impl LocalProxyState {
             stt_upstreams: Vec::new(),
             stt_subpath: DEFAULT_STT_SUBPATH.to_string(),
             http,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_concurrent_per_key: DEFAULT_MAX_CONCURRENT_PER_KEY,
+            per_key_slots: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            upstream_slots: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_UPSTREAM)),
         }
+    }
+
+    /// PBA-L3b-003: set the generation ceiling and the concurrency limits.
+    /// Zero values are raised to 1 (a limit of zero would refuse everything).
+    pub fn with_limits(
+        mut self,
+        max_tokens: u64,
+        max_concurrent_per_key: usize,
+        max_concurrent_upstream: usize,
+    ) -> Self {
+        self.max_tokens = max_tokens.max(1);
+        self.max_concurrent_per_key = max_concurrent_per_key.max(1);
+        self.upstream_slots = Arc::new(Semaphore::new(max_concurrent_upstream.max(1)));
+        self
+    }
+
+    /// Take one of this key's in-flight slots, or `None` if all are in use.
+    fn try_key_slot(&self, key_hash: &str) -> Option<OwnedSemaphorePermit> {
+        let sem = self
+            .per_key_slots
+            .lock()
+            .entry(key_hash.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.max_concurrent_per_key)))
+            .clone();
+        sem.try_acquire_owned().ok()
     }
 
     /// Set dedicated `/v1/embeddings` upstream(s). Empty is a no-op
@@ -199,11 +282,15 @@ async fn proxy_handler(
     };
 
     // The proxy is mounted under /v1/, but the outbound URL builder and
-    // upstream HTTP stack may normalize dot segments. Reject them at this
-    // boundary before quota consumption or forwarding so neither raw nor
-    // percent-encoded traversal can escape the intended route prefix.
-    if contains_dot_segment(uri.path()) {
-        return json_error(StatusCode::BAD_REQUEST, "dot-segment path is not allowed");
+    // upstream HTTP stack may normalize dot segments — and reqwest treats `\`
+    // as a separator, so `/v1/..\slots` reached the upstream as `/slots`
+    // (PBA-L3b-004). Reject every traversal spelling at this boundary, then
+    // forward only allowlisted routes, before quota consumption or forwarding.
+    if path_is_unsafe(uri.path()) {
+        return json_error(StatusCode::BAD_REQUEST, "path is not allowed");
+    }
+    if !ALLOWED_UPSTREAM_PATHS.contains(&uri.path()) {
+        return json_error(StatusCode::NOT_FOUND, "unknown route");
     }
 
     let consumed = match state.store.try_consume(&key_id) {
@@ -232,6 +319,13 @@ async fn proxy_handler(
         }
     };
 
+    // PBA-L3b-003: bound this key's in-flight requests. Held until the
+    // response body has been fully streamed (or dropped).
+    let key_slot = match state.try_key_slot(&consumed.hash) {
+        Some(p) => p,
+        None => return rate_limited(1, "too many concurrent requests for this api key"),
+    };
+
     tracing::info!(
         key_label = %consumed.label,
         key_hash_prefix = %&consumed.hash[..16.min(consumed.hash.len())],
@@ -253,20 +347,51 @@ async fn proxy_handler(
     let mut forward = headers.clone();
     forward.remove(header::AUTHORIZATION);
     forward.remove(header::HOST);
+    // The body may be rewritten below (generation clamp); let reqwest set the
+    // length from the bytes actually sent.
+    forward.remove(header::CONTENT_LENGTH);
     strip_hop_by_hop(&mut forward);
 
     // STT (`POST /v1/audio/transcriptions`) carries an audio upload, so it
     // gets the larger MAX_STT_BODY cap; every other route keeps the 8 MiB chat
     // cap. Detected here so the cap is chosen before the body is buffered.
     let is_stt = is_stt_transcriptions(&method, uri.path());
-    let max_body = if is_stt { MAX_STT_BODY } else { MAX_REQUEST_BODY };
+    let max_body = if is_stt {
+        MAX_STT_BODY
+    } else {
+        MAX_REQUEST_BODY
+    };
     let body_bytes = match axum::body::to_bytes(body, max_body).await {
         Ok(b) => b,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
     };
+    // PBA-L3b-003: a key is metered per request, so a request must not be able
+    // to ask for an unbounded generation.
+    // Fail closed: a body this proxy cannot parse and clamp is refused, never
+    // forwarded as-is (llama-server's parser accepts JSON that serde_json
+    // rejects, e.g. nesting deeper than 128 or `1e400`).
+    let body_bytes = if is_generation(&method, uri.path()) {
+        match clamp_generation_budget(&body_bytes, state.max_tokens) {
+            Ok(b) => b,
+            Err(msg) => return json_error(StatusCode::BAD_REQUEST, msg),
+        }
+    } else {
+        body_bytes
+    };
 
-    let reqw_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::POST);
+    // PBA-L3b-003: wait (fairly, FIFO) for shared upstream capacity.
+    let upstream_slot = match tokio::time::timeout(
+        UPSTREAM_QUEUE_WAIT,
+        state.upstream_slots.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        _ => return json_error(StatusCode::SERVICE_UNAVAILABLE, "upstream busy"),
+    };
+
+    let reqw_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
 
     // Try each upstream in order. Connection-level failure or a 5xx
     // status falls over to the next. 2xx/3xx/4xx from an upstream is
@@ -345,10 +470,18 @@ async fn proxy_handler(
     // SSE preserved: bytes_stream() yields chunks as they arrive without
     // buffering the whole response. This is the streaming-critical path —
     // never collect() / bytes() / text() the upstream response.
+    // The concurrency permits ride along with the stream, so they are released
+    // when the client has the whole response or goes away, not when headers
+    // arrive (a long SSE generation is exactly what they must account for).
+    let permits = (key_slot, upstream_slot);
     let stream = upstream_resp
         .bytes_stream()
         .map_ok(Bytes::from)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(std::io::Error::other)
+        .map(move |chunk| {
+            let _held = &permits;
+            chunk
+        });
     let body = Body::from_stream(stream);
 
     let mut out = Response::new(body);
@@ -366,6 +499,88 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// PBA-L3b-004: any spelling of path traversal. A raw `\` (reqwest and many
+/// servers treat it as `/`), a percent-encoded `.`, `/` or `\` (no legitimate
+/// allowlisted route needs one), or a dot segment after decoding.
+fn path_is_unsafe(path: &str) -> bool {
+    if path.contains('\\') {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    if ["%2e", "%2f", "%5c"].iter().any(|enc| lower.contains(enc)) {
+        return true;
+    }
+    contains_dot_segment(path)
+}
+
+/// POST routes that generate text, and so take a generation limit.
+fn is_generation(method: &Method, path: &str) -> bool {
+    *method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions")
+}
+
+/// PBA-L3b-003: most generations one request may ask for (prompts x `n`).
+/// llama-server fans a prompt array (and `n`) out into one task each, so each
+/// one multiplies the cost of a single metered request.
+pub const MAX_GENERATIONS_PER_REQUEST: u64 = 8;
+
+/// How many generations a body asks for: the number of prompts (a string or a
+/// token-id array is one; an array of strings or token arrays is one each)
+/// times `n` / `best_of`. `Err` for a shape this proxy will not meter.
+fn generation_count(obj: &serde_json::Map<String, serde_json::Value>) -> Result<u64, &'static str> {
+    let prompts = match obj.get("prompt") {
+        Some(serde_json::Value::Array(items)) if items.iter().all(|i| i.is_number()) => 1,
+        Some(serde_json::Value::Array(items)) => items.len() as u64,
+        _ => 1,
+    };
+    let mut per_prompt = 1u64;
+    for field in ["n", "best_of"] {
+        match obj.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) => match v.as_u64() {
+                Some(k) => per_prompt = per_prompt.max(k),
+                None => return Err("n / best_of must be a non-negative integer"),
+            },
+        }
+    }
+    Ok(prompts.max(1).saturating_mul(per_prompt.max(1)))
+}
+
+/// PBA-L3b-003: bound what one request can generate. The request's total
+/// budget is `cap` tokens, split evenly across its generations (see
+/// [`generation_count`]); more than [`MAX_GENERATIONS_PER_REQUEST`] is
+/// refused. Every generation-length field that is not a non-negative integer
+/// within the per-generation budget (including llama.cpp's `-1` = "unlimited",
+/// and non-numbers) is set to it, and a body naming none gets `max_tokens`.
+///
+/// Fails closed: a body that is not a JSON object serde_json can parse is an
+/// `Err` (the caller answers 400), never forwarded unclamped.
+fn clamp_generation_budget(body: &Bytes, cap: u64) -> Result<Bytes, &'static str> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return Err("request body must be a JSON object");
+    };
+    let generations = generation_count(&obj)?;
+    if generations > MAX_GENERATIONS_PER_REQUEST {
+        return Err("too many generations in one request (prompts x n)");
+    }
+    let per = (cap / generations).max(1);
+    let mut named = false;
+    for field in GENERATION_LIMIT_FIELDS {
+        if let Some(v) = obj.get_mut(*field) {
+            named = true;
+            if !matches!(v.as_u64(), Some(n) if n <= per) {
+                *v = serde_json::Value::from(per);
+            }
+        }
+    }
+    if !named {
+        obj.insert("max_tokens".to_string(), serde_json::Value::from(per));
+    }
+    serde_json::to_vec(&serde_json::Value::Object(obj))
+        .map(Bytes::from)
+        .map_err(|_| "request body could not be re-encoded")
+}
+
 fn contains_dot_segment(path: &str) -> bool {
     let decoded = percent_decode_path(path);
     decoded
@@ -380,10 +595,9 @@ fn percent_decode_path(path: &str) -> String {
 
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (
-                hex_value(bytes[index + 1]),
-                hex_value(bytes[index + 2]),
-            ) {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
                 decoded.push((high << 4) | low);
                 index += 3;
                 continue;
@@ -487,20 +701,16 @@ mod tests {
                         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
                          data: [DONE]\n\n",
                     ));
-                    r.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
+                    r.headers_mut()
+                        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
                     r
                 } else {
                     let _ = body; // suppress unused
                     let mut r = Response::new(Body::from(
                         r#"{"choices":[{"message":{"role":"assistant","content":"OK"}}]}"#,
                     ));
-                    r.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        "application/json".parse().unwrap(),
-                    );
+                    r.headers_mut()
+                        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
                     r
                 }
             }),
@@ -518,7 +728,10 @@ mod tests {
         let app = Router::new().fallback(any(move |uri: Uri| {
             let paths = paths.clone();
             async move {
-                paths.lock().expect("paths mutex").push(uri.path().to_string());
+                paths
+                    .lock()
+                    .expect("paths mutex")
+                    .push(uri.path().to_string());
                 (StatusCode::OK, "ok")
             }
         }));
@@ -527,7 +740,9 @@ mod tests {
             .expect("bind recording upstream");
         let addr = listener.local_addr().expect("local_addr");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("recording upstream serve");
+            axum::serve(listener, app)
+                .await
+                .expect("recording upstream serve");
         });
         addr
     }
@@ -746,7 +961,11 @@ mod tests {
 
         let embed_hits = embed_paths.lock().unwrap().clone();
         let chat_hits = chat_paths.lock().unwrap().clone();
-        assert_eq!(embed_hits, vec!["/v1/embeddings".to_string()], "embed upstream");
+        assert_eq!(
+            embed_hits,
+            vec!["/v1/embeddings".to_string()],
+            "embed upstream"
+        );
         assert_eq!(
             chat_hits,
             vec!["/v1/chat/completions".to_string()],
@@ -839,12 +1058,7 @@ mod tests {
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("dot-segments", 0, 0).unwrap();
 
-        for path in [
-            "/v1/../x",
-            "/v1/%2e%2e/x",
-            "/v1/a/../../x",
-            "/v1/.%2e/x",
-        ] {
+        for path in ["/v1/../x", "/v1/%2e%2e/x", "/v1/a/../../x", "/v1/.%2e/x"] {
             let app = router_with(store.clone(), format!("http://{upstream_addr}"));
             let resp = app
                 .oneshot(
@@ -956,11 +1170,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("stt-subpath", 0, 0).unwrap();
-        let state = LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()])
-            .with_stt(
-                vec![format!("http://{stt_addr}")],
-                Some("/inference".to_string()),
-            );
+        let state = LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()]).with_stt(
+            vec![format!("http://{stt_addr}")],
+            Some("/inference".to_string()),
+        );
         let app = build_local_proxy_router(state);
 
         let resp = app
@@ -1012,5 +1225,565 @@ mod tests {
             chat_paths.lock().unwrap().clone(),
             vec!["/v1/audio/transcriptions".to_string()]
         );
+    }
+
+    // ── PBA-L3b-004: path traversal past /v1/ ─────────────────────────
+
+    /// Serve `app` on an ephemeral port (a real socket, so the request line
+    /// reaches axum byte-for-byte, the way the audit PoC sent it).
+    async fn serve_app(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        addr
+    }
+
+    /// Send a raw `POST <raw_path>` and return the numeric status.
+    async fn raw_post_status(gw: SocketAddr, raw_path: &str, bearer: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(gw).await.unwrap();
+        let req = format!(
+            "POST {raw_path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {bearer}\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// The audit PoC, inverted. Before the fix every one of these returned 200
+    /// and the upstream saw `/slots` and `/props`.
+    #[tokio::test]
+    async fn pba_l3b_004_backslash_dot_segment_cannot_escape_v1() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream_addr = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("bs", 0, 0).unwrap();
+        let gw = serve_app(router_with(
+            store.clone(),
+            format!("http://{upstream_addr}"),
+        ))
+        .await;
+        for raw_path in [
+            "/v1/..\\slots",
+            "/v1/%2e%2e%5cslots",
+            "/v1/x\\..\\..\\props",
+            "/v1/..%5Cslots",
+        ] {
+            assert_eq!(
+                raw_post_status(gw, raw_path, &id).await,
+                400,
+                "{raw_path:?}"
+            );
+        }
+        let seen = paths.lock().unwrap().clone();
+        assert!(seen.is_empty(), "nothing may reach the upstream: {seen:?}");
+    }
+
+    /// Tripwire: every traversal spelling is refused (400), a route outside the
+    /// allowlist is 404, nothing reaches the upstream, and none of it charges
+    /// the key (a 1-request daily quota is still available afterwards).
+    #[tokio::test]
+    async fn pba_l3b_004_traversal_spelling_table() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream_addr = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("table", 0, 1).unwrap();
+        let gw = serve_app(router_with(
+            store.clone(),
+            format!("http://{upstream_addr}"),
+        ))
+        .await;
+        let table: &[(&str, u16)] = &[
+            // backslash, raw and encoded (`..\`, `%5c`)
+            ("/v1/..\\slots", 400),
+            ("/v1/x\\..\\..\\props", 400),
+            ("/v1/chat\\completions", 400),
+            ("/v1/chat/completions/..\\..\\slots", 400),
+            ("/v1/..%5cslots", 400),
+            ("/v1/..%5Cslots", 400),
+            ("/v1/%5c..%5cslots", 400),
+            // encoded dots (`%2e%2e`) and encoded slash
+            ("/v1/%2e%2e/slots", 400),
+            ("/v1/%2E%2E/props", 400),
+            ("/v1/%2e%2e%5cslots", 400),
+            ("/v1/.%2e/slots", 400),
+            ("/v1/%2e/chat/completions", 400),
+            ("/v1/chat%2fcompletions", 400),
+            ("/v1/chat%2Fcompletions", 400),
+            // plain dot segments
+            ("/v1/../slots", 400),
+            ("/v1/chat/completions/../../slots", 400),
+            ("/v1/./chat/completions", 400),
+            // well-formed but not an allowlisted upstream route
+            ("/v1/slots", 404),
+            ("/v1/props", 404),
+            ("/v1/metrics", 404),
+            ("/v1/chat/completions/extra", 404),
+            ("/v1/models/../../slots", 400),
+        ];
+        for (raw_path, want) in table {
+            assert_eq!(
+                raw_post_status(gw, raw_path, &id).await,
+                *want,
+                "{raw_path:?}"
+            );
+        }
+        assert!(
+            paths.lock().unwrap().is_empty(),
+            "no rejected path may be forwarded"
+        );
+        // The rejections were free: the key's single daily request is intact.
+        assert_eq!(raw_post_status(gw, "/v1/chat/completions", &id).await, 200);
+        assert_eq!(raw_post_status(gw, "/v1/chat/completions", &id).await, 429);
+    }
+
+    #[test]
+    fn pba_l3b_004_every_allowlisted_route_passes_the_path_check() {
+        for p in ALLOWED_UPSTREAM_PATHS {
+            assert!(!path_is_unsafe(p), "{p}");
+        }
+        assert!(path_is_unsafe("/v1/a\\b"));
+        assert!(path_is_unsafe("/v1/%2E"));
+        assert!(path_is_unsafe("/v1/%2F"));
+        assert!(path_is_unsafe("/v1/%5C"));
+        assert!(!path_is_unsafe("/v1/%41"));
+    }
+
+    // ── PBA-L3b-003: one key cannot pin the upstream ───────────────────
+
+    /// An upstream that records each chat-completions body it receives.
+    async fn spawn_body_recording_upstream(
+        bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> SocketAddr {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let bodies = bodies.clone();
+                async move {
+                    bodies
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null));
+                    (StatusCode::OK, "{}")
+                }
+            }),
+        );
+        serve_app(app).await
+    }
+
+    #[tokio::test]
+    async fn pba_l3b_003_generation_budget_is_clamped_before_forwarding() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let upstream = spawn_body_recording_upstream(bodies.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("clamp", 0, 0).unwrap();
+        let cap = 256u64;
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(cap, 4, 8),
+        );
+        let cases = [
+            r#"{"messages":[],"max_tokens":1000000}"#,
+            r#"{"messages":[]}"#,
+            r#"{"messages":[],"max_tokens":100}"#,
+            r#"{"prompt":"x","n_predict":-1}"#,
+            r#"{"messages":[],"max_completion_tokens":"lots"}"#,
+            r#"{"messages":[],"max_tokens":256}"#,
+        ];
+        for body in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CONTENT_LENGTH, body.len())
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        }
+        let seen = bodies.lock().unwrap().clone();
+        assert_eq!(seen.len(), cases.len());
+        assert_eq!(seen[0]["max_tokens"], cap, "an oversized budget is clamped");
+        assert_eq!(seen[1]["max_tokens"], cap, "a missing budget gets the cap");
+        assert_eq!(seen[2]["max_tokens"], 100, "a budget under the cap is kept");
+        assert_eq!(
+            seen[3]["n_predict"], cap,
+            "llama.cpp 'unlimited' is clamped"
+        );
+        assert!(
+            seen[3].get("max_tokens").is_none(),
+            "no second limit is invented"
+        );
+        assert_eq!(
+            seen[4]["max_completion_tokens"], cap,
+            "a non-number is replaced"
+        );
+        assert_eq!(seen[5]["max_tokens"], cap, "a budget at the cap is kept");
+        assert_eq!(
+            seen[0]["messages"],
+            serde_json::json!([]),
+            "other fields untouched"
+        );
+    }
+
+    /// Fail closed (verifier finding): a generation body the proxy cannot
+    /// parse and clamp is refused, including JSON that llama-server would parse
+    /// but serde_json will not (nesting deeper than 128, `1e400`).
+    #[test]
+    fn pba_l3b_003_clamp_refuses_what_it_cannot_parse() {
+        let deep = format!(
+            r#"{{"max_tokens":999999,"messages":[],"x":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let bodies: Vec<Vec<u8>> = vec![
+            b"not json".to_vec(),
+            b"[1,2]".to_vec(),
+            b"42".to_vec(),
+            b"".to_vec(),
+            deep.into_bytes(),
+            br#"{"n_predict":999999,"temperature":1e400}"#.to_vec(),
+        ];
+        for raw in bodies {
+            assert!(
+                clamp_generation_budget(&Bytes::from(raw.clone()), 10).is_err(),
+                "{}",
+                String::from_utf8_lossy(&raw)
+            );
+        }
+        assert!(is_generation(&Method::POST, "/v1/completions"));
+        assert!(is_generation(&Method::POST, "/v1/chat/completions"));
+        assert!(!is_generation(&Method::GET, "/v1/chat/completions"));
+        assert!(!is_generation(&Method::POST, "/v1/embeddings"));
+    }
+
+    /// Verifier PoC `verify_clamp_fail_open_on_unparseable_json`, inverted,
+    /// through the router: the upstream receives nothing and the client 400.
+    #[tokio::test]
+    async fn pba_l3b_003_unparseable_generation_body_is_400_and_not_forwarded() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("fail-closed", 0, 0).unwrap();
+        let app = router_with(store, format!("http://{upstream}"));
+        let deep = format!(
+            r#"{{"max_tokens":999999,"x":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        for body in [
+            deep,
+            r#"{"n_predict":999999,"temperature":1e400}"#.to_string(),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(header::AUTHORIZATION, format!("Bearer {id}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(paths.lock().unwrap().is_empty(), "nothing may be forwarded");
+    }
+
+    /// Prompt arrays and `n` multiply one request's cost; the budget is split
+    /// across generations and more than MAX_GENERATIONS_PER_REQUEST is refused.
+    #[test]
+    fn pba_l3b_003_prompt_arrays_and_n_share_one_budget() {
+        let clamp = |b: &str| {
+            clamp_generation_budget(&Bytes::from(b.to_string()), 800)
+                .map(|o| serde_json::from_slice::<serde_json::Value>(&o).unwrap())
+        };
+        let v = clamp(r#"{"prompt":["a","b","c","d"],"max_tokens":800}"#).unwrap();
+        assert_eq!(v["max_tokens"], 200, "4 prompts share 800");
+        let v = clamp(r#"{"prompt":["a","b"]}"#).unwrap();
+        assert_eq!(v["max_tokens"], 400);
+        let v = clamp(r#"{"prompt":[1,2,3,4,5]}"#).unwrap();
+        assert_eq!(
+            v["max_tokens"], 800,
+            "one token-id prompt is one generation"
+        );
+        let v = clamp(r#"{"prompt":[[1,2],[3]],"n":2}"#).unwrap();
+        assert_eq!(v["max_tokens"], 200, "2 prompts x n=2");
+        let v = clamp(r#"{"messages":[],"n":4,"max_tokens":100}"#).unwrap();
+        assert_eq!(
+            v["max_tokens"], 100,
+            "under the per-generation budget is kept"
+        );
+        let v = clamp(r#"{"prompt":"x","best_of":8}"#).unwrap();
+        assert_eq!(v["max_tokens"], 100);
+        assert!(clamp(r#"{"prompt":["a","b","c","d","e","f","g","h","i"]}"#).is_err());
+        assert!(clamp(r#"{"prompt":["a","b"],"n":5}"#).is_err());
+        assert!(clamp(r#"{"prompt":"x","n":-1}"#).is_err());
+        assert!(clamp(r#"{"prompt":"x","n":"many"}"#).is_err());
+        let v = clamp(r#"{"prompt":"x","n":null}"#).unwrap();
+        assert_eq!(v["max_tokens"], 800);
+        // A tiny cap never rounds a generation down to zero.
+        let o = clamp_generation_budget(&Bytes::from(r#"{"prompt":["a","b","c"]}"#), 2).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o).unwrap();
+        assert_eq!(v["max_tokens"], 1);
+        assert_eq!(generation_count(&serde_json::Map::new()), Ok(1));
+    }
+
+    /// Verifier hand-mutant G4 survived: nothing pinned that the concurrency
+    /// slot is held until the response body has been streamed, not merely
+    /// until the headers arrived. An upstream that sends its headers and a
+    /// first chunk, then stalls, must keep the key's only slot busy.
+    #[tokio::test]
+    async fn pba_l3b_003_slot_is_held_until_the_stream_ends() {
+        let gate = Arc::new(Semaphore::new(0));
+        let g = gate.clone();
+        let upstream = serve_app(Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let g = g.clone();
+                async move {
+                    let chunks = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: first\n\n"))
+                    })
+                    .chain(futures_util::stream::once(async move {
+                        let _p = g.acquire().await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"))
+                    }));
+                    Response::new(Body::from_stream(chunks))
+                }
+            }),
+        ))
+        .await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let key = store.create_key("stream", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(64, 1, 8),
+        );
+        // Headers are back, the body is still streaming.
+        let first = app.clone().oneshot(chat(&key)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(chat(&key)))
+            .await
+            .expect("the surplus request must be refused at once")
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the slot must stay held while the stream is open"
+        );
+        gate.add_permits(1);
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+        // Stream finished: the slot is free again.
+        let third = spawn_chat(&app, &key);
+        gate.add_permits(1);
+        assert_eq!(third.await.unwrap(), StatusCode::OK);
+    }
+
+    /// An upstream whose chat-completions handler blocks until `gate` has a
+    /// permit, counting requests in flight.
+    async fn spawn_gated_upstream(
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<Semaphore>,
+    ) -> SocketAddr {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let in_flight = in_flight.clone();
+                let gate = gate.clone();
+                async move {
+                    in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _p = gate.acquire().await;
+                    (StatusCode::OK, "{}")
+                }
+            }),
+        );
+        serve_app(app).await
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within 5s");
+    }
+
+    fn chat(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    /// Spawn a request and return its status once the full body is read (the
+    /// concurrency permit is held until then).
+    fn spawn_chat(app: &Router, key: &str) -> tokio::task::JoinHandle<StatusCode> {
+        let app = app.clone();
+        let req = chat(key);
+        tokio::spawn(async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+            status
+        })
+    }
+
+    /// Tripwire: with a per-key limit of N, the N+1th concurrent request on a
+    /// key gets 429 (with Retry-After), another key is unaffected, and the
+    /// slots come back once the responses have been read.
+    #[tokio::test]
+    async fn pba_l3b_003_n_plus_first_concurrent_request_on_a_key_is_429() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let upstream = spawn_gated_upstream(in_flight.clone(), gate.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let a = store.create_key("a", 0, 0).unwrap();
+        let b = store.create_key("b", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(64, 2, 32),
+        );
+
+        let a1 = spawn_chat(&app, &a);
+        let a2 = spawn_chat(&app, &a);
+        wait_until(|| in_flight.load(Ordering::SeqCst) == 2).await;
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(chat(&a)))
+            .await
+            .expect("the surplus request must be refused at once, not queued")
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "N+1th on key a"
+        );
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+        // Key b has its own slots.
+        let b1 = spawn_chat(&app, &b);
+        wait_until(|| in_flight.load(Ordering::SeqCst) == 3).await;
+
+        gate.add_permits(100);
+        for h in [a1, a2, b1] {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
+        // Slots were released with the bodies: key a may go again.
+        let again = spawn_chat(&app, &a);
+        assert_eq!(again.await.unwrap(), StatusCode::OK);
+    }
+
+    /// Fairness across keys: with the upstream full, one key's surplus is
+    /// refused (429) rather than queued, while another key's request waits in
+    /// line and is served as soon as capacity frees.
+    #[tokio::test]
+    async fn pba_l3b_003_upstream_capacity_is_shared_fairly_across_keys() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let upstream = spawn_gated_upstream(in_flight.clone(), gate.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let a = store.create_key("a", 0, 0).unwrap();
+        let b = store.create_key("b", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(64, 2, 2),
+        );
+
+        let a1 = spawn_chat(&app, &a);
+        let a2 = spawn_chat(&app, &a);
+        wait_until(|| in_flight.load(Ordering::SeqCst) == 2).await;
+        let resp = tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(chat(&a)))
+            .await
+            .expect("the surplus request must be refused at once, not queued")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // b queues for the shared upstream instead of being refused.
+        let b1 = spawn_chat(&app, &b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(in_flight.load(Ordering::SeqCst), 2, "b waits for capacity");
+        assert!(!b1.is_finished());
+
+        gate.add_permits(100);
+        assert_eq!(b1.await.unwrap(), StatusCode::OK);
+        for h in [a1, a2] {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn pba_l3b_003_limits_are_never_zero() {
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let st =
+            LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()]).with_limits(0, 0, 0);
+        assert_eq!(st.max_tokens, 1);
+        assert_eq!(st.max_concurrent_per_key, 1);
+        assert_eq!(st.upstream_slots.available_permits(), 1);
+        let dir2 = tempdir().unwrap();
+        let d = LocalProxyState::new(
+            PersistentKeyStore::open(dir2.path(), TEST_MASTER).unwrap(),
+            vec!["http://127.0.0.1:1".into()],
+        );
+        assert_eq!(d.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(d.max_concurrent_per_key, DEFAULT_MAX_CONCURRENT_PER_KEY);
+        assert_eq!(
+            d.upstream_slots.available_permits(),
+            DEFAULT_MAX_CONCURRENT_UPSTREAM
+        );
+    }
+
+    /// An upstream 5xx falls over to the next upstream (kills the cargo-mutants
+    /// survivor on the failover guard found while mutating PBA-L3b-003/-004).
+    #[tokio::test]
+    async fn upstream_5xx_falls_over_to_the_next_upstream() {
+        let failing = serve_app(Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        ))
+        .await;
+        let good = spawn_upstream(false).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let id = store.create_key("5xx", 0, 0).unwrap();
+        let app = build_local_proxy_router(LocalProxyState::new(
+            store,
+            vec![format!("http://{failing}"), format!("http://{good}")],
+        ));
+        let resp = app.oneshot(chat(&id)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&b).contains(r#""content":"OK""#));
     }
 }
