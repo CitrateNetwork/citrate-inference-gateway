@@ -13,6 +13,23 @@
 //! Defaulting to the existing marketplace mode keeps `gateway.citrate.ai`
 //! unchanged while letting `infer.citrate.ai` flip to the local-proxy
 //! build independently. (See PLANSET.md §"Target topology".)
+//!
+//! ## What this binary does NOT serve (PBA-L3b-I03)
+//!
+//! Neither mode mounts the paid-request routes. The x402 payment router
+//! (`citrate_gateway::build_router_with`, backed by the `x402-axum` crate) and
+//! the API-key debit / refund router (`citrate_gateway::build_router_with_auth`)
+//! exist in the library and are exercised by tests, but `main` builds only:
+//!
+//! - marketplace: [`build_router`], i.e. `/health`, `/v1/models`, `/metrics`,
+//!   plus the unpaid open-chat pilot routes only under the dev profile on a
+//!   loopback bind (FUA-GATEWAY-01); no payment is taken or settled;
+//! - local-proxy: `cgk_` bearer keys with request-count metering; no payment.
+//!
+//! Findings against the x402 and API-key-debit code are therefore latent-code
+//! findings, not live exposure, until a release wires those routers here.
+//! Wiring them is a product decision and was deliberately left out of the
+//! pre-bounty remediation; the bounty scope should say the same.
 
 use std::env;
 use std::sync::Arc;

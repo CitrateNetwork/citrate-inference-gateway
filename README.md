@@ -85,10 +85,19 @@ curl -s http://127.0.0.1:9800/health              # liveness
 curl -s http://127.0.0.1:9800/v1/models           # advertised models (marketplace mode)
 ```
 
-Marketplace routes: `/health`, `/v1/models`, `/metrics`, and the x402-gated
-`/v1/chat/completions`, `/v1/batch`, `/v1/batch/:id`. local-proxy routes:
-`/health` and `/v1/*` (forwarded to the upstream). Both bind loopback by default —
-a non-loopback bind logs a warning; front it with a TLS reverse proxy.
+Marketplace routes served by this binary: `/health`, `/v1/models`, `/metrics`
+(plus the unpaid open-chat pilot routes, only under the dev profile on a loopback
+bind). local-proxy routes: `/health`, and the allowlisted `/v1/chat/completions`,
+`/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions`
+forwarded to the upstream (any other path is 404; a path with `\`, an encoded
+`.`/`/`/`\` or a dot segment is 400). Both bind loopback by default — a
+non-loopback bind logs a warning; front it with a TLS reverse proxy.
+
+> **Paid routes are not served (PBA-L3b-I03).** The x402 payment router
+> (`build_router_with`, `x402-axum`) and the API-key debit/refund router
+> (`build_router_with_auth`) are library code exercised by tests; the shipped
+> binary mounts neither. Issues in that code are latent until a release wires
+> them into `main.rs`, and bounty scope should treat them that way.
 
 ## Connect it locally  ← the differentiator
 
@@ -119,7 +128,10 @@ See the full multi-repo bring-up: https://docs.citrate.ai/local-stack
 - local-proxy: `CITRATE_GATEWAY_UPSTREAM_URL` (default `http://127.0.0.1:8181`, comma-list),
   `CITRATE_GATEWAY_EMBED_UPSTREAM_URL`, `CITRATE_GATEWAY_KEYSTORE_PATH`
   (default `/var/lib/citrate-gateway/keystore`), `GATEWAY_STORE_KEY` /
-  `GATEWAY_STORE_KEY_FILE` (money-store master key; encrypted at rest, ENCRYPT-S1).
+  `GATEWAY_STORE_KEY_FILE` (money-store master key; encrypted at rest, ENCRYPT-S1),
+  `CITRATE_GATEWAY_MAX_TOKENS` (generation ceiling, default 2048),
+  `CITRATE_GATEWAY_MAX_CONCURRENT_PER_KEY` (default 4; the next request is 429),
+  `CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM` (fair shared queue, default 32).
 - marketplace: `CITRATE_GATEWAY_RPC_URL` (default `http://127.0.0.1:8545`),
   `CITRATE_GATEWAY_CHAIN_ID` (default 40204), `CITRATE_GATEWAY_MODEL_REGISTRY`,
   `CITRATE_GATEWAY_INFERENCE_ROUTER`, `CITRATE_GATEWAY_PRICING_ORACLE`.
