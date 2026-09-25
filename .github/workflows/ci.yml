@@ -59,7 +59,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Blocking (PBA R2): the tokio-shutdown hang that justified
       # continue-on-error is gone, so a failing test now fails the job.
