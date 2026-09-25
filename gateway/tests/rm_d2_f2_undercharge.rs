@@ -26,9 +26,9 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use x402_axum::keys::{derive_secp256k1_address, sign_digest_secp256k1};
 use x402_axum::{
-    encode_payment_header, eip712_digest, payment_settled_topic,
-    transfer_with_authorization_struct_hash, ChainClient, RawLog, TxReceipt, X402Client,
-    X402Error, X_PAYMENT_HEADER,
+    eip712_digest, encode_payment_header, payment_settled_topic,
+    transfer_with_authorization_struct_hash, ChainClient, RawLog, TxReceipt, X402Client, X402Error,
+    X_PAYMENT_HEADER,
 };
 
 use citrate_gateway::config::GatewayConfig;
@@ -38,7 +38,6 @@ use citrate_gateway::queries::{ChainQueries, ProviderInfo};
 /// addresses (the placeholder default was removed from the builders).
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
-
 
 mod common {
     pub use citrate_gateway::build_router_with;
@@ -105,10 +104,7 @@ impl FixedAmountChain {
 
 #[async_trait]
 impl ChainClient for FixedAmountChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if precompile_input.len() != 265 {
             return Ok(None);
         }
@@ -181,9 +177,7 @@ async fn spawn_stub_provider() -> SocketAddr {
     use axum::routing::post;
     use axum::{Json, Router};
 
-    async fn infer_handler(
-        Json(_body): Json<Value>,
-    ) -> Json<Value> {
+    async fn infer_handler(Json(_body): Json<Value>) -> Json<Value> {
         Json(serde_json::json!({
             "output": "pong",
             "input_tokens": 1,
@@ -192,7 +186,9 @@ async fn spawn_stub_provider() -> SocketAddr {
     }
 
     let app = Router::new().route("/infer", post(infer_handler));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind provider");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind provider");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("provider serve");
@@ -237,8 +233,7 @@ async fn spawn_gateway(provider_addr: SocketAddr, value_wei: u128, fee_wei: u128
         contracts: citrate_gateway::config::ContractAddresses::default(),
     };
 
-    let app =
-        common::build_router_with(
+    let app = common::build_router_with(
         config,
         queries,
         chain,
@@ -266,16 +261,20 @@ fn parse_addr(value: &str) -> H160 {
 /// Sign a valid challenge while intentionally lowering the authorized
 /// amount. This keeps the F-2 handler/settlement gate test meaningful after
 /// IGW-B-006 made the initial challenge quote request-aware.
-fn payment_header_for_amount(
-    challenge: &Value,
-    secret: &[u8; 32],
-    amount: U256,
-) -> String {
+fn payment_header_for_amount(challenge: &Value, secret: &[u8; 32], amount: U256) -> String {
     let payer = derive_secp256k1_address(secret).expect("payer address");
     let recipient = parse_addr(challenge["x402"]["recipient"].as_str().expect("recipient"));
     let wsalt = parse_addr(TEST_WSALT);
-    let valid_after = U256::from(challenge["x402"]["valid_after"].as_u64().expect("valid_after"));
-    let valid_before = U256::from(challenge["x402"]["valid_before"].as_u64().expect("valid_before"));
+    let valid_after = U256::from(
+        challenge["x402"]["valid_after"]
+            .as_u64()
+            .expect("valid_after"),
+    );
+    let valid_before = U256::from(
+        challenge["x402"]["valid_before"]
+            .as_u64()
+            .expect("valid_before"),
+    );
     let nonce_bytes = hex::decode(
         challenge["x402"]["nonce"]
             .as_str()
@@ -333,7 +332,10 @@ async fn test_f2_undercharge_rejected_402() {
         .send()
         .await
         .expect("challenge request");
-    assert_eq!(challenge_response.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        challenge_response.status(),
+        reqwest::StatusCode::PAYMENT_REQUIRED
+    );
     let challenge: Value = challenge_response.json().await.expect("challenge json");
     let header = payment_header_for_amount(&challenge, &payer_secret(), U256::from(100u64));
     let resp = http

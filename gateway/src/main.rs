@@ -109,8 +109,8 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
     // Default to loopback in local-proxy mode — Caddy terminates TLS and
     // forwards in over loopback. Binding 0.0.0.0 would re-expose the open
     // path we're trying to close.
-    let listen_addr = env::var("CITRATE_GATEWAY_LISTEN_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9800".to_string());
+    let listen_addr =
+        env::var("CITRATE_GATEWAY_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:9800".to_string());
 
     // ENCRYPT-S1 / WP-2: encrypted at rest; master key via the keyvault
     // sourcing chain (GATEWAY_STORE_KEY env → key file → generate).

@@ -32,8 +32,8 @@ use ethereum_types::{H160, H256, U256};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use citrate_gateway::queries::ChainQueries;
+use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 
 /// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
@@ -41,21 +41,22 @@ use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
 
-
 // ── Stub provider ────────────────────────────────────────────────
 
 async fn spawn_stub_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(|JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
-            // Echo the prompt back as a canned completion.
-            let prompt = req.prompt.clone();
-            JsonResp(serde_json::json!({
-                "output": format!("STUB-RESPONSE: {}", prompt),
-                "input_tokens": prompt.split_whitespace().count(),
-                "output_tokens": 4,
-            }))
-        }),
+        post(
+            |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
+                // Echo the prompt back as a canned completion.
+                let prompt = req.prompt.clone();
+                JsonResp(serde_json::json!({
+                    "output": format!("STUB-RESPONSE: {}", prompt),
+                    "input_tokens": prompt.split_whitespace().count(),
+                    "output_tokens": 4,
+                }))
+            },
+        ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
     let addr = listener.local_addr().expect("local_addr");
@@ -120,10 +121,7 @@ impl HonestMockChain {
 
 #[async_trait]
 impl ChainClient for HonestMockChain {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         if precompile_input.len() != 265 {
             return Ok(None);
         }
@@ -272,9 +270,7 @@ async fn sync_chat_happy_path_via_x402_client() {
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
     let choices = body["choices"].as_array().expect("choices");
     assert!(!choices.is_empty(), "should have ≥ 1 choice");
-    let content = choices[0]["message"]["content"]
-        .as_str()
-        .expect("content");
+    let content = choices[0]["message"]["content"].as_str().expect("content");
     assert!(
         content.contains("STUB-RESPONSE"),
         "stub provider's response should propagate; got: {}",

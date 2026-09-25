@@ -81,8 +81,8 @@ fn bounded_provider_token_counts(
         .input_tokens
         .unwrap_or_else(|| prompt.split_whitespace().count() as u32)
         .min(estimate_input_tokens(&req.messages));
-    let completion_limit = clamp_max_tokens(req.max_tokens, max_tokens_ceiling())
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let completion_limit =
+        clamp_max_tokens(req.max_tokens, max_tokens_ceiling()).unwrap_or(DEFAULT_MAX_TOKENS);
     let completion_tokens = resp
         .output_tokens
         .unwrap_or_else(|| resp.output.split_whitespace().count() as u32)
@@ -165,7 +165,11 @@ pub async fn chat_completions_handler(
         // uncapped models are a no-op). The model + exact cost are known here,
         // not in the layer (which prices roughly against the default model).
         if let Some(Extension(ctx)) = &api_key {
-            match state.keys.debit_model_budget(&ctx.key_id, &req.model, actual_cost).await {
+            match state
+                .keys
+                .debit_model_budget(&ctx.key_id, &req.model, actual_cost)
+                .await
+            {
                 Ok(()) => model_debited = true,
                 Err(crate::keystore::ModelBudgetError::Exceeded(remaining)) => {
                     metrics::counter!("gateway_chat_requests_total", 1, "outcome" => "model_budget_exceeded");
@@ -196,7 +200,10 @@ pub async fn chat_completions_handler(
             // the overall balance separately, in settle_api_key_response).
             if model_debited {
                 if let (Some(Extension(ctx)), Some(cost)) = (&api_key, accepted_charge) {
-                    state.keys.refund_model_budget(&ctx.key_id, &req.model, cost).await;
+                    state
+                        .keys
+                        .refund_model_budget(&ctx.key_id, &req.model, cost)
+                        .await;
                 }
             }
             return Err(e);
@@ -291,7 +298,7 @@ pub(crate) fn estimate_input_tokens(messages: &[crate::openai::ChatMessage]) -> 
     for m in messages {
         // role + content are both attacker-controlled; both count.
         let body_bytes = (m.role.len() as u64) + (m.content.len() as u64);
-        let body_tokens = (body_bytes + BYTES_PER_TOKEN - 1) / BYTES_PER_TOKEN; // ceil_div
+        let body_tokens = body_bytes.div_ceil(BYTES_PER_TOKEN);
         total = total
             .saturating_add(body_tokens)
             .saturating_add(PER_MESSAGE_OVERHEAD);
@@ -649,7 +656,7 @@ mod input_token_estimation_tests {
         // 1024× via slice references costs O(1024 * ptr_size) of memory,
         // not O(1024 * 4 MiB).
         let huge = msg("u", &"x".repeat(4 * 1024 * 1024));
-        let pool: Vec<&ChatMessage> = std::iter::repeat(&huge).take(1024).collect();
+        let pool: Vec<&ChatMessage> = std::iter::repeat_n(&huge, 1024).collect();
 
         // estimate_input_tokens takes &[ChatMessage]; we need owned
         // entries for the slice. Materialise once — this is 1024 ×
@@ -687,7 +694,11 @@ mod input_token_estimation_tests {
         let body_bytes: u64 = 4 * 1024 * 1024 * 5_000; // ~20 GiB nominal
         let body_tokens: u64 = body_bytes.div_ceil(3);
         let total = body_tokens.saturating_add(4);
-        let saturated: u32 = if total > u32::MAX as u64 { u32::MAX } else { total as u32 };
+        let saturated: u32 = if total > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            total as u32
+        };
         assert_eq!(
             saturated,
             u32::MAX,

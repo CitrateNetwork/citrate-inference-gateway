@@ -30,7 +30,9 @@ use std::sync::Arc;
 use ethereum_types::{H160, H256, U256};
 use reqwest::{RequestBuilder, Response, StatusCode};
 
-use crate::digest::{eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator};
+use crate::digest::{
+    eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator,
+};
 use crate::error::X402Error;
 use crate::header::{encode as encode_payment_header, X_PAYMENT_HEADER};
 use crate::keys::{derive_secp256k1_address, sign_digest_secp256k1};
@@ -107,11 +109,7 @@ impl X402Client {
     /// be set via [`X402Client::with_secret_bytes`] before any
     /// `send_paid` call. Prefer [`X402Client::try_new`] in new code.
     #[doc(hidden)]
-    pub fn new(
-        wsalt_address: H160,
-        facilitator_address: H160,
-        chain_id: u64,
-    ) -> Self {
+    pub fn new(wsalt_address: H160, facilitator_address: H160, chain_id: u64) -> Self {
         Self {
             config: Arc::new(ClientConfig {
                 secret: [0u8; 32],
@@ -157,10 +155,7 @@ impl X402Client {
     /// 6. Attach `X-PAYMENT` and send the cloned request.
     /// 7. Return that response regardless of its status (a second
     ///    402 is the server's business to report; we don't loop).
-    pub async fn send_paid(
-        &self,
-        req: RequestBuilder,
-    ) -> Result<Response, X402Error> {
+    pub async fn send_paid(&self, req: RequestBuilder) -> Result<Response, X402Error> {
         // Secret-presence check — catches the legacy `new()` caller
         // who forgot to set a real secret before calling send_paid.
         if self.config.secret.iter().all(|&b| b == 0) {
@@ -266,17 +261,17 @@ impl X402Client {
 }
 
 fn parse_challenge(body: &serde_json::Value) -> Result<PaymentChallenge, X402Error> {
-    let envelope = body.get("x402").ok_or_else(|| {
-        X402Error::Internal("402 body missing 'x402' envelope".into())
-    })?;
+    let envelope = body
+        .get("x402")
+        .ok_or_else(|| X402Error::Internal("402 body missing 'x402' envelope".into()))?;
     serde_json::from_value(envelope.clone())
         .map_err(|e| X402Error::Internal(format!("challenge decode: {}", e)))
 }
 
 fn parse_addr_hex(s: &str) -> Result<H160, X402Error> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| X402Error::Internal(format!("bad address hex: {}", e)))?;
+    let bytes =
+        hex::decode(s).map_err(|e| X402Error::Internal(format!("bad address hex: {}", e)))?;
     if bytes.len() != 20 {
         return Err(X402Error::Internal(format!(
             "address should be 20 bytes, got {}",
@@ -288,8 +283,8 @@ fn parse_addr_hex(s: &str) -> Result<H160, X402Error> {
 
 fn parse_bytes32_hex(s: &str) -> Result<H256, X402Error> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| X402Error::Internal(format!("bad bytes32 hex: {}", e)))?;
+    let bytes =
+        hex::decode(s).map_err(|e| X402Error::Internal(format!("bad bytes32 hex: {}", e)))?;
     if bytes.len() != 32 {
         return Err(X402Error::Internal(format!(
             "bytes32 should be 32 bytes, got {}",
@@ -323,8 +318,8 @@ mod tests {
 
     #[test]
     fn try_new_rejects_zero_secret() {
-        let err = X402Client::try_new([0u8; 32], any_addr(), any_addr(), 40204)
-            .expect_err("should fail");
+        let err =
+            X402Client::try_new([0u8; 32], any_addr(), any_addr(), 40204).expect_err("should fail");
         assert!(matches!(err, X402Error::Internal(_)));
     }
 

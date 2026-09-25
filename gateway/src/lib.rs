@@ -25,8 +25,11 @@
 
 use std::sync::Arc;
 
-use axum::{routing::{get, post}, Router};
 use axum::http::{header, Method};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use ethereum_types::H160;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
@@ -63,8 +66,8 @@ pub mod health;
 pub mod keystore;
 pub mod keyvault;
 pub mod local_proxy;
-pub mod migrate;
 pub mod metrics;
+pub mod migrate;
 pub mod models;
 pub mod openai;
 pub mod pricing;
@@ -220,15 +223,17 @@ pub fn validate_money_address(name: &str, addr: &str) -> Result<H160, String> {
         ));
     }
     let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes = hex::decode(hex_part)
-        .map_err(|e| format!("{name} is not valid hex ({e}): {trimmed:?}"))?;
+    let bytes =
+        hex::decode(hex_part).map_err(|e| format!("{name} is not valid hex ({e}): {trimmed:?}"))?;
     let arr: [u8; 20] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| format!("{name} must be 20 bytes, got {}: {trimmed:?}", bytes.len()))?;
     let parsed = H160::from(arr);
     if parsed == H160::zero() {
-        return Err(format!("{name} is the zero address — refusing the money path"));
+        return Err(format!(
+            "{name} is the zero address — refusing the money path"
+        ));
     }
     if hex_part.eq_ignore_ascii_case(RETIRED_PLACEHOLDER_ADDR) {
         return Err(format!(
@@ -311,7 +316,11 @@ pub async fn build_router(config: GatewayConfig) -> Router {
         // crash left unsettled (exactly-once).
         let (rehydrated, settled) = batches.recover().await;
         if rehydrated > 0 {
-            tracing::info!(rehydrated, settled, "recovered in-flight batches on boot (WP-F)");
+            tracing::info!(
+                rehydrated,
+                settled,
+                "recovered in-flight batches on boot (WP-F)"
+            );
         }
     }
 
@@ -382,7 +391,10 @@ pub async fn build_router_with(
 
     let layer = X402Layer::builder()
         .chain_id(config.chain_id)
-        .facilitator_address(&format!("0x{}", hex::encode(facilitator_address.as_bytes())))
+        .facilitator_address(&format!(
+            "0x{}",
+            hex::encode(facilitator_address.as_bytes())
+        ))
         .wsalt_address(&format!("0x{}", hex::encode(wsalt.as_bytes())))
         .treasury(&format!("0x{}", hex::encode(treasury_addr.as_bytes())))
         .rpc_url(&config.rpc_url)
@@ -429,6 +441,9 @@ pub async fn build_router_with(
 /// the body with a `deposit_instructions` pointer.
 /// 2026-05-31 audit -007 (SECREM-02 6.4a): like [`build_router_with`],
 /// `wsalt_address` + `treasury` are required, validated, fail-closed.
+// Public constructor whose parameters are each a distinct, required piece of
+// the payment configuration; bundling them would only move the argument list.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_router_with_auth(
     config: GatewayConfig,
     queries: Arc<dyn ChainQueries>,
@@ -463,7 +478,10 @@ pub async fn build_router_with_auth(
 
     let x402 = X402Layer::builder()
         .chain_id(config.chain_id)
-        .facilitator_address(&format!("0x{}", hex::encode(facilitator_address.as_bytes())))
+        .facilitator_address(&format!(
+            "0x{}",
+            hex::encode(facilitator_address.as_bytes())
+        ))
         .wsalt_address(&format!("0x{}", hex::encode(wsalt.as_bytes())))
         .treasury(&format!("0x{}", hex::encode(treasury_addr.as_bytes())))
         .rpc_url(&config.rpc_url)
@@ -505,12 +523,12 @@ pub async fn build_router_with_auth(
 }
 
 mod state {
-    use std::sync::Arc;
     use crate::auth::ApiKeyStore;
     use crate::batch::BatchStore;
     use crate::config::GatewayConfig;
     use crate::queries::ChainQueries;
     use crate::usage::UsageStore;
+    use std::sync::Arc;
 
     /// Shared state passed to every handler. Cheap to clone (Arc).
     pub struct AppState {
@@ -548,13 +566,19 @@ mod open_chat_gate_tests {
 
     #[test]
     fn open_chat_with_dev_profile_is_on() {
-        assert_eq!(resolve_open_chat(Some("1"), Some("1")), OpenChatDecision::On);
+        assert_eq!(
+            resolve_open_chat(Some("1"), Some("1")),
+            OpenChatDecision::On
+        );
     }
 
     #[test]
     fn open_chat_unset_is_off_regardless_of_dev_profile() {
         assert_eq!(resolve_open_chat(None, Some("1")), OpenChatDecision::Off);
-        assert_eq!(resolve_open_chat(Some("0"), Some("1")), OpenChatDecision::Off);
+        assert_eq!(
+            resolve_open_chat(Some("0"), Some("1")),
+            OpenChatDecision::Off
+        );
         assert_eq!(resolve_open_chat(None, None), OpenChatDecision::Off);
     }
 

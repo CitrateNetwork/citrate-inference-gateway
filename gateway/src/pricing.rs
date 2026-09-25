@@ -63,23 +63,22 @@ impl std::fmt::Debug for TokenBasedPricing {
 
 #[async_trait]
 impl PricingStrategy for TokenBasedPricing {
-    async fn price_for(
-        &self,
-        request: &Request<axum::body::Bytes>,
-    ) -> Result<U256, PricingError> {
+    async fn price_for(&self, request: &Request<axum::body::Bytes>) -> Result<U256, PricingError> {
         let body = request.body();
         let value: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
             PricingError::NotPriceable(format!("request body is not valid JSON: {e}"))
         })?;
 
-        if let Ok(chat) = serde_json::from_value::<crate::openai::ChatCompletionRequest>(
-            value.clone(),
-        ) {
+        if let Ok(chat) =
+            serde_json::from_value::<crate::openai::ChatCompletionRequest>(value.clone())
+        {
             return self.quote_chat(&chat).await;
         }
 
-        let batch = serde_json::from_value::<crate::batch::BatchSubmitRequest>(value)
-            .map_err(|e| PricingError::NotPriceable(format!("request shape is not priceable: {e}")))?;
+        let batch =
+            serde_json::from_value::<crate::batch::BatchSubmitRequest>(value).map_err(|e| {
+                PricingError::NotPriceable(format!("request shape is not priceable: {e}"))
+            })?;
         if batch.requests.is_empty() {
             // Preserve the established x402 flow for structurally valid but
             // handler-invalid requests: issue a challenge, then let the
@@ -152,11 +151,9 @@ impl TokenBasedPricing {
             .await
             .map_err(|e| PricingError::OracleUnavailable(e.to_string()))?;
         let input_tokens = crate::chat::estimate_input_tokens(&request.messages);
-        let output_tokens = crate::chat::clamp_max_tokens(
-            request.max_tokens,
-            crate::chat::max_tokens_ceiling(),
-        )
-        .unwrap_or(crate::chat::DEFAULT_MAX_TOKENS);
+        let output_tokens =
+            crate::chat::clamp_max_tokens(request.max_tokens, crate::chat::max_tokens_ceiling())
+                .unwrap_or(crate::chat::DEFAULT_MAX_TOKENS);
         self.queries
             .estimate_cost(model_hash, input_tokens, output_tokens, DEFAULT_TIER)
             .await
@@ -187,10 +184,7 @@ mod tests {
         ) -> Result<U256, GatewayError> {
             Ok(self.0)
         }
-        async fn list_providers(
-            &self,
-            _: H256,
-        ) -> Result<Vec<ProviderInfo>, GatewayError> {
+        async fn list_providers(&self, _: H256) -> Result<Vec<ProviderInfo>, GatewayError> {
             Ok(vec![])
         }
     }
@@ -206,10 +200,8 @@ mod tests {
 
     #[tokio::test]
     async fn prices_via_chain_queries() {
-        let pricing = TokenBasedPricing::new(
-            Arc::new(MockQueries(U256::from(42u64))),
-            "llama-3.1-8b",
-        );
+        let pricing =
+            TokenBasedPricing::new(Arc::new(MockQueries(U256::from(42u64))), "llama-3.1-8b");
         let p = pricing.price_for(&request()).await.expect("price");
         assert_eq!(p, U256::from(42u64));
     }
@@ -231,10 +223,7 @@ mod tests {
             ) -> Result<U256, GatewayError> {
                 unreachable!()
             }
-            async fn list_providers(
-                &self,
-                _: H256,
-            ) -> Result<Vec<ProviderInfo>, GatewayError> {
+            async fn list_providers(&self, _: H256) -> Result<Vec<ProviderInfo>, GatewayError> {
                 unreachable!()
             }
         }

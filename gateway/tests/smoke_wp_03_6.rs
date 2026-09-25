@@ -282,7 +282,7 @@ async fn chat_request_increments_counter() {
     // Scrape /metrics (with the operator token) and confirm the success
     // counter moved.
     let body = reqwest::Client::new()
-        .get(&format!("http://{}/metrics", gw))
+        .get(format!("http://{}/metrics", gw))
         .bearer_auth("smoke-metrics-secret")
         .send()
         .await

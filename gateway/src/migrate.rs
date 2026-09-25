@@ -209,7 +209,9 @@ pub fn migrate_encrypt(
         for (k, v) in &rows {
             let got = enc.raw_get_unsealed(k)?;
             if got.as_deref() != Some(v.as_slice()) {
-                return Err(MigrateError::Verify(String::from_utf8_lossy(k).into_owned()));
+                return Err(MigrateError::Verify(
+                    String::from_utf8_lossy(k).into_owned(),
+                ));
             }
         }
         enc.flush()?;
@@ -322,7 +324,9 @@ mod tests {
         // Nothing written: no staging, no backup, source still plaintext
         // (openable as encrypted → PlaintextStore refusal).
         assert!(!sibling(&db_path, ".migrating").exists());
-        let err = PersistentKeyStore::open(&db_path, MASTER).err().expect("must fail");
+        let err = PersistentKeyStore::open(&db_path, MASTER)
+            .err()
+            .expect("must fail");
         assert!(matches!(err, StoreError::PlaintextStore));
     }
 
@@ -361,7 +365,8 @@ mod tests {
             walk(root).into_iter().any(|f| {
                 std::fs::read(&f)
                     .map(|b| {
-                        b.windows(23).any(|w| w == b"MONEY-LABEL-DO-NOT-LEAK".as_slice())
+                        b.windows(23)
+                            .any(|w| w == b"MONEY-LABEL-DO-NOT-LEAK".as_slice())
                             || b.windows(20).any(|w| w == [0xABu8; 20])
                     })
                     .unwrap_or(false)
@@ -369,7 +374,10 @@ mod tests {
         };
         assert!(!leak(&db_path), "migrated store still leaks plaintext");
         // …and (sanity of the probe itself) present in the plaintext backup.
-        assert!(leak(&backup), "probe should find plaintext in the backup copy");
+        assert!(
+            leak(&backup),
+            "probe should find plaintext in the backup copy"
+        );
     }
 
     #[test]
@@ -381,7 +389,10 @@ mod tests {
         migrate_encrypt(&db_path, Some(MASTER), false).unwrap();
         let again = migrate_encrypt(&db_path, Some(MASTER), false).unwrap();
         assert_eq!(again.state, SourceState::AlreadyEncrypted);
-        assert!(again.backup.is_none(), "no second backup, nothing rewritten");
+        assert!(
+            again.backup.is_none(),
+            "no second backup, nothing rewritten"
+        );
     }
 
     #[test]

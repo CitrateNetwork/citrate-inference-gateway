@@ -42,7 +42,11 @@ fn debit_then_crash_reload_applies_exactly_once() {
 
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     let bal = store.get_balance(&id).expect("get").expect("present");
-    assert_eq!(bal, salt(70), "exactly once: not 100 (lost), not 40 (doubled)");
+    assert_eq!(
+        bal,
+        salt(70),
+        "exactly once: not 100 (lost), not 40 (doubled)"
+    );
 }
 
 /// A sequence of committed debits and refunds reconciles exactly across restart.
@@ -61,7 +65,10 @@ fn balance_consistent_across_restart_with_refunds() {
         // 100 - 30 + 10 - 5 = 75
     }
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(75));
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        salt(75)
+    );
 }
 
 /// An over-balance debit is refused and persists nothing (bounds preserved).
@@ -77,12 +84,18 @@ fn insufficient_debit_changes_nothing() {
         Err(BalanceError::Insufficient(have)) => assert_eq!(have, salt(100)),
         other => panic!("expected Insufficient(100), got {other:?}"),
     }
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(100));
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        salt(100)
+    );
 
     // and across restart
     drop(store);
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(100));
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        salt(100)
+    );
 }
 
 /// Refunds must credit even a revoked key (revocation stops spend, never traps
@@ -100,12 +113,18 @@ fn refund_credits_revoked_key_durably() {
         store.revoke(&id).expect("revoke");
 
         // spending is blocked once revoked
-        assert!(matches!(store.debit_balance(&id, salt(1)), Err(BalanceError::Revoked)));
+        assert!(matches!(
+            store.debit_balance(&id, salt(1)),
+            Err(BalanceError::Revoked)
+        ));
         // but refunds still land
         store.refund_balance(&id, salt(40)).expect("refund"); // -> 100
     }
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(100));
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        salt(100)
+    );
 }
 
 /// Concurrent debits of one funded key never overspend and never lose/double a
@@ -135,10 +154,16 @@ fn concurrent_debits_never_overspend() {
     assert_eq!(successes, 33, "exactly floor(1000/30) debits should commit");
 
     let expected = salt(1000) - salt(30) * U256::from(successes as u64);
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), expected);
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        expected
+    );
 
     // and the durable value matches across restart
     drop(store);
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), expected);
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        expected
+    );
 }

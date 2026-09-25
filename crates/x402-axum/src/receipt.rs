@@ -35,10 +35,7 @@ pub struct PaymentSettledEvent {
 /// matches the canonical event signature. Returns `None` if the
 /// receipt has no such log (indicates the tx succeeded but didn't
 /// emit — contract bug or wrong receipt).
-pub fn find_payment_settled(
-    receipt: &TxReceipt,
-    facilitator: H160,
-) -> Option<PaymentSettledEvent> {
+pub fn find_payment_settled(receipt: &TxReceipt, facilitator: H160) -> Option<PaymentSettledEvent> {
     let expected_topic0 = payment_settled_topic();
     for log in &receipt.logs {
         if log.address != facilitator {
@@ -63,7 +60,13 @@ pub fn find_payment_settled(
         let fee = U256::from_big_endian(&log.data[32..64]);
         let nonce = H256::from_slice(&log.data[64..96]);
 
-        return Some(PaymentSettledEvent { from, to, value, fee, nonce });
+        return Some(PaymentSettledEvent {
+            from,
+            to,
+            value,
+            fee,
+            nonce,
+        });
     }
     None
 }
@@ -96,11 +99,7 @@ mod tests {
 
         RawLog {
             address: facilitator,
-            topics: vec![
-                payment_settled_topic(),
-                padded_addr(from),
-                padded_addr(to),
-            ],
+            topics: vec![payment_settled_topic(), padded_addr(from), padded_addr(to)],
             data,
         }
     }

@@ -15,10 +15,10 @@
 use async_trait::async_trait;
 use ethereum_types::{H160, H256, U256};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::ContractAddresses;
@@ -35,9 +35,11 @@ const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// lazily on first miss in `resolve_model_name`. `None` values are short-lived
 /// negative entries, so repeated unknown names do not re-enumerate the chain.
 /// Held under a tokio RwLock so reads are non-blocking when the cache is warm.
-static MODEL_NAME_CACHE: Lazy<
-    RwLock<Option<(std::time::Instant, HashMap<String, Option<H256>>)>>,
-> = Lazy::new(|| RwLock::new(None));
+/// A cache slot: when it was filled, and what with.
+type Cached<T> = RwLock<Option<(std::time::Instant, T)>>;
+
+static MODEL_NAME_CACHE: Lazy<Cached<HashMap<String, Option<H256>>>> =
+    Lazy::new(|| RwLock::new(None));
 
 /// IGW-B-007: only one cache refresh may enumerate ModelRegistry at a time.
 /// Callers arriving during a refresh re-check the cache after acquiring this
@@ -46,8 +48,7 @@ static MODEL_CACHE_REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// IGW-B-007: `/v1/models` is unauthenticated, so retain its complete model
 /// listing for the same short TTL and serialize refreshes with name lookups.
-static MODEL_LIST_CACHE: Lazy<RwLock<Option<(std::time::Instant, Vec<ModelInfo>)>>> =
-    Lazy::new(|| RwLock::new(None));
+static MODEL_LIST_CACHE: Lazy<Cached<Vec<ModelInfo>>> = Lazy::new(|| RwLock::new(None));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedModelLookup {
@@ -132,10 +133,7 @@ pub trait ChainQueries: Send + Sync {
     /// List providers registered for the given model. Empty vec
     /// (NOT an error) when no providers are registered — the
     /// caller decides what to do.
-    async fn list_providers(
-        &self,
-        model_hash: H256,
-    ) -> Result<Vec<ProviderInfo>, GatewayError>;
+    async fn list_providers(&self, model_hash: H256) -> Result<Vec<ProviderInfo>, GatewayError>;
 
     /// List ComputePool entries that can serve `model_hash` (CM-05
     /// WP-05.4). Default impl returns empty so HttpChainQueries
@@ -143,10 +141,7 @@ pub trait ChainQueries: Send + Sync {
     /// real on-chain ABI call lands in WP-05.4 slice 2 alongside
     /// the gateway wallet for `requestPoolCompute` tx submission.
     /// Mock implementations override this to drive integration tests.
-    async fn list_pools(
-        &self,
-        _model_hash: H256,
-    ) -> Result<Vec<PoolEntry>, GatewayError> {
+    async fn list_pools(&self, _model_hash: H256) -> Result<Vec<PoolEntry>, GatewayError> {
         Ok(Vec::new())
     }
 
@@ -229,10 +224,7 @@ impl HttpChainQueries {
 
     /// PIL-47c: replace the cache with a freshly-built map. Holds the
     /// write lock only for the swap.
-    async fn refresh_model_cache(
-        &self,
-        name_to_hash: HashMap<String, Option<H256>>,
-    ) {
+    async fn refresh_model_cache(&self, name_to_hash: HashMap<String, Option<H256>>) {
         let mut guard = MODEL_NAME_CACHE.write().await;
         *guard = Some((std::time::Instant::now(), name_to_hash));
     }
@@ -335,10 +327,7 @@ impl ChainQueries for HttpChainQueries {
             let mut data = Vec::with_capacity(36);
             data.extend_from_slice(&selector("getModel(bytes32)"));
             data.extend_from_slice(h.as_bytes());
-            let result = match self
-                .eth_call(&self.contracts.model_registry, &data)
-                .await
-            {
+            let result = match self.eth_call(&self.contracts.model_registry, &data).await {
                 Ok(b) => b,
                 Err(_) => continue, // skip; one bad model shouldn't break lookup
             };
@@ -386,10 +375,7 @@ impl ChainQueries for HttpChainQueries {
         Ok(U256::from_big_endian(&result))
     }
 
-    async fn list_providers(
-        &self,
-        model_hash: H256,
-    ) -> Result<Vec<ProviderInfo>, GatewayError> {
+    async fn list_providers(&self, model_hash: H256) -> Result<Vec<ProviderInfo>, GatewayError> {
         // Step 1: getProviders(bytes32) -> address[]
         let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&selector("getProviders(bytes32)"));
@@ -456,9 +442,7 @@ impl ChainQueries for HttpChainQueries {
         // Step 1: enumerate hashes.
         let mut data = Vec::with_capacity(4);
         data.extend_from_slice(&selector("getAllModelHashes()"));
-        let result = self
-            .eth_call(&self.contracts.model_registry, &data)
-            .await?;
+        let result = self.eth_call(&self.contracts.model_registry, &data).await?;
         let hashes = decode_bytes32_array(&result)?;
 
         // Step 2: fetch each model's name + owner + isActive.
@@ -474,10 +458,7 @@ impl ChainQueries for HttpChainQueries {
             let mut data = Vec::with_capacity(36);
             data.extend_from_slice(&selector("getModel(bytes32)"));
             data.extend_from_slice(h.as_bytes());
-            let result = match self
-                .eth_call(&self.contracts.model_registry, &data)
-                .await
-            {
+            let result = match self.eth_call(&self.contracts.model_registry, &data).await {
                 Ok(b) => b,
                 Err(_) => continue, // skip the one bad entry, keep the rest
             };
@@ -625,20 +606,17 @@ fn decode_string_at_offset_word(bytes: &[u8], word_idx: usize) -> Result<String,
     // Guard against giant offsets: U256::as_usize() panics on overflow,
     // so route through a bounded conversion.
     let offset_u256 = U256::from_big_endian(&bytes[off_start..off_start + 32]);
-    let offset = usize::try_from(offset_u256.low_u128()).ok().and_then(|v| {
+    let offset = usize::try_from(offset_u256.low_u128())
+        .ok()
         // Reject anything that doesn't fit in the low 64 bits — no
         // ABI string offset will exceed the buffer length anyway.
-        if offset_u256 > U256::from(u64::MAX) {
-            None
-        } else {
-            Some(v)
-        }
-    }).ok_or_else(|| {
-        GatewayError::ChainUnavailable(format!(
-            "string-at-word: offset overflows usize at word {}",
-            word_idx
-        ))
-    })?;
+        .filter(|_| offset_u256 <= U256::from(u64::MAX))
+        .ok_or_else(|| {
+            GatewayError::ChainUnavailable(format!(
+                "string-at-word: offset overflows usize at word {}",
+                word_idx
+            ))
+        })?;
     if bytes.len() < offset.saturating_add(32) || bytes.len() < offset + 32 {
         return Err(GatewayError::ChainUnavailable(format!(
             "string-at-word: length at {} out of range ({} bytes)",
@@ -817,7 +795,7 @@ mod tests {
         let mut buf = vec![0u8; 128];
         buf[31] = 0x20; // offset
         buf[63] = 2; // length
-        // First addr 0xaa…aa in last 20 bytes of word at [64..96]
+                     // First addr 0xaa…aa in last 20 bytes of word at [64..96]
         buf[64 + 12..64 + 32].copy_from_slice(&[0xaa; 20]);
         // Second addr 0xbb…bb in last 20 bytes of word at [96..128]
         buf[96 + 12..96 + 32].copy_from_slice(&[0xbb; 20]);
@@ -882,7 +860,7 @@ mod tests {
         buf.extend_from_slice(&len_word);
         // Pad name to multiple of 32 bytes
         let mut name_bytes = name.as_bytes().to_vec();
-        while name_bytes.len() % 32 != 0 {
+        while !name_bytes.len().is_multiple_of(32) {
             name_bytes.push(0);
         }
         buf.extend_from_slice(&name_bytes);
@@ -987,8 +965,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_model_name_accepts_pinned_hash() {
         let q = HttpChainQueries::new("http://unused", ContractAddresses::default());
-        let hash =
-            "0xabababababababababababababababababababababababababababababababab";
+        let hash = "0xabababababababababababababababababababababababababababababababab";
         let h = q.resolve_model_name(hash).await.expect("ok");
         assert_eq!(h.as_bytes(), &[0xab; 32]);
     }
@@ -996,7 +973,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_model_name_rejects_bare_name() {
         let q = HttpChainQueries::new("http://unused", ContractAddresses::default());
-        let err = q.resolve_model_name("llama-3.1-8b").await.expect_err("fail");
+        let err = q
+            .resolve_model_name("llama-3.1-8b")
+            .await
+            .expect_err("fail");
         assert!(matches!(err, GatewayError::UnknownModel(_)));
     }
 

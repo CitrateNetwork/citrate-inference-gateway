@@ -37,7 +37,6 @@ use x402_axum::{ChainClient, RawLog, TxReceipt, X402Error};
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
 
-
 // ── Stub provider ───────────────────────────────────────────────
 
 async fn spawn_stub_provider() -> SocketAddr {
@@ -421,13 +420,28 @@ async fn api_key_batch_reads_bound_to_owning_key() {
     assert_eq!(resp.status(), 404, "unauthenticated read must 404");
 
     // Different tenant's key → 404 (no existence oracle).
-    let resp = http.get(&read_url).bearer_auth(&other).send().await.expect("get");
+    let resp = http
+        .get(&read_url)
+        .bearer_auth(&other)
+        .send()
+        .await
+        .expect("get");
     assert_eq!(resp.status(), 404, "cross-tenant read must 404");
-    let resp = http.get(&output_url).bearer_auth(&other).send().await.expect("get");
+    let resp = http
+        .get(&output_url)
+        .bearer_auth(&other)
+        .send()
+        .await
+        .expect("get");
     assert_eq!(resp.status(), 404, "cross-tenant output read must 404");
 
     // Owning key → 200.
-    let resp = http.get(&read_url).bearer_auth(&owner).send().await.expect("get");
+    let resp = http
+        .get(&read_url)
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .expect("get");
     assert_eq!(resp.status(), 200, "owner must read its own batch");
 }
 

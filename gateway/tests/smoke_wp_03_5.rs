@@ -35,20 +35,21 @@ use x402_axum::{ChainClient, RawLog, TxReceipt, X402Error};
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
 
-
 // ── Stub provider — fixed token counts for deterministic assertions ──
 
 async fn spawn_stub_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(|JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
-            let prompt = req.prompt.clone();
-            JsonResp(serde_json::json!({
-                "output": format!("STUB-RESPONSE: {}", prompt),
-                "input_tokens": 7,
-                "output_tokens": 13,
-            }))
-        }),
+        post(
+            |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
+                let prompt = req.prompt.clone();
+                JsonResp(serde_json::json!({
+                    "output": format!("STUB-RESPONSE: {}", prompt),
+                    "input_tokens": 7,
+                    "output_tokens": 13,
+                }))
+            },
+        ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
     let addr = listener.local_addr().expect("local_addr");
@@ -97,7 +98,10 @@ struct HonestMockChain {
 }
 impl HonestMockChain {
     fn new(facilitator: H160) -> Self {
-        Self { facilitator, settled: Mutex::new(HashSet::new()) }
+        Self {
+            facilitator,
+            settled: Mutex::new(HashSet::new()),
+        }
     }
 }
 #[async_trait]
@@ -110,13 +114,21 @@ impl ChainClient for HonestMockChain {
         addr.copy_from_slice(&precompile_input[32..52]);
         Ok(Some(H160::from(addr)))
     }
-    async fn get_nonce(&self, _: H160) -> Result<u64, X402Error> { Ok(0) }
-    async fn send_raw_tx(&self, _: &[u8]) -> Result<H256, X402Error> { Ok(H256::from([0xab; 32])) }
+    async fn get_nonce(&self, _: H160) -> Result<u64, X402Error> {
+        Ok(0)
+    }
+    async fn send_raw_tx(&self, _: &[u8]) -> Result<H256, X402Error> {
+        Ok(H256::from([0xab; 32]))
+    }
     async fn wait_for_receipt(&self, _: H256, _: Duration) -> Result<TxReceipt, X402Error> {
         let nonce = H256::from([0x77; 32]);
         let mut settled = self.settled.lock().expect("mutex");
         if !settled.insert(nonce) {
-            return Ok(TxReceipt { status: false, block_number: 2, logs: vec![] });
+            return Ok(TxReceipt {
+                status: false,
+                block_number: 2,
+                logs: vec![],
+            });
         }
         drop(settled);
         let from = H160::from([0xa1; 20]);
@@ -161,7 +173,9 @@ fn operator_secret() -> [u8; 32] {
 async fn spawn_gateway(provider: SocketAddr) -> (SocketAddr, Arc<ApiKeyStore>) {
     std::env::set_var("CITRATE_GATEWAY_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "1");
     let facilitator = H160::from([0xfa; 20]);
-    let queries = Arc::new(MockChainQueries { provider_endpoint: provider.to_string() });
+    let queries = Arc::new(MockChainQueries {
+        provider_endpoint: provider.to_string(),
+    });
     let chain = Arc::new(HonestMockChain::new(facilitator));
     let keys = Arc::new(ApiKeyStore::new());
     let config = GatewayConfig {
@@ -243,9 +257,16 @@ async fn three_requests_appear_in_usage_totals() {
     // Provider reports 13, but the request's max_tokens=10 is the authoritative
     // output bound used for persisted usage.
     assert_eq!(body["total_output_tokens"].as_u64(), Some(30));
-    assert!(body["salt_spent_grains"].is_string(), "grains as U256 string");
+    assert!(
+        body["salt_spent_grains"].is_string(),
+        "grains as U256 string"
+    );
     let display = body["salt_spent_display"].as_str().expect("display");
-    assert!(display.ends_with(" SALT"), "display suffix, got: {}", display);
+    assert!(
+        display.ends_with(" SALT"),
+        "display suffix, got: {}",
+        display
+    );
 }
 
 #[tokio::test]

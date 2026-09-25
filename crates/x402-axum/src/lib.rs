@@ -86,17 +86,19 @@ pub use challenge::{build_challenge, now_unix_secs, BuiltChallenge, ChallengeInp
 pub use client::X402Client;
 pub use digest::{eip712_digest, transfer_with_authorization_struct_hash, wsalt_domain_separator};
 pub use error::X402Error;
-pub use header::{decode as decode_payment_header, encode as encode_payment_header, X_PAYMENT_HEADER};
+pub use header::{
+    decode as decode_payment_header, encode as encode_payment_header, X_PAYMENT_HEADER,
+};
 pub use layer::{X402Layer, X402LayerBuilder, X402Service};
 pub use ledger::{NonceLedger, NonceLedgerError};
 pub use nonce::{NonceEntropyError, NonceSource};
 pub use observability::{
-    CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent,
-    RejectionBreakdown, SettledEvent,
+    CountersObservability, NoopObservability, ObservabilityHook, RejectedEvent, RejectionBreakdown,
+    SettledEvent,
 };
 pub use pricing::{
     buffer_request_body, request_for_pricing, FixedPricing, PricingError, PricingStrategy,
     MAX_PRICING_BODY_BYTES,
 };
 pub use receipt::{find_payment_settled, PaymentSettledEvent};
-pub use types::{PaymentChallenge, PaymentPayload, PAYLOAD_BYTES, X402Paid};
+pub use types::{PaymentChallenge, PaymentPayload, X402Paid, PAYLOAD_BYTES};

@@ -24,7 +24,7 @@ use citrate_gateway::queries::ChainQueries;
 use citrate_gateway::{build_router_with, GatewayConfig, ProviderInfo, ProviderProtocolRequest};
 use x402_axum::keys::{derive_secp256k1_address, sign_digest_secp256k1};
 use x402_axum::{
-    encode_payment_header, eip712_digest, transfer_with_authorization_struct_hash, ChainClient,
+    eip712_digest, encode_payment_header, transfer_with_authorization_struct_hash, ChainClient,
     RawLog, TxReceipt, X402Error,
 };
 
@@ -33,17 +33,17 @@ const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
 
 fn payer_secret() -> [u8; 32] {
     [
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-        0xee, 0x00, 0x11, 0x22,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x00,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x00,
+        0x11, 0x22,
     ]
 }
 
 fn operator_secret() -> [u8; 32] {
     [
-        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38,
-        0xff, 0x94, 0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b,
-        0xf4, 0xf2, 0xff, 0x80,
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2,
+        0xff, 0x80,
     ]
 }
 
@@ -163,15 +163,19 @@ impl ChainClient for HonestMockChain {
 async fn spawn_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(|JsonExtractor(_req): JsonExtractor<ProviderProtocolRequest>| async {
-            JsonResponse(serde_json::json!({
-                "output": "served",
-                "input_tokens": 1,
-                "output_tokens": 1
-            }))
-        }),
+        post(
+            |JsonExtractor(_req): JsonExtractor<ProviderProtocolRequest>| async {
+                JsonResponse(serde_json::json!({
+                    "output": "served",
+                    "input_tokens": 1,
+                    "output_tokens": 1
+                }))
+            },
+        ),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("provider bind");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("provider bind");
     let addr = listener.local_addr().expect("provider address");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("provider serve");
@@ -205,7 +209,9 @@ async fn spawn_gateway(provider: SocketAddr) -> SocketAddr {
         TEST_TREASURY,
     )
     .await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("gateway bind");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("gateway bind");
     let addr = listener.local_addr().expect("gateway address");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("gateway serve");
@@ -231,8 +237,16 @@ fn payment_header(challenge: &Value, secret: &[u8; 32]) -> String {
     let wsalt = parse_addr(TEST_WSALT);
     let amount = U256::from_dec_str(challenge["x402"]["amount"].as_str().expect("amount"))
         .expect("amount wei");
-    let valid_after = U256::from(challenge["x402"]["valid_after"].as_u64().expect("valid_after"));
-    let valid_before = U256::from(challenge["x402"]["valid_before"].as_u64().expect("valid_before"));
+    let valid_after = U256::from(
+        challenge["x402"]["valid_after"]
+            .as_u64()
+            .expect("valid_after"),
+    );
+    let valid_before = U256::from(
+        challenge["x402"]["valid_before"]
+            .as_u64()
+            .expect("valid_before"),
+    );
     let nonce_bytes = hex::decode(
         challenge["x402"]["nonce"]
             .as_str()
@@ -287,9 +301,12 @@ async fn challenge_amount_tracks_actual_model_and_budget() {
     .await;
     let cheap_amount = U256::from_dec_str(cheap["x402"]["amount"].as_str().expect("cheap amount"))
         .expect("cheap wei");
-    let expensive_amount =
-        U256::from_dec_str(expensive["x402"]["amount"].as_str().expect("expensive amount"))
-            .expect("expensive wei");
+    let expensive_amount = U256::from_dec_str(
+        expensive["x402"]["amount"]
+            .as_str()
+            .expect("expensive amount"),
+    )
+    .expect("expensive wei");
     assert!(
         expensive_amount > cheap_amount,
         "expensive request must not receive the fixed cheap quote: cheap={cheap_amount}, expensive={expensive_amount}"

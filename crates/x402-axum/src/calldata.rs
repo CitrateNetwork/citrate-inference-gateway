@@ -78,7 +78,7 @@ pub fn payment_settled_topic() -> H256 {
     let sig = "PaymentSettled(address,address,uint256,uint256,bytes32)";
     let mut h = Keccak256::new();
     h.update(sig.as_bytes());
-    H256::from_slice(h.finalize().as_slice())
+    H256::from_slice(&h.finalize()[..])
 }
 
 #[cfg(test)]
@@ -122,7 +122,7 @@ mod tests {
         // EVM ABI: addresses encode as uint160 left-padded to 32.
         let data = encode_settle_payment(&sample());
         let from_word = &data[4..36]; // skip selector, take first arg
-        // High 12 bytes must be zero.
+                                      // High 12 bytes must be zero.
         assert!(from_word[..12].iter().all(|&b| b == 0));
         // Low 20 bytes match the address.
         assert_eq!(&from_word[12..32], &[0xa1u8; 20]);
@@ -162,7 +162,7 @@ mod tests {
         // collide.
         let mut h = Keccak256::new();
         h.update(b"BatchSettled(uint256,uint256,uint256)");
-        let batched = H256::from_slice(h.finalize().as_slice());
+        let batched = H256::from_slice(&h.finalize()[..]);
         assert_ne!(settled, batched);
     }
 }

@@ -119,17 +119,14 @@ impl NonceSource {
         hasher.update(self.process_id);
         hasher.update(counter.to_be_bytes());
         hasher.update(rand_bytes);
-        Ok(H256::from_slice(hasher.finalize().as_slice()))
+        Ok(H256::from_slice(&hasher.finalize()[..]))
     }
 }
 
 impl std::fmt::Debug for NonceSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NonceSource")
-            .field(
-                "counter",
-                &self.counter.load(Ordering::Relaxed),
-            )
+            .field("counter", &self.counter.load(Ordering::Relaxed))
             // Don't print process_id — it's per-process entropy that
             // has no business in logs.
             .finish_non_exhaustive()
@@ -160,9 +157,7 @@ fn fill_random(dst: &mut [u8]) -> Result<(), NonceEntropyError> {
     #[cfg(test)]
     {
         if FAIL_ENTROPY.with(|f| f.get()) {
-            tracing::error!(
-                "x402 nonce entropy FAILURE (test-injected): refusing to mint a nonce"
-            );
+            tracing::error!("x402 nonce entropy FAILURE (test-injected): refusing to mint a nonce");
             return Err(NonceEntropyError);
         }
     }

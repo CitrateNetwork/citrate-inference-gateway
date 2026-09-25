@@ -41,7 +41,9 @@ pub struct NonceManager {
 impl NonceManager {
     /// Empty (unseeded) manager.
     pub fn new() -> Self {
-        Self { inner: Mutex::new(None) }
+        Self {
+            inner: Mutex::new(None),
+        }
     }
 
     /// Reserve the next nonce. Seeds from `seed` (the chain) on first use. The
@@ -124,7 +126,7 @@ pub fn encode_request_pool_compute(pool_id: U256, job_spec: &[u8], max_price: U2
     out.extend_from_slice(&u256_word(U256::from(job_spec.len() as u64)));
     out.extend_from_slice(job_spec);
     let pad = (32 - (job_spec.len() % 32)) % 32;
-    out.extend(std::iter::repeat(0u8).take(pad));
+    out.extend(std::iter::repeat_n(0u8, pad));
     out
 }
 
@@ -188,9 +190,16 @@ impl OperatorWallet {
     /// is reviewed). **Fail-closed:** if a KMS key is configured but the binary
     /// was built without the `aws-kms` feature, this errors rather than running
     /// the marketplace without a signer.
-    pub async fn from_env(rpc_url: impl Into<String>, chain_id: u64) -> Result<Option<Self>, GatewayError> {
-        let kms = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID").ok().filter(|s| !s.is_empty());
-        let keystore = std::env::var("CITRATE_GATEWAY_OPERATOR_KEYSTORE").ok().filter(|s| !s.is_empty());
+    pub async fn from_env(
+        rpc_url: impl Into<String>,
+        chain_id: u64,
+    ) -> Result<Option<Self>, GatewayError> {
+        let kms = std::env::var("CITRATE_GATEWAY_KMS_KEY_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let keystore = std::env::var("CITRATE_GATEWAY_OPERATOR_KEYSTORE")
+            .ok()
+            .filter(|s| !s.is_empty());
         if kms.is_none() && keystore.is_none() {
             return Ok(None);
         }
@@ -199,9 +208,12 @@ impl OperatorWallet {
         let ceiling = std::env::var("CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI")
             .ok()
             .and_then(|s| U256::from_dec_str(&s).ok())
-            .ok_or_else(|| GatewayError::Internal(
-                "set CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI (operator blast-radius bound)".into(),
-            ))?;
+            .ok_or_else(|| {
+                GatewayError::Internal(
+                    "set CITRATE_GATEWAY_OPERATOR_SPEND_CAP_WEI (operator blast-radius bound)"
+                        .into(),
+                )
+            })?;
         let epoch_blocks: u64 = std::env::var("CITRATE_GATEWAY_OPERATOR_EPOCH_BLOCKS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -212,14 +224,22 @@ impl OperatorWallet {
             #[cfg(feature = "aws-kms")]
             {
                 let signer = Arc::new(AwsKmsSigner::from_env(key_id).await?);
-                return Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)));
+                return Ok(Some(Self::new(
+                    signer,
+                    rpc_url,
+                    chain_id,
+                    compute_pool,
+                    ceiling,
+                    epoch_blocks,
+                )));
             }
             #[cfg(not(feature = "aws-kms"))]
             {
                 let _ = key_id;
                 return Err(GatewayError::Internal(
                     "CITRATE_GATEWAY_KMS_KEY_ID is set but this gateway was built without the \
-                     `aws-kms` feature — rebuild with `--features aws-kms`.".into(),
+                     `aws-kms` feature — rebuild with `--features aws-kms`."
+                        .into(),
                 ));
             }
         }
@@ -228,7 +248,11 @@ impl OperatorWallet {
         //    mainnet — mainnet must use AWS KMS, enforced by precedence above +
         //    the CI tripwire). Requires `CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1`.
         let keystore = keystore.expect("keystore present (checked)");
-        if std::env::var("CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER").ok().as_deref() != Some("1") {
+        if std::env::var("CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
             return Err(GatewayError::Internal(
                 "CITRATE_GATEWAY_OPERATOR_KEYSTORE is set but CITRATE_GATEWAY_ALLOW_LOCAL_SIGNER=1 \
                  is required — the encrypted-file signer is DEV/TESTNET only; mainnet must use AWS \
@@ -243,15 +267,24 @@ impl OperatorWallet {
                     .and_then(|p| std::fs::read_to_string(p).ok())
                     .map(|s| s.trim().to_string())
             })
-            .ok_or_else(|| GatewayError::Internal(
-                "set CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD or ..._PASSWORD_FILE".into(),
-            ))?;
+            .ok_or_else(|| {
+                GatewayError::Internal(
+                    "set CITRATE_GATEWAY_OPERATOR_KEYSTORE_PASSWORD or ..._PASSWORD_FILE".into(),
+                )
+            })?;
         let signer = std::sync::Arc::new(EncryptedFileSigner::from_keystore(&keystore, &password)?);
         tracing::warn!(
             operator = %format!("0x{}", hex::encode(signer.address().as_bytes())),
             "⚠ DEV/TESTNET operator signer loaded from an ENCRYPTED FILE (not KMS) — do NOT use on mainnet"
         );
-        Ok(Some(Self::new(signer, rpc_url, chain_id, compute_pool, ceiling, epoch_blocks)))
+        Ok(Some(Self::new(
+            signer,
+            rpc_url,
+            chain_id,
+            compute_pool,
+            ceiling,
+            epoch_blocks,
+        )))
     }
 
     /// The operator EOA address (never the key).
@@ -396,7 +429,9 @@ impl OperatorWallet {
         let bytes = hex::decode(s.trim_start_matches("0x"))
             .map_err(|e| GatewayError::ChainUnavailable(format!("bad tx hash hex: {e}")))?;
         if bytes.len() != 32 {
-            return Err(GatewayError::ChainUnavailable("tx hash not 32 bytes".into()));
+            return Err(GatewayError::ChainUnavailable(
+                "tx hash not 32 bytes".into(),
+            ));
         }
         Ok(H256::from_slice(&bytes))
     }
@@ -412,7 +447,9 @@ fn parse_addr_env(key: &str) -> Result<H160, GatewayError> {
     let bytes = hex::decode(s.trim_start_matches("0x"))
         .map_err(|e| GatewayError::Internal(format!("{key}: bad hex: {e}")))?;
     if bytes.len() != 20 {
-        return Err(GatewayError::Internal(format!("{key}: not a 20-byte address")));
+        return Err(GatewayError::Internal(format!(
+            "{key}: not a 20-byte address"
+        )));
     }
     Ok(H160::from_slice(&bytes))
 }
@@ -429,6 +466,7 @@ fn parse_addr_env(key: &str) -> Result<H160, GatewayError> {
 
 /// Parse a DER-encoded ECDSA signature (as AWS KMS returns) into low-S `(r, s)`.
 /// Uses k256 so DER decoding + EIP-2 low-S normalization are battle-tested.
+#[cfg(any(test, feature = "aws-kms"))]
 fn parse_kms_der_signature(der: &[u8]) -> Result<([u8; 32], [u8; 32]), GatewayError> {
     use k256::ecdsa::Signature;
     let sig = Signature::from_der(der)
@@ -445,13 +483,16 @@ fn parse_kms_der_signature(der: &[u8]) -> Result<([u8; 32], [u8; 32]), GatewayEr
 /// Derive the EOA address from a KMS SubjectPublicKeyInfo (SPKI) DER. The
 /// uncompressed secp256k1 point (`0x04 || X || Y`, 65 bytes) is the SPKI's
 /// trailing bytes; address = keccak256(point[1..])[12..].
+#[cfg(any(test, feature = "aws-kms"))]
 fn address_from_spki(spki: &[u8]) -> Result<H160, GatewayError> {
     if spki.len() < 65 {
         return Err(GatewayError::Internal("kms SPKI too short".into()));
     }
     let point = &spki[spki.len() - 65..];
     if point[0] != 0x04 {
-        return Err(GatewayError::Internal("kms SPKI not an uncompressed point".into()));
+        return Err(GatewayError::Internal(
+            "kms SPKI not an uncompressed point".into(),
+        ));
     }
     let digest = Keccak256::digest(&point[1..]);
     Ok(H160::from_slice(&digest[12..]))
@@ -481,7 +522,9 @@ impl EncryptedFileSigner {
         let secret_vec = eth_keystore::decrypt_key(path.as_ref(), password)
             .map_err(|e| GatewayError::Internal(format!("keystore decrypt: {e}")))?;
         if secret_vec.len() != 32 {
-            return Err(GatewayError::Internal("keystore key is not 32 bytes".into()));
+            return Err(GatewayError::Internal(
+                "keystore key is not 32 bytes".into(),
+            ));
         }
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&secret_vec);
@@ -559,7 +602,9 @@ mod aws_kms {
             let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
             let region = env("AWS_REGION")
                 .or_else(|| env("AWS_DEFAULT_REGION"))
-                .ok_or_else(|| GatewayError::Internal("set AWS_REGION for the KMS signer".into()))?;
+                .ok_or_else(|| {
+                    GatewayError::Internal("set AWS_REGION for the KMS signer".into())
+                })?;
             let access_key = env("AWS_ACCESS_KEY_ID")
                 .ok_or_else(|| GatewayError::Internal("set AWS_ACCESS_KEY_ID".into()))?;
             let secret_key = env("AWS_SECRET_ACCESS_KEY")
@@ -579,7 +624,10 @@ mod aws_kms {
                 address: H160::zero(),
             };
             let resp = signer
-                .kms_call("TrentService.GetPublicKey", json!({ "KeyId": signer.key_id }))
+                .kms_call(
+                    "TrentService.GetPublicKey",
+                    json!({ "KeyId": signer.key_id }),
+                )
                 .await?;
             let spki_b64 = resp
                 .get("PublicKey")
@@ -658,7 +706,9 @@ mod aws_kms {
                 .await
                 .map_err(|e| GatewayError::ChainUnavailable(format!("kms body: {e}")))?;
             if !status.is_success() {
-                return Err(GatewayError::Internal(format!("kms {target} {status}: {text}")));
+                return Err(GatewayError::Internal(format!(
+                    "kms {target} {status}: {text}"
+                )));
             }
             serde_json::from_str(&text)
                 .map_err(|e| GatewayError::Internal(format!("kms response decode: {e}")))
@@ -690,9 +740,11 @@ mod aws_kms {
             let der = base64::engine::general_purpose::STANDARD
                 .decode(sig_b64)
                 .map_err(|e| X402Error::Internal(format!("kms Signature base64: {e}")))?;
-            let (r, s) = parse_kms_der_signature(&der).map_err(|e| X402Error::Internal(format!("{e}")))?;
-            let recovery_id = recover_id(hash, &r, &s, self.address)
-                .ok_or_else(|| X402Error::Internal("kms signature did not recover operator".into()))?;
+            let (r, s) =
+                parse_kms_der_signature(&der).map_err(|e| X402Error::Internal(format!("{e}")))?;
+            let recovery_id = recover_id(hash, &r, &s, self.address).ok_or_else(|| {
+                X402Error::Internal("kms signature did not recover operator".into())
+            })?;
             Ok(RecoverableSignature { recovery_id, r, s })
         }
     }
@@ -733,7 +785,10 @@ mod tests {
         let data = encode_reclaim_expired_job(U256::from(42u64));
         assert_eq!(data.len(), 4 + 32, "selector + one word");
         assert_eq!(data[4 + 31], 42, "jobId word");
-        assert_eq!(&data[..4], &Keccak256::digest(b"reclaimExpiredJob(uint256)")[..4]);
+        assert_eq!(
+            &data[..4],
+            &Keccak256::digest(b"reclaimExpiredJob(uint256)")[..4]
+        );
     }
 
     #[tokio::test]
@@ -742,8 +797,14 @@ mod tests {
         // First reserve seeds from the closure (here: 5).
         let a = mgr.reserve(|| async { Ok(5u64) }).await.expect("a");
         // Subsequent reserves never call the seed again (would panic here).
-        let b = mgr.reserve(|| async { panic!("must not re-seed") }).await.expect("b");
-        let c = mgr.reserve(|| async { panic!("must not re-seed") }).await.expect("c");
+        let b = mgr
+            .reserve(|| async { panic!("must not re-seed") })
+            .await
+            .expect("b");
+        let c = mgr
+            .reserve(|| async { panic!("must not re-seed") })
+            .await
+            .expect("c");
         assert_eq!((a, b, c), (5, 6, 7));
         mgr.resync(20).await;
         let d = mgr.reserve(|| async { panic!("seeded") }).await.expect("d");
@@ -754,14 +815,18 @@ mod tests {
     async fn spend_cap_bounds_per_epoch_and_rolls_over() {
         let cap = SpendCap::new(U256::from(100u64), 10); // 100 wei / 10 blocks
         cap.try_spend(U256::from(60u64), 3).await.expect("60 ok");
-        cap.try_spend(U256::from(40u64), 5).await.expect("40 ok (=100)");
+        cap.try_spend(U256::from(40u64), 5)
+            .await
+            .expect("40 ok (=100)");
         // 1 more in the same epoch breaches the ceiling.
         assert!(matches!(
             cap.try_spend(U256::from(1u64), 9).await,
             Err(GatewayError::SpendCapExceeded { .. })
         ));
         // next epoch (block 10..) resets the window.
-        cap.try_spend(U256::from(100u64), 10).await.expect("new epoch ok");
+        cap.try_spend(U256::from(100u64), 10)
+            .await
+            .expect("new epoch ok");
     }
 
     /// WP-C: with no KMS key configured, no operator wallet is loaded (pool
@@ -769,7 +834,9 @@ mod tests {
     #[tokio::test]
     async fn from_env_is_none_when_unconfigured() {
         std::env::remove_var("CITRATE_GATEWAY_KMS_KEY_ID");
-        let w = OperatorWallet::from_env("http://127.0.0.1:8545", 31337).await.expect("ok");
+        let w = OperatorWallet::from_env("http://127.0.0.1:8545", 31337)
+            .await
+            .expect("ok");
         assert!(w.is_none());
     }
 

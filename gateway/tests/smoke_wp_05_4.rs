@@ -33,9 +33,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use citrate_gateway::queries::{ChainQueries, PoolEntry, ProviderInfo};
-use citrate_gateway::{
-    build_router_with, GatewayConfig, ProviderProtocolRequest,
-};
+use citrate_gateway::{build_router_with, GatewayConfig, ProviderProtocolRequest};
 use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 
 /// 2026-05-31 audit -007 (SECREM-02 6.4a): explicit money-path
@@ -43,19 +41,20 @@ use x402_axum::{ChainClient, RawLog, TxReceipt, X402Client, X402Error};
 const TEST_WSALT: &str = "0x61bc737f67b430fe2567630823694032a049253e";
 const TEST_TREASURY: &str = "0x7e577e577e577e577e577e577e577e577e577e57";
 
-
 // ── Stub provider ───────────────────────────────────────────────
 
 async fn spawn_stub_provider() -> SocketAddr {
     let app = axum::Router::new().route(
         "/infer",
-        post(|JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
-            JsonResp(serde_json::json!({
-                "output": format!("STUB-RESPONSE: {}", req.prompt),
-                "input_tokens": 7,
-                "output_tokens": 13,
-            }))
-        }),
+        post(
+            |JsonExtractor(req): JsonExtractor<ProviderProtocolRequest>| async move {
+                JsonResp(serde_json::json!({
+                    "output": format!("STUB-RESPONSE: {}", req.prompt),
+                    "input_tokens": 7,
+                    "output_tokens": 13,
+                }))
+            },
+        ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
     let addr = listener.local_addr().expect("local_addr");
@@ -104,10 +103,7 @@ impl ChainQueries for MockQueries {
             max_concurrent: 10,
         }])
     }
-    async fn list_pools(
-        &self,
-        _: H256,
-    ) -> Result<Vec<PoolEntry>, citrate_gateway::GatewayError> {
+    async fn list_pools(&self, _: H256) -> Result<Vec<PoolEntry>, citrate_gateway::GatewayError> {
         Ok(self.pools.clone())
     }
 }
@@ -120,34 +116,53 @@ struct HonestMockChain {
 }
 impl HonestMockChain {
     fn new(facilitator: H160) -> Self {
-        Self { facilitator, settled: Mutex::new(HashSet::new()) }
+        Self {
+            facilitator,
+            settled: Mutex::new(HashSet::new()),
+        }
     }
 }
 #[async_trait]
 impl ChainClient for HonestMockChain {
     async fn verify_offline(&self, input: &[u8]) -> Result<Option<H160>, X402Error> {
-        if input.len() != 265 { return Ok(None); }
+        if input.len() != 265 {
+            return Ok(None);
+        }
         let mut a = [0u8; 20];
         a.copy_from_slice(&input[32..52]);
         Ok(Some(H160::from(a)))
     }
-    async fn get_nonce(&self, _: H160) -> Result<u64, X402Error> { Ok(0) }
-    async fn send_raw_tx(&self, _: &[u8]) -> Result<H256, X402Error> { Ok(H256::from([0xab; 32])) }
+    async fn get_nonce(&self, _: H160) -> Result<u64, X402Error> {
+        Ok(0)
+    }
+    async fn send_raw_tx(&self, _: &[u8]) -> Result<H256, X402Error> {
+        Ok(H256::from([0xab; 32]))
+    }
     async fn wait_for_receipt(&self, _: H256, _: Duration) -> Result<TxReceipt, X402Error> {
         let nonce = H256::from([0x77; 32]);
         let mut s = self.settled.lock().expect("mutex");
-        if !s.insert(nonce) { return Ok(TxReceipt { status: false, block_number: 2, logs: vec![] }); }
+        if !s.insert(nonce) {
+            return Ok(TxReceipt {
+                status: false,
+                block_number: 2,
+                logs: vec![],
+            });
+        }
         drop(s);
         let from = H160::from([0xa1; 20]);
         let to = H160::from([0xa2; 20]);
         let value = U256::from(995_000_000_000_000_000u128);
         let fee = U256::from(5_000_000_000_000_000u128);
-        let mut padded_from = [0u8; 32]; padded_from[12..32].copy_from_slice(from.as_bytes());
-        let mut padded_to = [0u8; 32]; padded_to[12..32].copy_from_slice(to.as_bytes());
+        let mut padded_from = [0u8; 32];
+        padded_from[12..32].copy_from_slice(from.as_bytes());
+        let mut padded_to = [0u8; 32];
+        padded_to[12..32].copy_from_slice(to.as_bytes());
         let mut data = Vec::with_capacity(96);
         let mut buf = [0u8; 32];
-        value.to_big_endian(&mut buf); data.extend_from_slice(&buf);
-        fee.to_big_endian(&mut buf); data.extend_from_slice(&buf);
+        value.to_big_endian(&mut buf);
+        data.extend_from_slice(&buf);
+        fee.to_big_endian(&mut buf);
+        data.extend_from_slice(&buf);
         data.extend_from_slice(nonce.as_bytes());
         Ok(TxReceipt {
             status: true,
@@ -369,5 +384,9 @@ async fn weak_pool_loses_to_strong_individual() {
     });
     let req = reqwest::Client::new().post(&url).json(&body);
     let resp = client.send_paid(req).await.expect("send");
-    assert_eq!(resp.status(), 200, "individual with stronger score should win");
+    assert_eq!(
+        resp.status(),
+        200,
+        "individual with stronger score should win"
+    );
 }

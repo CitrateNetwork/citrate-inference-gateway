@@ -52,7 +52,10 @@ fn batch_refund_settles_exactly_once() {
 
     // And the credit + the settled marker survived the crash atomically.
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
-    assert_eq!(store.get_balance(&id).expect("get").expect("present"), salt(40));
+    assert_eq!(
+        store.get_balance(&id).expect("get").expect("present"),
+        salt(40)
+    );
     assert!(store.batch_was_settled("batch_x").expect("settled flag"));
 }
 
@@ -62,8 +65,12 @@ fn batches_persist_and_enumerate_for_recovery() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("open");
-        store.persist_batch("batch_a", br#"{"id":"batch_a"}"#).expect("persist a");
-        store.persist_batch("batch_b", br#"{"id":"batch_b"}"#).expect("persist b");
+        store
+            .persist_batch("batch_a", br#"{"id":"batch_a"}"#)
+            .expect("persist a");
+        store
+            .persist_batch("batch_b", br#"{"id":"batch_b"}"#)
+            .expect("persist b");
     }
     let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).expect("reopen");
     let mut ids: Vec<String> = store
@@ -114,18 +121,26 @@ async fn recovery_refunds_uncompleted_slots_exactly_once() {
             {{"state":"dispatched","request":{{"model":"m","messages":[],"max_tokens":null,"stream":false}},"quoted_cost_grains":"40","error":null}},
             {{"state":"pending","request":{{"model":"m","messages":[],"max_tokens":null,"stream":false}},"quoted_cost_grains":"30","error":null}}]}}"#
     );
-    store.persist_batch("batch_r", batch_json.as_bytes()).expect("persist");
+    store
+        .persist_batch("batch_r", batch_json.as_bytes())
+        .expect("persist");
 
     let batches = BatchStore::with_persistence(store.clone());
     let (rehydrated, settled) = batches.recover().await;
     assert_eq!((rehydrated, settled), (1, 1), "one batch reconciled");
 
     // Refunded slot1 (40) + slot2 (30) = 70; slot0 (30) released to providers.
-    assert_eq!(store.get_balance(&key).expect("get").expect("present"), salt(70));
+    assert_eq!(
+        store.get_balance(&key).expect("get").expect("present"),
+        salt(70)
+    );
     assert!(store.batch_was_settled("batch_r").expect("flag"));
 
     // A crash during recovery replays it — must NOT double-refund.
     let (_r2, s2) = batches.recover().await;
     assert_eq!(s2, 0, "already-settled batch is not re-settled");
-    assert_eq!(store.get_balance(&key).expect("get").expect("present"), salt(70));
+    assert_eq!(
+        store.get_balance(&key).expect("get").expect("present"),
+        salt(70)
+    );
 }

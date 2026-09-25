@@ -57,10 +57,7 @@ pub trait ChainClient: Send + Sync {
     /// (32-byte domain separator prepended to the 233-byte payload).
     /// Returns `Some(recovered_signer)` on valid signature, `None`
     /// on invalid.
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error>;
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error>;
 
     /// Get the next tx nonce for an address (pending block tag).
     async fn get_nonce(&self, address: H160) -> Result<u64, X402Error>;
@@ -85,10 +82,7 @@ pub trait ChainClient: Send + Sync {
 /// the X402Layer plus the gateway's own state.
 #[async_trait]
 impl<T: ChainClient + ?Sized> ChainClient for std::sync::Arc<T> {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
         (**self).verify_offline(precompile_input).await
     }
     async fn get_nonce(&self, address: H160) -> Result<u64, X402Error> {
@@ -160,11 +154,11 @@ impl HttpChainClient {
 
 #[async_trait]
 impl ChainClient for HttpChainClient {
-    async fn verify_offline(
-        &self,
-        precompile_input: &[u8],
-    ) -> Result<Option<H160>, X402Error> {
-        let to_hex = format!("0x{}", hex::encode(TRANSFER_AUTH_VERIFY_PRECOMPILE.as_bytes()));
+    async fn verify_offline(&self, precompile_input: &[u8]) -> Result<Option<H160>, X402Error> {
+        let to_hex = format!(
+            "0x{}",
+            hex::encode(TRANSFER_AUTH_VERIFY_PRECOMPILE.as_bytes())
+        );
         let data_hex = format!("0x{}", hex::encode(precompile_input));
         let params = json!([
             { "to": to_hex, "data": data_hex },
@@ -206,7 +200,9 @@ impl ChainClient for HttpChainClient {
 
     async fn send_raw_tx(&self, raw_tx: &[u8]) -> Result<H256, X402Error> {
         let data_hex = format!("0x{}", hex::encode(raw_tx));
-        let result = self.rpc_call("eth_sendRawTransaction", json!([data_hex])).await?;
+        let result = self
+            .rpc_call("eth_sendRawTransaction", json!([data_hex]))
+            .await?;
         let hex_str = result
             .as_str()
             .ok_or_else(|| X402Error::RpcError("non-string tx hash".into()))?;
@@ -257,7 +253,11 @@ fn parse_receipt(v: &Value) -> Result<TxReceipt, X402Error> {
     let block_number = u64::from_str_radix(bn_str.trim_start_matches("0x"), 16)
         .map_err(|e| X402Error::RpcError(format!("bad blockNumber: {}", e)))?;
 
-    let logs_val = v.get("logs").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    let logs_val = v
+        .get("logs")
+        .and_then(|l| l.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut logs = Vec::with_capacity(logs_val.len());
     for log in logs_val {
         let addr_str = log
@@ -293,10 +293,18 @@ fn parse_receipt(v: &Value) -> Result<TxReceipt, X402Error> {
         let data = hex::decode(data_str.trim_start_matches("0x"))
             .map_err(|e| X402Error::RpcError(format!("data hex: {}", e)))?;
 
-        logs.push(RawLog { address, topics, data });
+        logs.push(RawLog {
+            address,
+            topics,
+            data,
+        });
     }
 
-    Ok(TxReceipt { status, block_number, logs })
+    Ok(TxReceipt {
+        status,
+        block_number,
+        logs,
+    })
 }
 
 #[cfg(test)]

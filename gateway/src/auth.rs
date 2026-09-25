@@ -156,7 +156,9 @@ impl std::fmt::Debug for ApiKeyStore {
             Backend::Memory(_) => "memory",
             Backend::Persistent(_) => "persistent",
         };
-        f.debug_struct("ApiKeyStore").field("backend", &kind).finish()
+        f.debug_struct("ApiKeyStore")
+            .field("backend", &kind)
+            .finish()
     }
 }
 
@@ -182,7 +184,9 @@ impl ApiKeyStore {
         path: impl AsRef<std::path::Path>,
         master: [u8; 32],
     ) -> Result<Self, crate::keystore::StoreError> {
-        Ok(Self::with_persistent(crate::keystore::PersistentKeyStore::open(path, master)?))
+        Ok(Self::with_persistent(
+            crate::keystore::PersistentKeyStore::open(path, master)?,
+        ))
     }
 
     /// Build over an already-open persistent store, so the API-key balances and
@@ -204,9 +208,11 @@ impl ApiKeyStore {
                 let h = hash_key_id(key_id);
                 m.read().await.get(&h).cloned()
             }
-            Backend::Persistent(p) => {
-                p.get_balance_record(key_id).ok().flatten().map(record_from_balance)
-            }
+            Backend::Persistent(p) => p
+                .get_balance_record(key_id)
+                .ok()
+                .flatten()
+                .map(record_from_balance),
         }
     }
 
@@ -229,7 +235,9 @@ impl ApiKeyStore {
                 record.balance_grains -= amount;
                 Ok(record.balance_grains)
             }
-            Backend::Persistent(p) => p.debit_balance(key_id, amount).map_err(DebitError::from_balance),
+            Backend::Persistent(p) => p
+                .debit_balance(key_id, amount)
+                .map_err(DebitError::from_balance),
         }
     }
 
@@ -245,7 +253,9 @@ impl ApiKeyStore {
                 record.balance_grains = record.balance_grains.saturating_add(amount);
                 Ok(record.balance_grains)
             }
-            Backend::Persistent(p) => p.refund_balance(key_id, amount).map_err(DebitError::from_balance),
+            Backend::Persistent(p) => p
+                .refund_balance(key_id, amount)
+                .map_err(DebitError::from_balance),
         }
     }
 
@@ -266,7 +276,12 @@ impl ApiKeyStore {
     // ── Per-model budgets (INFER-S3 / WP-E) ─────────────────────────
 
     /// Set (or replace) a key's remaining budget for `model`.
-    pub async fn set_model_budget(&self, key_id: &str, model: &str, amount: U256) -> Result<(), DebitError> {
+    pub async fn set_model_budget(
+        &self,
+        key_id: &str,
+        model: &str,
+        amount: U256,
+    ) -> Result<(), DebitError> {
         match &self.backend {
             Backend::Memory(m) => {
                 let h = hash_key_id(key_id);
@@ -275,7 +290,9 @@ impl ApiKeyStore {
                 record.model_budgets.insert(model.to_owned(), amount);
                 Ok(())
             }
-            Backend::Persistent(p) => p.set_model_budget(key_id, model, amount).map_err(|_| DebitError::Unknown),
+            Backend::Persistent(p) => p
+                .set_model_budget(key_id, model, amount)
+                .map_err(|_| DebitError::Unknown),
         }
     }
 
@@ -287,7 +304,12 @@ impl ApiKeyStore {
                 m.read()
                     .await
                     .get(&h)
-                    .map(|r| r.model_budgets.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                    .map(|r| {
+                        r.model_budgets
+                            .iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }
             Backend::Persistent(p) => p.get_model_budgets(key_id).unwrap_or_default(),
@@ -345,7 +367,13 @@ impl ApiKeyStore {
 
     /// Mint and insert a fresh record, returning the plaintext `cgk_` token.
     /// Backend-agnostic home for [`create_key_with_backing`].
-    async fn insert(&self, label: String, balance: U256, deposit: H160, backing: KeyBacking) -> String {
+    async fn insert(
+        &self,
+        label: String,
+        balance: U256,
+        deposit: H160,
+        backing: KeyBacking,
+    ) -> String {
         match &self.backend {
             Backend::Memory(m) => {
                 let key_id = format!("cgk_{}", Uuid::new_v4().simple());
@@ -902,19 +930,35 @@ mod tests {
     async fn memory_model_budget_exhausts_refunds_and_passes_uncapped() {
         let store = ApiKeyStore::new();
         let id = create_key(&store, "k", U256::from(1000u64), H160::zero()).await;
-        store.set_model_budget(&id, "llama", U256::from(5u64)).await.expect("set");
+        store
+            .set_model_budget(&id, "llama", U256::from(5u64))
+            .await
+            .expect("set");
 
-        store.debit_model_budget(&id, "llama", U256::from(5u64)).await.expect("debit");
+        store
+            .debit_model_budget(&id, "llama", U256::from(5u64))
+            .await
+            .expect("debit");
         // llama exhausted
         assert!(matches!(
-            store.debit_model_budget(&id, "llama", U256::from(1u64)).await,
+            store
+                .debit_model_budget(&id, "llama", U256::from(1u64))
+                .await,
             Err(crate::keystore::ModelBudgetError::Exceeded(_))
         ));
         // an uncapped model is a no-op pass
-        store.debit_model_budget(&id, "mistral", U256::from(999u64)).await.expect("uncapped");
+        store
+            .debit_model_budget(&id, "mistral", U256::from(999u64))
+            .await
+            .expect("uncapped");
         // refund restores the llama bucket
-        store.refund_model_budget(&id, "llama", U256::from(5u64)).await;
-        store.debit_model_budget(&id, "llama", U256::from(5u64)).await.expect("debit after refund");
+        store
+            .refund_model_budget(&id, "llama", U256::from(5u64))
+            .await;
+        store
+            .debit_model_budget(&id, "llama", U256::from(5u64))
+            .await
+            .expect("debit after refund");
 
         let budgets = store.get_model_budgets(&id).await;
         assert_eq!(budgets, vec![("llama".to_string(), U256::zero())]);
