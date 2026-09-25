@@ -259,14 +259,18 @@ async fn proxy_handler(
     // gets the larger MAX_STT_BODY cap; every other route keeps the 8 MiB chat
     // cap. Detected here so the cap is chosen before the body is buffered.
     let is_stt = is_stt_transcriptions(&method, uri.path());
-    let max_body = if is_stt { MAX_STT_BODY } else { MAX_REQUEST_BODY };
+    let max_body = if is_stt {
+        MAX_STT_BODY
+    } else {
+        MAX_REQUEST_BODY
+    };
     let body_bytes = match axum::body::to_bytes(body, max_body).await {
         Ok(b) => b,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
     };
 
-    let reqw_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::POST);
+    let reqw_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
 
     // Try each upstream in order. Connection-level failure or a 5xx
     // status falls over to the next. 2xx/3xx/4xx from an upstream is
@@ -380,10 +384,9 @@ fn percent_decode_path(path: &str) -> String {
 
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (
-                hex_value(bytes[index + 1]),
-                hex_value(bytes[index + 2]),
-            ) {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
                 decoded.push((high << 4) | low);
                 index += 3;
                 continue;
@@ -487,20 +490,16 @@ mod tests {
                         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
                          data: [DONE]\n\n",
                     ));
-                    r.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
+                    r.headers_mut()
+                        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
                     r
                 } else {
                     let _ = body; // suppress unused
                     let mut r = Response::new(Body::from(
                         r#"{"choices":[{"message":{"role":"assistant","content":"OK"}}]}"#,
                     ));
-                    r.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        "application/json".parse().unwrap(),
-                    );
+                    r.headers_mut()
+                        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
                     r
                 }
             }),
@@ -518,7 +517,10 @@ mod tests {
         let app = Router::new().fallback(any(move |uri: Uri| {
             let paths = paths.clone();
             async move {
-                paths.lock().expect("paths mutex").push(uri.path().to_string());
+                paths
+                    .lock()
+                    .expect("paths mutex")
+                    .push(uri.path().to_string());
                 (StatusCode::OK, "ok")
             }
         }));
@@ -527,7 +529,9 @@ mod tests {
             .expect("bind recording upstream");
         let addr = listener.local_addr().expect("local_addr");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("recording upstream serve");
+            axum::serve(listener, app)
+                .await
+                .expect("recording upstream serve");
         });
         addr
     }
@@ -746,7 +750,11 @@ mod tests {
 
         let embed_hits = embed_paths.lock().unwrap().clone();
         let chat_hits = chat_paths.lock().unwrap().clone();
-        assert_eq!(embed_hits, vec!["/v1/embeddings".to_string()], "embed upstream");
+        assert_eq!(
+            embed_hits,
+            vec!["/v1/embeddings".to_string()],
+            "embed upstream"
+        );
         assert_eq!(
             chat_hits,
             vec!["/v1/chat/completions".to_string()],
@@ -839,12 +847,7 @@ mod tests {
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("dot-segments", 0, 0).unwrap();
 
-        for path in [
-            "/v1/../x",
-            "/v1/%2e%2e/x",
-            "/v1/a/../../x",
-            "/v1/.%2e/x",
-        ] {
+        for path in ["/v1/../x", "/v1/%2e%2e/x", "/v1/a/../../x", "/v1/.%2e/x"] {
             let app = router_with(store.clone(), format!("http://{upstream_addr}"));
             let resp = app
                 .oneshot(
@@ -956,11 +959,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
         let id = store.create_key("stt-subpath", 0, 0).unwrap();
-        let state = LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()])
-            .with_stt(
-                vec![format!("http://{stt_addr}")],
-                Some("/inference".to_string()),
-            );
+        let state = LocalProxyState::new(store, vec!["http://127.0.0.1:1".into()]).with_stt(
+            vec![format!("http://{stt_addr}")],
+            Some("/inference".to_string()),
+        );
         let app = build_local_proxy_router(state);
 
         let resp = app
