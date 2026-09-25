@@ -49,9 +49,11 @@ pub fn score_provider(p: &ProviderInfo) -> u128 {
 
 /// Score a pool. Higher = better.
 pub fn score_pool(p: &PoolEntry) -> u128 {
-    let salt = (p.total_stake_grains / U256::from(1_000_000_000_000_000_000u128)).as_u128();
+    // Whole SALT tokens staked (the chain's token, not a cryptographic salt).
+    let staked_tokens =
+        (p.total_stake_grains / U256::from(1_000_000_000_000_000_000u128)).as_u128();
     let rep = u128::from(p.min_member_reputation_bps);
-    rep.saturating_mul(salt)
+    rep.saturating_mul(staked_tokens)
 }
 
 /// Pick the best dispatch target across both classes.
@@ -99,11 +101,12 @@ mod tests {
         }
     }
 
-    fn pool(rep_bps: u32, salt: u64) -> PoolEntry {
+    fn pool(rep_bps: u32, staked_tokens: u64) -> PoolEntry {
         PoolEntry {
             pool_id: 1,
             name: "pool-x".into(),
-            total_stake_grains: U256::from(salt) * U256::from(1_000_000_000_000_000_000u128),
+            total_stake_grains: U256::from(staked_tokens)
+                * U256::from(1_000_000_000_000_000_000u128),
             member_count: 1,
             min_member_reputation_bps: rep_bps,
         }
