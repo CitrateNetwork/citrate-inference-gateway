@@ -516,7 +516,7 @@ jobs:
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign installers + checksum manifest (keyless OIDC)
-        # Fail closed (PBA-L6-001, NAT-B-014): an unsigned artefact must never
+        # Fail closed: an unsigned artefact must never
         # be published, because deploy_testnet.sh and users verify these
         # signatures. SHA256SUMS.txt is signed too, so an attacker who can
         # write the release cannot swap an artefact and its checksum.
