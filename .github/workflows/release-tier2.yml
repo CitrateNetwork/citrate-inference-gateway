@@ -10,9 +10,13 @@
 #   git tag v0.5.0-beta2          # → Tier-1 only (release.yml)
 #   git tag v0.5.0-beta2-tier2    # → Tier-2 installers (this workflow)
 #
-# Manual rebuild:
-#   gh workflow run release-tier2.yml --ref main \
-#     -f release_tag=v0.5.0-beta2-tier2
+# Signing: the `package` job reads the code-signing / notarization secrets
+# from the protected `release` environment (required reviewer, v* tags
+# only), so it runs only on a `v*-tier2` / `v*-tier2-slim` tag push. A
+# manual dispatch does not sign or publish; to rebuild, delete and re-push
+# the tag. On a tag build the job FAILS if the macOS artefacts are not
+# signed + notarized. Windows has no Authenticode certificate yet (owner
+# decision pending), so an unsigned Windows build is a visible warning.
 
 name: Release Tier-2 (citrate-inference-gateway)
 
@@ -20,12 +24,23 @@ on:
   push:
     tags:
       - 'v*-tier2'
+      # Slim variant (SFL-01 WP-1.2): same installers WITHOUT the multi-GB
+      # GGUF resource; the llama-server runtime is still bundled. Only
+      # repos that render a packager-slim.toml (currently the wallet)
+      # should push -tier2-slim tags — other repos fail fast with a
+      # clear error in the packaging step.
+      - 'v*-tier2-slim'
   workflow_dispatch:
     inputs:
       release_tag:
         description: 'Existing tag to publish or rebuild (e.g. v0.5.0-beta2-tier2)'
         required: true
         type: string
+      slim:
+        description: 'Slim profile — package with packager-slim.toml (no bundled GGUF)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -38,6 +53,11 @@ jobs:
   package:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Signing secrets live in the protected `release` environment (required
+    # reviewer, v* tags only). Only a v* tag push runs this job; PR CI and
+    # manual dispatches never reach the environment.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -60,11 +80,18 @@ jobs:
     env:
       # Exposed so the SSH-setup steps below can self-skip on repos that have
       # no cross-repo SSH git deps (e.g. citrate-chain). Repos that consume
-      # private sibling crates via ssh:// host aliases (gui-native, defense_prime-shell)
+      # private sibling crates via ssh:// host aliases (citrate-native, boeing-shell)
       # set these deploy-key secrets and the steps activate.
       CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
       LEARNING_CENTER_DEPLOY_KEY: ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
       AGENT_RUNTIME_DEPLOY_KEY: ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
+      # Presence flags for the signing secrets ('true' / 'false', never a
+      # value). Signing steps gate on these; the secret values themselves
+      # stay in the step-level env of the one step that needs them.
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_APPLE_NOTARY: ${{ secrets.APPLE_NOTARY_USER != '' && secrets.APPLE_NOTARY_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
       # Force lzma-sys / xz2 to build liblzma from source and link it
       # statically. Otherwise the macOS runner's Homebrew xz gets dynamically
       # linked into the binary (load path `/opt/homebrew/opt/xz/lib/liblzma.5.dylib`)
@@ -72,6 +99,11 @@ jobs:
       # on user machines because it's signed by a different Team ID — crashing
       # at launch with "Library not loaded: …liblzma.5.dylib … different Team IDs".
       LZMA_API_STATIC: "1"
+      # Slim profile selector (SFL-01 WP-1.2). True when the run was
+      # triggered by a -tier2-slim tag or the workflow_dispatch `slim`
+      # input. Downstream steps use it to skip the GGUF fetch and to
+      # package with packager-slim.toml instead of packager.toml.
+      CITRATE_SLIM: ${{ (github.event.inputs.slim == 'true' || endsWith(github.event.inputs.release_tag || github.ref_name, '-tier2-slim')) && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -135,13 +167,14 @@ jobs:
       # Cached across runs by the .gguf.sha256 + checked against it.
       - name: Cache bundled models
         id: cache-models
+        if: env.CITRATE_SLIM != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: branding/models/*.gguf
           key: gguf-${{ hashFiles('branding/models/*.gguf.sha256') }}
 
       - name: Fetch bundled models (sha256-verified)
-        if: steps.cache-models.outputs.cache-hit != 'true'
+        if: env.CITRATE_SLIM != 'true' && steps.cache-models.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -e
@@ -177,6 +210,36 @@ jobs:
             echo "  ✓ $name verified"
           done
 
+      # Bundled llama-server inference runtime (PIL-02). Fetched per build
+      # from the ggml-org/llama.cpp release pinned inside the script,
+      # verified against the committed branding/llama-server/<target>/
+      # llama-server.sha256 manifests, then staged into
+      # branding/llama-server/current/ which packager.toml globs as
+      # resources. Only this runner's target is fetched. Repos without
+      # the script (chain, gateway, pool) skip cleanly.
+      - name: Fetch bundled llama-server (sha256-pinned)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [[ ! -f scripts/fetch-llama-server.sh ]]; then
+            echo "no scripts/fetch-llama-server.sh in this repo — skipping"
+            exit 0
+          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)   ls_target=linux-x86_64 ;;
+            aarch64-unknown-linux-gnu)  ls_target=linux-aarch64 ;;
+            x86_64-apple-darwin)        ls_target=macos-x86_64 ;;
+            aarch64-apple-darwin)       ls_target=macos-aarch64 ;;
+            x86_64-pc-windows-msvc)     ls_target=windows-x86_64 ;;
+            aarch64-pc-windows-msvc)    ls_target=windows-aarch64 ;;
+            *)
+              echo "no llama-server mapping for ${{ matrix.target }} — skipping"
+              exit 0 ;;
+          esac
+          bash scripts/fetch-llama-server.sh --stage "$ls_target"
+
       - name: Linux build deps (.deb/.rpm/.AppImage)
         if: runner.os == 'Linux'
         run: |
@@ -201,7 +264,7 @@ jobs:
           echo "C:\\Program Files\\NASM" >> $GITHUB_PATH
 
       - name: Import Apple Developer ID cert (macOS)
-        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERT == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -221,7 +284,7 @@ jobs:
           security list-keychain -d user -s $KEYCHAIN
 
       - name: Import Windows Authenticode cert (Windows)
-        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -269,11 +332,24 @@ jobs:
           # for chain (node/), gui (gui/citrate_desktop_app/), and pool (.).
           TARGET_DIR="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release"
           cd gateway
-          CONFIG_JSON=$(CITRATE_TARGET_DIR="$TARGET_DIR" python3 -c "
+          # Slim profile (SFL-01 WP-1.2): swap in packager-slim.toml, which
+          # drops the multi-GB GGUF resource but keeps the llama-server
+          # runtime. Rendered by apply-tier2.sh only for profiles that
+          # declare slim_resources in repos.toml — anything else fails
+          # loudly here rather than shipping a mislabelled artifact.
+          PACKAGER_CONFIG=packager.toml
+          if [[ "$CITRATE_SLIM" == "true" ]]; then
+            PACKAGER_CONFIG=packager-slim.toml
+            if [[ ! -f "$PACKAGER_CONFIG" ]]; then
+              echo "::error::slim build requested but $PACKAGER_CONFIG does not exist in gateway"
+              exit 1
+            fi
+          fi
+          CONFIG_JSON=$(CITRATE_TARGET_DIR="$TARGET_DIR" CITRATE_PACKAGER_CONFIG="$PACKAGER_CONFIG" python3 -c "
           import json, os
           try: import tomllib
           except ImportError: import tomli as tomllib
-          with open('packager.toml','rb') as f: d = tomllib.load(f)
+          with open(os.environ.get('CITRATE_PACKAGER_CONFIG', 'packager.toml'),'rb') as f: d = tomllib.load(f)
           # The --binaries-dir CLI flag is ignored when --config is a raw JSON
           # string, so packager defaults to out-dir and the binary copy fails
           # with 'No such file or directory'. Inject an absolute binaries-dir.
@@ -307,7 +383,7 @@ jobs:
             --out-dir "$TARGET_DIR/packages"
 
       - name: Notarize macOS artefacts
-        if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
+        if: runner.os == 'macOS' && env.HAS_APPLE_NOTARY == 'true'
         env:
           APPLE_NOTARY_USER: ${{ secrets.APPLE_NOTARY_USER }}
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
@@ -324,6 +400,57 @@ jobs:
               --wait
             xcrun stapler staple "$f" || true
           done
+
+      # Nothing ships unsigned silently. On a v* tag build the macOS legs
+      # FAIL unless the signing + notarization secrets are present AND the
+      # artefacts verify (codesign on the .app, stapled ticket on the .dmg).
+      # Windows has no Authenticode certificate yet (owner decision
+      # pending), so an unsigned Windows build is a visible warning (job
+      # annotation + run summary), not a failure. Linux packages are signed
+      # with cosign in the publish job. Runs before hashing/upload, so a
+      # failing leg uploads nothing and the publish job never runs.
+      - name: Require signed artefacts (v* tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="target/${{ matrix.target }}/release/packages"
+          case "${{ runner.os }}" in
+            macOS)
+              missing=""
+              [[ "$HAS_APPLE_CERT" == "true" ]] || missing="$missing APPLE_CERTIFICATE"
+              [[ "$HAS_APPLE_SIGNING_IDENTITY" == "true" ]] || missing="$missing APPLE_SIGNING_IDENTITY"
+              [[ "$HAS_APPLE_NOTARY" == "true" ]] || missing="$missing APPLE_NOTARY_USER/APPLE_NOTARY_PASSWORD/APPLE_TEAM_ID"
+              if [[ -n "$missing" ]]; then
+                echo "::error title=Unsigned macOS release::v* tag build without macOS signing/notarization. Missing in the release environment:$missing"
+                exit 1
+              fi
+              shopt -s nullglob
+              n=0
+              for app in "$PKG"/*.app; do
+                codesign --verify --deep --strict --verbose=2 "$app"
+                n=$((n + 1))
+              done
+              for dmg in "$PKG"/*.dmg; do
+                xcrun stapler validate "$dmg"
+                n=$((n + 1))
+              done
+              if [[ "$n" -eq 0 ]]; then
+                echo "::error::no macOS .app/.dmg artefacts found to verify"
+                exit 1
+              fi
+              echo "macOS artefacts signed and notarized ($n verified)"
+              ;;
+            Windows)
+              if [[ "$HAS_WINDOWS_CERT" != "true" ]]; then
+                echo "::warning title=Unsigned Windows installers::No WINDOWS_CERTIFICATE in the release environment. The Windows installers in this release are NOT Authenticode-signed (owner decision pending)."
+                echo "**WARNING: the Windows installers in this release are NOT Authenticode-signed** (no WINDOWS_CERTIFICATE; owner decision pending)." >> "$GITHUB_STEP_SUMMARY"
+              fi
+              ;;
+            *)
+              echo "Linux packages are signed with cosign in the publish job."
+              ;;
+          esac
 
       - name: SHA-256 sums
         shell: bash
@@ -342,7 +469,9 @@ jobs:
       - name: Upload artefacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: tier2-${{ matrix.target }}
+          # -slim suffix keeps full and slim artefacts from colliding when
+          # both variants are rebuilt against the same commit.
+          name: tier2-${{ matrix.target }}${{ env.CITRATE_SLIM == 'true' && '-slim' || '' }}
           path: target/${{ matrix.target }}/release/packages/*
           retention-days: 30
 
@@ -386,16 +515,46 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Sign installers (keyless OIDC)
+      - name: Sign installers + checksum manifest (keyless OIDC)
+        # Fail closed: an unsigned artefact must never
+        # be published, because deploy_testnet.sh and users verify these
+        # signatures. SHA256SUMS.txt is signed too, so an attacker who can
+        # write the release cannot swap an artefact and its checksum.
         run: |
+          set -euo pipefail
           cd dist
           shopt -s nullglob
-          for f in *.dmg *.msi *.exe *.deb *.rpm *.AppImage *.app.zip ; do
+          for f in SHA256SUMS.txt *.dmg *.msi *.exe *.deb *.rpm *.AppImage *.app.zip ; do
             [[ -f "$f" ]] || continue
             COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" \
               --output-signature "$f.sig" \
-              --output-certificate "$f.pem" || true
+              --output-certificate "$f.pem"
           done
+
+      - name: Verify every signature before publishing
+        # Verify each blob against its own signature + certificate, pinned to
+        # this repo's GitHub OIDC identity; fail before publish on any miss.
+        run: |
+          cd dist
+          shopt -s nullglob
+          rc=0
+          for f in SHA256SUMS.txt *.dmg *.msi *.exe *.deb *.rpm *.AppImage *.app.zip ; do
+            [[ -f "$f" ]] || continue
+            if [[ ! -s "$f.sig" || ! -s "$f.pem" ]]; then
+              echo "::error::missing signature/certificate for $f"
+              rc=1
+              continue
+            fi
+            if ! cosign verify-blob "$f" \
+                --signature "$f.sig" \
+                --certificate "$f.pem" \
+                --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" ; then
+              echo "::error::signature verification FAILED for $f"
+              rc=1
+            fi
+          done
+          exit $rc
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
