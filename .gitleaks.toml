@@ -1,0 +1,26 @@
+# gitleaks configuration — narrow secret-scan allowlist (hardening / scanner compat)
+#
+# The default "generic-api-key" rule flags entries in the GENERATED on-chain
+# address book whose contract NAME contains a trigger word such as "Access" or
+# "Auth" — e.g.  "ModelAccessControl": "0x...",  "WebAuthnP256Validator": "0x...".
+# The flagged value is a PUBLIC 40204 contract address (0x + 40 hex = 20 bytes),
+# not a credential. Nothing secret.
+#
+# This allowlist exempts ONLY findings whose SECRET is exactly a 0x-prefixed
+# 40-hex EVM address. It does NOT disable any rule and does NOT skip any file:
+# real credentials (Stripe/GitHub/AWS keys, 64-hex private keys, JWTs, ...) are
+# still caught, because none of them are a bare 20-byte hex address.
+#
+# NOTE: a `paths`-scoped allowlist was deliberately avoided. In gitleaks 8.30.1
+# (the version pinned by .github/workflows/merge-gate.yml) an allowlist `paths`
+# match skips the WHOLE file even with condition="AND", which would suppress
+# real secrets living in that file. Scoping by the address VALUE pattern is
+# strictly narrower and was verified with an injection test (see PR body).
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public 40204 contract addresses (0x + 40 hex) in the generated address book are not secrets"
+regexes = ['''^0x[0-9a-fA-F]{40}$''']
+regexTarget = "secret"
