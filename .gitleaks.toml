@@ -1,0 +1,13 @@
+# gitleaks config: the default ruleset plus ONE narrow value allowlist.
+# Address books list public contract addresses under names such as
+# "ModelAccessControl", which the default generic-api-key rule misreads as a
+# credential. A value that is exactly an EVM address (0x + 40 hex) is public
+# by definition and is allowed. Nothing else is: private keys (64 hex), API
+# tokens and every other secret format are still reported, in every file.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public EVM addresses (0x + 40 hex) are not secrets"
+regexTarget = "secret"
+regexes = ['''^0x[0-9a-fA-F]{40}$''']
