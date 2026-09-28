@@ -1,19 +1,37 @@
 //! `/health` endpoint.
 //!
-//! Returns 200 with `{"ok": true}` unconditionally. Does NOT
+//! Returns 200 with `{"ok": true, "sha": "<git commit>"}` unconditionally. Does NOT
 //! depend on chain RPC reachability — load balancers must not
 //! take the gateway out of rotation on transient chain blips.
+//!
+//! `sha` is the deployed git commit (audit rescore #10, dim 8) so a deploy can be
+//! *probed* rather than attested. It is resolved from a runtime env var (`GIT_SHA`
+//! then `SOURCE_COMMIT`), falling back to the value `build.rs` bakes in; `"unknown"`
+//! when nothing is available. Not a secret.
 //!
 //! Future enhancements (post-v1):
 //! - `/health/ready` that DOES check chain reachability for
 //!   slow-startup orchestrators.
-//! - `/health/version` returning the gateway's build SHA.
 
 use axum::Json;
 
-/// `GET /health` handler. Trivial liveness probe.
+/// The deployed git commit, for the `/health` probe. Runtime env override first
+/// (`GIT_SHA`, then `SOURCE_COMMIT`), else the commit baked in at build time.
+fn git_sha() -> String {
+    for key in ["GIT_SHA", "SOURCE_COMMIT"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    env!("GIT_SHA").to_string()
+}
+
+/// `GET /health` handler. Trivial liveness probe + the deployed git commit.
 pub async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+    Json(serde_json::json!({ "ok": true, "sha": git_sha() }))
 }
 
 #[cfg(test)]
