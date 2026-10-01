@@ -16,12 +16,27 @@
 //! batch:<batch_id>               -> bincode PersistedBatch  (WP-F F2)
 //! batchset:<batch_id>            -> settled marker          (WP-F F2)
 //! mbudget:<sha256_hex>:<model>   -> U256 BE                 (WP-E)
+//! member:<subhash>               -> sha256_hex of the account's live key (GW-AUTOKEY)
+//! quota:member-pool:<yyyymmdd>   -> u64 LE  (requests across ALL member keys that day)
 //! meta:enc                       -> encryption marker       (ENCRYPT-S1)
 //! ```
 //!
 //! Per-second rate-limit windows are kept in memory only — restart resets
 //! the in-flight burst counter, which is correct (the daily quota is what
 //! survives restart, and that *is* persisted).
+//!
+//! # Member keys (GW-AUTOKEY / WP-1)
+//!
+//! Self-serve keys minted for signed-in Citrate accounts carry the label
+//! `member:<subhash>` ([`MEMBER_LABEL_PREFIX`]). They are ordinary `record:`
+//! rows — same auth, same per-key rps/daily metering — plus one extra gate:
+//! a shared per-UTC-day pool across every member key
+//! ([`PersistentKeyStore::set_member_pool_daily`]). The pool exists because
+//! self-serve issuance means the number of keys is unbounded, so per-key
+//! quotas alone don't bound the load on the one upstream. Operator-minted
+//! keys never match the prefix and never touch the pool. The `member:` row
+//! maps an account to its one live key (by hash) so re-issuance can revoke
+//! the previous key without ever having stored its plaintext.
 //!
 //! # Encryption at rest (ENCRYPT-S1 / WP-2)
 //!
@@ -49,6 +64,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aes_gcm_siv::aead::{Aead, Payload};
@@ -69,6 +85,11 @@ pub fn hash_key_id(key_id: &str) -> String {
     h.update(key_id.as_bytes());
     hex::encode(h.finalize())
 }
+
+/// Label prefix marking a self-serve member key (GW-AUTOKEY). Keys whose
+/// label starts with this are additionally metered against the shared
+/// member pool; nothing else about them differs from operator-minted keys.
+pub const MEMBER_LABEL_PREFIX: &str = "member:";
 
 // ── Value encryption at rest (ENCRYPT-S1 / WP-2) ────────────────────
 
@@ -398,6 +419,16 @@ pub struct PersistentKeyStore {
     /// must read, check, deduct, and durably commit as one critical section so
     /// concurrent debits cannot lose an update or overspend.
     bal_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// GW-AUTOKEY: per-UTC-day cap on requests across ALL member keys
+    /// (labels starting with [`MEMBER_LABEL_PREFIX`]). `0` = no pool, which
+    /// is the default so a store opened without the feature behaves exactly
+    /// as before. Atomic so the proxy can configure it on a shared `Arc`.
+    member_pool_daily: AtomicU64,
+    /// Serializes the pool counter's read-compare-write. Separate from the
+    /// per-key locks because the pool is shared across keys; always taken
+    /// AFTER a key's lock (never the other way round), so no lock-order
+    /// inversion is possible.
+    member_pool_lock: Mutex<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -431,6 +462,8 @@ impl PersistentKeyStore {
             master: Zeroizing::new(master),
             rate: Mutex::new(HashMap::new()),
             bal_locks: Mutex::new(HashMap::new()),
+            member_pool_daily: AtomicU64::new(0),
+            member_pool_lock: Mutex::new(()),
         };
         store.check_or_init_enc_marker()?;
         Ok(Arc::new(store))
@@ -949,27 +982,113 @@ impl PersistentKeyStore {
     /// quota-keyed (`record:`, local-proxy) and balance-keyed (`bal:`, WP-F
     /// marketplace) namespaces.
     pub fn revoke(&self, key_id: &str) -> Result<(), StoreError> {
-        let h = hash_key_id(key_id);
-        if let Some(b) = self.get_val(&record_key(&h))? {
+        self.revoke_hash(&hash_key_id(key_id))
+    }
+
+    /// [`Self::revoke`] by `sha256(bearer)` hex instead of the plaintext.
+    /// Needed wherever only the hash survives — the store never holds a
+    /// plaintext token, so re-issuing a member key can only name the old key
+    /// by hash (GW-AUTOKEY). Same namespaces, same `Unknown` on a miss.
+    pub fn revoke_hash(&self, hash: &str) -> Result<(), StoreError> {
+        let h = hash;
+        if let Some(b) = self.get_val(&record_key(h))? {
             let mut rec: KeyRecord =
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
             rec.revoked = true;
             let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-            self.put_val(&record_key(&h), &bytes, &WriteOptions::default())?;
+            self.put_val(&record_key(h), &bytes, &WriteOptions::default())?;
             return Ok(());
         }
         // Balance key — revoke under the per-key lock so it can't race a debit.
-        let keylock = self.lock_for(&h);
+        let keylock = self.lock_for(h);
         let _guard = keylock.lock();
-        if let Some(b) = self.get_val(&bal_key(&h))? {
+        if let Some(b) = self.get_val(&bal_key(h))? {
             let mut rec: BalanceRecord =
                 bincode::deserialize(&b).map_err(|e| StoreError::Encode(e.to_string()))?;
             rec.revoked = true;
             let bytes = bincode::serialize(&rec).map_err(|e| StoreError::Encode(e.to_string()))?;
-            self.put_val(&bal_key(&h), &bytes, &synced())?;
+            self.put_val(&bal_key(h), &bytes, &synced())?;
             return Ok(());
         }
         Err(StoreError::Unknown)
+    }
+
+    // ── Member keys (GW-AUTOKEY / WP-1) ─────────────────────────────
+
+    /// Set the per-UTC-day request cap shared by every member key. `0`
+    /// disables the pool. Non-member keys are never affected.
+    pub fn set_member_pool_daily(&self, cap: u64) {
+        self.member_pool_daily.store(cap, Ordering::Relaxed);
+    }
+
+    /// The configured member-pool cap (`0` = disabled).
+    pub fn member_pool_daily(&self) -> u64 {
+        self.member_pool_daily.load(Ordering::Relaxed)
+    }
+
+    /// Requests counted against the member pool so far today (ops/tests).
+    pub fn member_pool_used_today(&self) -> Result<u64, StoreError> {
+        Ok(self.read_counter(&member_pool_key(&today_yyyymmdd()))?)
+    }
+
+    /// Hash of the live key currently mapped to member `subhash`, if any.
+    pub fn member_key_hash(&self, subhash: &str) -> Result<Option<String>, StoreError> {
+        match self.get_val(&member_map_key(subhash))? {
+            Some(b) => Ok(Some(
+                String::from_utf8(b).map_err(|e| StoreError::Encode(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Issue member `subhash` a fresh key labelled `member:<subhash>` and
+    /// retire the previous one, so an account holds at most one live key.
+    /// Returns the plaintext token — hand it to the caller once, never log it.
+    ///
+    /// Order matters for crash safety: mint → revoke the old key (by hash)
+    /// → write the mapping. A crash after the revoke leaves the mapping on a
+    /// revoked key (the next issuance revokes it again, harmlessly); the
+    /// opposite order could lose the mapping while the old key is still live,
+    /// stranding a working key nobody can retire. The whole sequence runs
+    /// under a per-account lock so two concurrent issuances for the same
+    /// account cannot both leave a live key behind.
+    pub fn rotate_member_key(
+        &self,
+        subhash: &str,
+        quota_rps: u32,
+        daily_quota: u64,
+    ) -> Result<String, StoreError> {
+        let map_key = member_map_key(subhash);
+        let lock = self.lock_for(&map_key);
+        let _guard = lock.lock();
+
+        let previous = self.member_key_hash(subhash)?;
+        let id = self.create_key(
+            format!("{MEMBER_LABEL_PREFIX}{subhash}"),
+            quota_rps,
+            daily_quota,
+        )?;
+        if let Some(old) = previous {
+            match self.revoke_hash(&old) {
+                // An admin may already have purged/never-persisted the old
+                // record; nothing left to revoke is fine.
+                Ok(()) | Err(StoreError::Unknown) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Synced: the mapping is what lets the NEXT issuance revoke this key.
+        self.put_val(&map_key, hash_key_id(&id).as_bytes(), &synced())?;
+        Ok(id)
+    }
+
+    /// Read a `u64 LE` counter row; absent or malformed reads as 0 (the
+    /// pre-existing daily-quota behaviour).
+    fn read_counter(&self, key: &str) -> Result<u64, ValErr> {
+        Ok(self
+            .get_val(key)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0))
     }
 
     /// List all records as `(hash, record)`. The plaintext bearer isn't
@@ -1025,7 +1144,16 @@ impl PersistentKeyStore {
             w.count += 1;
         }
 
-        if record.daily_quota > 0 {
+        // GW-AUTOKEY: member keys also draw on the shared daily pool. Read
+        // the cap once so a concurrent reconfigure can't split one request
+        // across two policies.
+        let pool_cap = if record.label.starts_with(MEMBER_LABEL_PREFIX) {
+            self.member_pool_daily()
+        } else {
+            0
+        };
+
+        if record.daily_quota > 0 || pool_cap > 0 {
             // FUA-GATEWAY-03: the read-compare-write below must be atomic per
             // key — two concurrent requests could both read N and both write
             // N+1, drifting past the cap. Reuse the per-key balance lock so
@@ -1035,25 +1163,38 @@ impl PersistentKeyStore {
             let _guard = keylock.lock();
             let day = today_yyyymmdd();
             let day_key = quota_key(&h, &day);
-            let cur = self
-                .get_val(&day_key)?
-                .and_then(|b| {
-                    if b.len() == 8 {
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&b);
-                        Some(u64::from_le_bytes(buf))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            if cur >= record.daily_quota {
+            let cur = if record.daily_quota > 0 {
+                self.read_counter(&day_key)?
+            } else {
+                0
+            };
+            if record.daily_quota > 0 && cur >= record.daily_quota {
                 return Err(ConsumeError::DailyQuotaExceeded {
                     retry_after_secs: seconds_until_next_utc_day(),
                 });
             }
-            let next = cur + 1;
-            self.put_val(&day_key, &next.to_le_bytes(), &WriteOptions::default())?;
+            // Pool check-and-increment under its own lock (shared across
+            // keys), taken after the key lock and before the key's counter is
+            // written, so a pool refusal charges neither counter.
+            if pool_cap > 0 {
+                let _pool = self.member_pool_lock.lock();
+                let pool_key = member_pool_key(&day);
+                let used = self.read_counter(&pool_key)?;
+                if used >= pool_cap {
+                    return Err(ConsumeError::DailyQuotaExceeded {
+                        retry_after_secs: seconds_until_next_utc_day(),
+                    });
+                }
+                self.put_val(
+                    &pool_key,
+                    &(used + 1).to_le_bytes(),
+                    &WriteOptions::default(),
+                )?;
+            }
+            if record.daily_quota > 0 {
+                let next = cur + 1;
+                self.put_val(&day_key, &next.to_le_bytes(), &WriteOptions::default())?;
+            }
         }
 
         Ok(ConsumedKey {
@@ -1122,6 +1263,18 @@ fn synced() -> WriteOptions {
 
 fn quota_key(hash: &str, day: &str) -> String {
     format!("quota:{}:{}", hash, day)
+}
+
+/// Shared member-pool counter. Lives in the `quota` namespace (same `u64 LE`
+/// value shape, so `migrate-encrypt` classifies it); `member-pool` can never
+/// collide with a per-key row because those carry a 64-char hex hash.
+fn member_pool_key(day: &str) -> String {
+    format!("quota:member-pool:{}", day)
+}
+
+/// Account → live-key-hash mapping row (GW-AUTOKEY).
+fn member_map_key(subhash: &str) -> String {
+    format!("{MEMBER_LABEL_PREFIX}{subhash}")
 }
 
 fn now_secs() -> u64 {
@@ -1462,6 +1615,155 @@ mod tests {
             open_value(&TEST_MASTER, b"bal:rich", &sealed).unwrap(),
             b"lots-of-money"
         );
+    }
+
+    // ── GW-AUTOKEY / WP-1: member keys ──────────────────────────────
+
+    /// The shared pool caps the SUM of requests across member keys, refuses
+    /// with `DailyQuotaExceeded` (so the proxy answers 429 + Retry-After to
+    /// UTC midnight), and never touches an operator key.
+    #[test]
+    fn member_pool_caps_member_keys_and_spares_non_member_keys() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        store.set_member_pool_daily(3);
+        let a = store.create_key("member:aaaa", 0, 100).unwrap();
+        let b = store.create_key("member:bbbb", 0, 100).unwrap();
+        let op = store.create_key("chatbot-prod", 0, 0).unwrap();
+
+        store.try_consume(&a).unwrap();
+        store.try_consume(&b).unwrap();
+        store.try_consume(&a).unwrap();
+        assert_eq!(store.member_pool_used_today().unwrap(), 3);
+        for k in [&a, &b] {
+            match store.try_consume(k) {
+                Err(ConsumeError::DailyQuotaExceeded { retry_after_secs }) => {
+                    assert!(retry_after_secs <= 86_400);
+                }
+                other => panic!("expected pool exhaustion, got {:?}", other.err()),
+            }
+        }
+        // A pool refusal charges neither the pool nor the key's own counter.
+        assert_eq!(store.member_pool_used_today().unwrap(), 3);
+        let day = today_yyyymmdd();
+        let a_used = store
+            .read_counter(&quota_key(&hash_key_id(&a), &day))
+            .ok()
+            .unwrap();
+        assert_eq!(a_used, 2);
+
+        // Non-member key: unaffected, and never counted in the pool.
+        for _ in 0..10 {
+            store.try_consume(&op).unwrap();
+        }
+        assert_eq!(store.member_pool_used_today().unwrap(), 3);
+
+        // 0 disables the pool again.
+        store.set_member_pool_daily(0);
+        store.try_consume(&a).unwrap();
+    }
+
+    /// Default (feature off): no pool, even for `member:`-labelled keys.
+    #[test]
+    fn member_pool_is_off_by_default() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        assert_eq!(store.member_pool_daily(), 0);
+        let a = store.create_key("member:aaaa", 0, 0).unwrap();
+        for _ in 0..50 {
+            store.try_consume(&a).unwrap();
+        }
+        assert_eq!(store.member_pool_used_today().unwrap(), 0);
+    }
+
+    /// The pool counter is atomic across keys: racing member keys can never
+    /// overshoot it.
+    #[test]
+    fn member_pool_is_atomic_under_concurrency() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        store.set_member_pool_daily(20);
+        let keys: Vec<String> = (0..8)
+            .map(|i| store.create_key(format!("member:{i:04}"), 0, 0).unwrap())
+            .collect();
+        let handles: Vec<_> = keys
+            .into_iter()
+            .map(|k| {
+                let store = store.clone();
+                std::thread::spawn(move || (0..8).filter(|_| store.try_consume(&k).is_ok()).count())
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 20, "exactly the pool cap may succeed");
+    }
+
+    #[test]
+    fn revoke_hash_revokes_without_the_plaintext() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        let id = store.create_key("x", 0, 0).unwrap();
+        store.revoke_hash(&hash_key_id(&id)).unwrap();
+        assert!(store.get_record(&id).unwrap().unwrap().revoked);
+        assert!(matches!(store.try_consume(&id), Err(ConsumeError::Revoked)));
+        assert!(matches!(
+            store.revoke_hash(&hash_key_id("cgk_nope")),
+            Err(StoreError::Unknown)
+        ));
+    }
+
+    /// Re-issuing for the same account revokes the previous key and remaps
+    /// the account to the new one; other accounts are untouched.
+    #[test]
+    fn rotate_member_key_replaces_and_revokes_previous() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        let first = store.rotate_member_key("abcd", 1, 300).unwrap();
+        let other = store.rotate_member_key("ffff", 1, 300).unwrap();
+        let rec = store.get_record(&first).unwrap().unwrap();
+        assert_eq!(rec.label, "member:abcd");
+        assert_eq!((rec.quota_rps, rec.daily_quota), (1, 300));
+        assert_eq!(
+            store.member_key_hash("abcd").unwrap(),
+            Some(hash_key_id(&first))
+        );
+
+        let second = store.rotate_member_key("abcd", 1, 300).unwrap();
+        assert_ne!(first, second);
+        assert!(matches!(
+            store.try_consume(&first),
+            Err(ConsumeError::Revoked)
+        ));
+        store.try_consume(&second).unwrap();
+        store.try_consume(&other).unwrap();
+        assert_eq!(
+            store.member_key_hash("abcd").unwrap(),
+            Some(hash_key_id(&second))
+        );
+        // The mapping row holds a hash, never the plaintext bearer.
+        let raw = store
+            .get_val(&member_map_key("abcd"))
+            .ok()
+            .flatten()
+            .unwrap();
+        assert!(!raw.windows(second.len()).any(|w| w == second.as_bytes()));
+    }
+
+    /// A mapping that points at a record which no longer exists does not
+    /// block re-issuance.
+    #[test]
+    fn rotate_member_key_tolerates_a_missing_previous_record() {
+        let dir = tempdir().unwrap();
+        let store = open(dir.path());
+        store
+            .put_val(
+                &member_map_key("dead"),
+                hash_key_id("cgk_gone").as_bytes(),
+                &synced(),
+            )
+            .ok()
+            .unwrap();
+        let k = store.rotate_member_key("dead", 1, 300).unwrap();
+        store.try_consume(&k).unwrap();
     }
 
     /// Recursively list files under `dir` (probe helper).

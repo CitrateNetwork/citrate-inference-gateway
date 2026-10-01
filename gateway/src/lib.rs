@@ -66,6 +66,7 @@ pub mod health;
 pub mod keystore;
 pub mod keyvault;
 pub mod local_proxy;
+pub mod member_keys;
 pub mod metrics;
 pub mod migrate;
 pub mod models;
