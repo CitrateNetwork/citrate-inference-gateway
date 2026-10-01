@@ -134,6 +134,16 @@ See the full multi-repo bring-up: https://docs.citrate.ai/local-stack
   that is not a parseable JSON object, is 400),
   `CITRATE_GATEWAY_MAX_CONCURRENT_PER_KEY` (default 4; the next request is 429),
   `CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM` (fair shared queue, default 32).
+- local-proxy self-serve member keys (`POST /auth/member-key`, GW-AUTOKEY; off by
+  default, route is 404): `CITRATE_GATEWAY_MEMBER_KEYS=1` enables it;
+  `CITRATE_GATEWAY_MEMBER_USERINFO_URL` (default `https://auth.citrate.ai/me`),
+  `CITRATE_GATEWAY_MEMBER_RPS` (default 1), `CITRATE_GATEWAY_MEMBER_DAILY` (default 300),
+  `CITRATE_GATEWAY_MEMBER_DAILY_POOL` (requests/UTC day across all member keys, default
+  50000, `0` = no pool), `CITRATE_GATEWAY_MEMBER_MAX_CONCURRENT` (default 2, never above
+  the per-key limit), `CITRATE_GATEWAY_MEMBER_TRUST_XFF` (default off; set to 1 only
+  behind Caddy, which overwrites `X-Forwarded-For`), `CITRATE_GATEWAY_MEMBER_BASE_URL`
+  (default `https://infer.citrate.ai/v1`), `CITRATE_GATEWAY_MEMBER_MODEL` (default
+  `citrate-gemma`).
 - marketplace: `CITRATE_GATEWAY_RPC_URL` (default `http://127.0.0.1:8545`),
   `CITRATE_GATEWAY_CHAIN_ID` (default 40204), `CITRATE_GATEWAY_MODEL_REGISTRY`,
   `CITRATE_GATEWAY_INFERENCE_ROUTER`, `CITRATE_GATEWAY_PRICING_ORACLE`.

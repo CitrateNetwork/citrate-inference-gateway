@@ -5,7 +5,8 @@
 //! - **`local-proxy`** (WP-5 of 2026-06-04 planset): the lean
 //!   `cgk_`-gated OpenAI passthrough that fronts a resident llama-server.
 //!   Reads `CITRATE_GATEWAY_UPSTREAM_URL` + `CITRATE_GATEWAY_KEYSTORE_PATH`.
-//!   No chain RPC, no x402.
+//!   No chain RPC, no x402. Optionally serves `POST /auth/member-key`
+//!   (GW-AUTOKEY self-serve keys) when `CITRATE_GATEWAY_MEMBER_KEYS=1`.
 //! - **`marketplace`** (default — pre-existing behavior): the on-chain
 //!   marketplace gateway with `ModelRegistry` / `InferenceRouter` dispatch.
 //!   Reads `CITRATE_GATEWAY_RPC_URL` + contract addresses.
@@ -37,6 +38,7 @@ use std::sync::Arc;
 use citrate_gateway::config::ContractAddresses;
 use citrate_gateway::keystore::PersistentKeyStore;
 use citrate_gateway::local_proxy::{build_local_proxy_router, LocalProxyState};
+use citrate_gateway::member_keys::MemberKeyConfig;
 use citrate_gateway::{build_router, GatewayConfig};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -130,10 +132,25 @@ async fn run_local_proxy() -> Result<(), Box<dyn std::error::Error>> {
         "CITRATE_GATEWAY_MAX_CONCURRENT_UPSTREAM",
         citrate_gateway::local_proxy::DEFAULT_MAX_CONCURRENT_UPSTREAM as u64,
     )? as usize;
-    let state = LocalProxyState::new(store, upstreams.clone())
+    let mut state = LocalProxyState::new(store, upstreams.clone())
         .with_embed_upstreams(embed_upstreams.clone())
         .with_stt(stt_upstreams.clone(), stt_subpath.clone())
         .with_limits(max_tokens, max_per_key, max_upstream);
+    // GW-AUTOKEY: self-serve member keys. Off unless explicitly enabled, so
+    // an existing deployment's routes and keys are untouched by this build.
+    if env_flag("CITRATE_GATEWAY_MEMBER_KEYS")? {
+        let cfg = member_key_config_from_env()?;
+        tracing::info!(
+            userinfo_url = %cfg.userinfo_url,
+            quota_rps = cfg.quota_rps,
+            daily_quota = cfg.daily_quota,
+            pool_daily = cfg.pool_daily,
+            max_concurrent = cfg.max_concurrent,
+            trust_forwarded_for = cfg.trust_forwarded_for,
+            "member-key issuance enabled (POST /auth/member-key)"
+        );
+        state = state.with_member_keys(cfg);
+    }
     let app = build_local_proxy_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -168,6 +185,63 @@ fn env_number(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error
             Ok(n) if n > 0 => Ok(n),
             _ => Err(format!("{name}={raw:?} must be a positive integer").into()),
         },
+    }
+}
+
+/// GW-AUTOKEY: build the member-key config from `CITRATE_GATEWAY_MEMBER_*`,
+/// falling back to [`MemberKeyConfig::default`] per field.
+fn member_key_config_from_env() -> Result<MemberKeyConfig, Box<dyn std::error::Error>> {
+    let d = MemberKeyConfig::default();
+    let text = |name: &str, default: String| {
+        env::var(name)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+    };
+    let quota_rps = env_number("CITRATE_GATEWAY_MEMBER_RPS", u64::from(d.quota_rps))?;
+    Ok(MemberKeyConfig {
+        userinfo_url: text(
+            "CITRATE_GATEWAY_MEMBER_USERINFO_URL",
+            d.userinfo_url.clone(),
+        ),
+        quota_rps: u32::try_from(quota_rps)
+            .map_err(|_| "CITRATE_GATEWAY_MEMBER_RPS is out of range")?,
+        daily_quota: env_number("CITRATE_GATEWAY_MEMBER_DAILY", d.daily_quota)?,
+        // 0 is meaningful here (no pool), unlike the per-key limits.
+        pool_daily: env_number_or_zero("CITRATE_GATEWAY_MEMBER_DAILY_POOL", d.pool_daily)?,
+        max_concurrent: env_number(
+            "CITRATE_GATEWAY_MEMBER_MAX_CONCURRENT",
+            d.max_concurrent as u64,
+        )? as usize,
+        base_url: text("CITRATE_GATEWAY_MEMBER_BASE_URL", d.base_url.clone()),
+        model: text("CITRATE_GATEWAY_MEMBER_MODEL", d.model.clone()),
+        trust_forwarded_for: env_flag("CITRATE_GATEWAY_MEMBER_TRUST_XFF")?,
+        ..d
+    })
+}
+
+/// A boolean switch from the environment: unset/empty/`0`/`false` → off,
+/// `1`/`true` → on. Anything else fails the boot rather than guessing.
+fn env_flag(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Err(_) => Ok(false),
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "no" | "off" => Ok(false),
+            "1" | "true" | "yes" | "on" => Ok(true),
+            _ => Err(format!("{name}={raw:?} must be 1/0 or true/false").into()),
+        },
+    }
+}
+
+/// Like [`env_number`] but `0` is allowed (for limits where 0 means "off").
+fn env_number_or_zero(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Err(_) => Ok(default),
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name}={raw:?} must be a non-negative integer").into()),
     }
 }
 
