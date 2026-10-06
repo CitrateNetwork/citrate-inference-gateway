@@ -18,6 +18,10 @@
 //!   Whisper backend (`CITRATE_GATEWAY_STT_URL`, subpath overridable via
 //!   `CITRATE_GATEWAY_STT_SUBPATH`). Unlike embeddings this does NOT fall
 //!   back to the chat upstreams; when unconfigured the route returns 503.
+//! - `POST /auth/member-key` — self-serve `cgk_` issuance for accounts
+//!   signed in at the IdP (GW-AUTOKEY; see [`crate::member_keys`]). Takes
+//!   an IdP access token, not a `cgk_` key, and charges no key's quota.
+//!   **404** unless enabled with [`LocalProxyState::with_member_keys`].
 //!
 //! # Outcomes
 //!
@@ -45,7 +49,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::Response;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -53,7 +57,8 @@ use tower_http::cors::{Any as CorsAny, CorsLayer};
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::keystore::{ConsumeError, PersistentKeyStore};
+use crate::keystore::{ConsumeError, PersistentKeyStore, MEMBER_LABEL_PREFIX};
+use crate::member_keys::{member_key_handler, MemberKeyConfig, MemberKeys};
 
 /// Hop-by-hop headers per RFC 7230 §6.1 — strip in both directions so we
 /// don't accidentally forward them between the client connection and the
@@ -166,6 +171,9 @@ pub struct LocalProxyState {
     per_key_slots: Arc<parking_lot::Mutex<HashMap<String, Arc<Semaphore>>>>,
     /// PBA-L3b-003: shared, fair upstream capacity.
     upstream_slots: Arc<Semaphore>,
+    /// GW-AUTOKEY: self-serve member-key issuance. `None` = feature off
+    /// (`POST /auth/member-key` is 404 and no member pool is enforced).
+    pub(crate) member_keys: Option<Arc<MemberKeys>>,
 }
 
 impl LocalProxyState {
@@ -194,7 +202,29 @@ impl LocalProxyState {
             max_concurrent_per_key: DEFAULT_MAX_CONCURRENT_PER_KEY,
             per_key_slots: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             upstream_slots: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_UPSTREAM)),
+            member_keys: None,
         }
+    }
+
+    /// GW-AUTOKEY: enable `POST /auth/member-key` with `cfg`, and arm the
+    /// store's shared member pool with `cfg.pool_daily`. Without this call
+    /// the route is 404 and the store's pool stays at its default of off.
+    pub fn with_member_keys(mut self, cfg: MemberKeyConfig) -> Self {
+        self.store.set_member_pool_daily(cfg.pool_daily);
+        self.member_keys = Some(Arc::new(MemberKeys::new(cfg)));
+        self
+    }
+
+    /// Test hook: replace the member-key issuance clock (unix seconds) so
+    /// tests can step past the per-account window without sleeping.
+    #[cfg(test)]
+    pub(crate) fn with_member_key_clock(mut self, clock: crate::member_keys::Clock) -> Self {
+        if let Some(mk) = self.member_keys.take() {
+            let mut inner = MemberKeys::new(mk.cfg.clone());
+            inner.clock = clock;
+            self.member_keys = Some(Arc::new(inner));
+        }
+        self
     }
 
     /// PBA-L3b-003: set the generation ceiling and the concurrency limits.
@@ -212,14 +242,27 @@ impl LocalProxyState {
     }
 
     /// Take one of this key's in-flight slots, or `None` if all are in use.
-    fn try_key_slot(&self, key_hash: &str) -> Option<OwnedSemaphorePermit> {
+    fn try_key_slot(&self, key_hash: &str, label: &str) -> Option<OwnedSemaphorePermit> {
+        let limit = self.concurrency_limit_for(label);
         let sem = self
             .per_key_slots
             .lock()
             .entry(key_hash.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(self.max_concurrent_per_key)))
+            .or_insert_with(|| Arc::new(Semaphore::new(limit)))
             .clone();
         sem.try_acquire_owned().ok()
+    }
+
+    /// In-flight limit for a key. Member keys (GW-AUTOKEY) get the member
+    /// config's limit, never more than the proxy-wide one; every other key —
+    /// and every key when the feature is off — keeps `max_concurrent_per_key`.
+    fn concurrency_limit_for(&self, label: &str) -> usize {
+        match &self.member_keys {
+            Some(mk) if label.starts_with(MEMBER_LABEL_PREFIX) => {
+                mk.cfg.max_concurrent.clamp(1, self.max_concurrent_per_key)
+            }
+            _ => self.max_concurrent_per_key,
+        }
     }
 
     /// Set dedicated `/v1/embeddings` upstream(s). Empty is a no-op
@@ -256,6 +299,9 @@ pub fn build_local_proxy_router(state: LocalProxyState) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        // Outside /v1/ on purpose: never matched by the passthrough, never
+        // metered against a cgk_ key (it authenticates with an IdP token).
+        .route("/auth/member-key", post(member_key_handler))
         .route("/v1/*rest", any(proxy_handler))
         .layer(cors)
         .layer(redact)
@@ -321,7 +367,7 @@ async fn proxy_handler(
 
     // PBA-L3b-003: bound this key's in-flight requests. Held until the
     // response body has been fully streamed (or dropped).
-    let key_slot = match state.try_key_slot(&consumed.hash) {
+    let key_slot = match state.try_key_slot(&consumed.hash, &consumed.label) {
         Some(p) => p,
         None => return rate_limited(1, "too many concurrent requests for this api key"),
     };
@@ -1785,5 +1831,350 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&b).contains(r#""content":"OK""#));
+    }
+
+    // ── GW-AUTOKEY / WP-1: POST /auth/member-key ──────────────────────
+
+    /// Fake IdP userinfo: `good` → alice, `good2` → bob, `bad` → 401,
+    /// `boom` → 500, `nosub` → 200 without `sub`.
+    async fn spawn_fake_idp() -> SocketAddr {
+        serve_app(Router::new().route(
+            "/me",
+            get(|headers: HeaderMap| async move {
+                let token = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                match token {
+                    "Bearer good" => (StatusCode::OK, r#"{"sub":"alice","email":"a@x"}"#),
+                    "Bearer good2" => (StatusCode::OK, r#"{"sub":"bob"}"#),
+                    "Bearer nosub" => (StatusCode::OK, r#"{"email":"a@x"}"#),
+                    "Bearer boom" => (StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+                    _ => (StatusCode::UNAUTHORIZED, "no"),
+                }
+            }),
+        ))
+        .await
+    }
+
+    fn member_cfg(idp: SocketAddr) -> MemberKeyConfig {
+        MemberKeyConfig {
+            userinfo_url: format!("http://{idp}/me"),
+            ..MemberKeyConfig::default()
+        }
+    }
+
+    fn issue(token: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("POST").uri("/auth/member-key");
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    async fn json_body(resp: Response<Body>) -> serde_json::Value {
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    /// Settable clock for the issuance limiter.
+    fn test_clock(start: u64) -> (Arc<std::sync::atomic::AtomicU64>, crate::member_keys::Clock) {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(start));
+        let r = t.clone();
+        (
+            t,
+            Arc::new(move || r.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    }
+
+    /// Happy path: a valid IdP token yields a working `member:` key with the
+    /// documented body + `no-store`, and the key's 1 rps limit applies.
+    #[tokio::test]
+    async fn member_key_good_token_issues_working_rate_limited_key() {
+        let idp = spawn_fake_idp().await;
+        let upstream = spawn_upstream(false).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store.clone(), vec![format!("http://{upstream}")])
+                .with_member_keys(member_cfg(idp)),
+        );
+
+        let resp = app.clone().oneshot(issue(Some("good"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let v = json_body(resp).await;
+        let key = v["key"].as_str().unwrap().to_string();
+        assert!(key.starts_with("cgk_"));
+        assert_eq!(v["base_url"], "https://infer.citrate.ai/v1");
+        assert_eq!(v["model"], "citrate-gemma");
+        assert_eq!(v["quota_rps"], 1);
+        assert_eq!(v["daily_requests"], 300);
+
+        let rec = store.get_record(&key).unwrap().unwrap();
+        assert_eq!(
+            rec.label,
+            format!("member:{}", crate::member_keys::subject_hash("alice"))
+        );
+
+        let first = app.clone().oneshot(chat(&key)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // 1 rps: back-to-back requests must hit 429. The window is the wall
+        // second, so one pair may straddle a boundary under a loaded test
+        // run; two consecutive boundaries between immediate requests can't
+        // happen, so three tries are deterministic.
+        let mut limited = None;
+        for _ in 0..3 {
+            let r = app.clone().oneshot(chat(&key)).await.unwrap();
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited = Some(r);
+                break;
+            }
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let limited = limited.expect("a 1 rps member key must be rate limited");
+        assert_eq!(limited.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    /// One issuance per 60 s per account; once the window passes, a new
+    /// issuance revokes the previous key (one live key per account).
+    #[tokio::test]
+    async fn member_key_reissue_is_spaced_and_revokes_previous_key() {
+        let idp = spawn_fake_idp().await;
+        let upstream = spawn_upstream(false).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let (now, clock) = test_clock(1_000_000);
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")])
+                .with_member_keys(member_cfg(idp))
+                .with_member_key_clock(clock),
+        );
+
+        let k1 = json_body(app.clone().oneshot(issue(Some("good"))).await.unwrap()).await["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        now.fetch_add(5, std::sync::atomic::Ordering::SeqCst);
+        let again = app.clone().oneshot(issue(Some("good"))).await.unwrap();
+        assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(again.headers().get(header::RETRY_AFTER).unwrap(), "55");
+        // Refused re-issuance did not touch the live key.
+        assert_eq!(
+            app.clone().oneshot(chat(&k1)).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        now.fetch_add(60, std::sync::atomic::Ordering::SeqCst);
+        let resp = app.clone().oneshot(issue(Some("good"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let k2 = json_body(resp).await["key"].as_str().unwrap().to_string();
+        assert_ne!(k1, k2);
+
+        assert_eq!(
+            app.clone().oneshot(chat(&k1)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "the previous key is revoked"
+        );
+        assert_eq!(
+            app.clone().oneshot(chat(&k2)).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    /// IdP verdicts map to 401 / 503 and never mint; a missing bearer is 401.
+    #[tokio::test]
+    async fn member_key_idp_failures_never_mint() {
+        let idp = spawn_fake_idp().await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store.clone(), vec!["http://127.0.0.1:1".into()])
+                .with_member_keys(member_cfg(idp)),
+        );
+        for (token, want) in [
+            (Some("bad"), StatusCode::UNAUTHORIZED),
+            (Some("boom"), StatusCode::SERVICE_UNAVAILABLE),
+            (Some("nosub"), StatusCode::SERVICE_UNAVAILABLE),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let resp = app.clone().oneshot(issue(token)).await.unwrap();
+            assert_eq!(resp.status(), want, "{token:?}");
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+        }
+        assert!(store.list().unwrap().is_empty(), "nothing may be minted");
+    }
+
+    /// An unreachable IdP is a 503, never a mint.
+    #[tokio::test]
+    async fn member_key_unreachable_idp_is_503() {
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store.clone(), vec!["http://127.0.0.1:1".into()])
+                .with_member_keys(MemberKeyConfig {
+                    userinfo_url: "http://127.0.0.1:1/me".into(),
+                    ..MemberKeyConfig::default()
+                }),
+        );
+        let resp = app.oneshot(issue(Some("good"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// Feature off (no MemberKeyConfig): the route is 404 and the store's
+    /// member pool stays disabled.
+    #[tokio::test]
+    async fn member_key_route_is_404_when_feature_off() {
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let app = router_with(store.clone(), "http://127.0.0.1:1".into());
+        let resp = app.oneshot(issue(Some("good"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(store.member_pool_daily(), 0);
+    }
+
+    /// The issuance route consumes no key's quota and is not swallowed by
+    /// the `/v1/*` passthrough: a 1-request-per-day operator key is intact
+    /// after issuances, and nothing reaches the upstream.
+    #[tokio::test]
+    async fn member_key_route_charges_no_key_and_never_forwards() {
+        let idp = spawn_fake_idp().await;
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let upstream = spawn_recording_upstream(paths.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let op = store.create_key("op", 0, 1).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")])
+                .with_member_keys(member_cfg(idp)),
+        );
+        // Even sent with a cgk_ key as the bearer, it goes to the IdP (401).
+        let resp = app.clone().oneshot(issue(Some(&op))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(paths.lock().unwrap().is_empty());
+        assert_eq!(
+            app.clone().oneshot(chat(&op)).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    /// Shared pool: with pool=2, two members' first requests succeed, the
+    /// third member request (either key) is 429 until UTC midnight, and an
+    /// operator key is unaffected.
+    #[tokio::test]
+    async fn member_pool_cap_blocks_members_but_not_operator_keys() {
+        let idp = spawn_fake_idp().await;
+        let upstream = spawn_upstream(false).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let op = store.create_key("chatbot-prod", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_member_keys(
+                MemberKeyConfig {
+                    pool_daily: 2,
+                    // Lift the per-key rps so only the pool can refuse.
+                    quota_rps: 100,
+                    ..member_cfg(idp)
+                },
+            ),
+        );
+        let mut keys = Vec::new();
+        for t in ["good", "good2"] {
+            let resp = app.clone().oneshot(issue(Some(t))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{t}");
+            keys.push(json_body(resp).await["key"].as_str().unwrap().to_string());
+        }
+        for k in &keys {
+            assert_eq!(
+                app.clone().oneshot(chat(k)).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        let third = app.clone().oneshot(chat(&keys[0])).await.unwrap();
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry: u64 = third
+            .headers()
+            .get(header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(retry <= 86_400);
+        assert!(json_body(third).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daily quota"));
+        for _ in 0..3 {
+            assert_eq!(
+                app.clone().oneshot(chat(&op)).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    /// Member keys get the member in-flight limit (2) while operator keys
+    /// keep the proxy-wide one (4); without the feature nothing changes.
+    #[tokio::test]
+    async fn member_keys_get_their_own_concurrency_limit() {
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let off = LocalProxyState::new(store.clone(), vec!["http://127.0.0.1:1".into()]);
+        assert_eq!(
+            off.concurrency_limit_for("member:abcd"),
+            DEFAULT_MAX_CONCURRENT_PER_KEY
+        );
+        let on = off.clone().with_member_keys(MemberKeyConfig::default());
+        assert_eq!(on.concurrency_limit_for("member:abcd"), 2);
+        assert_eq!(
+            on.concurrency_limit_for("chatbot-prod"),
+            DEFAULT_MAX_CONCURRENT_PER_KEY
+        );
+        // Never above the proxy-wide limit.
+        let tight = on.with_limits(64, 1, 8);
+        assert_eq!(tight.concurrency_limit_for("member:abcd"), 1);
+    }
+
+    /// End to end: the third concurrent request on a member key is 429.
+    #[tokio::test]
+    async fn member_key_third_concurrent_request_is_429() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let idp = spawn_fake_idp().await;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let upstream = spawn_gated_upstream(in_flight.clone(), gate.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_member_keys(
+                MemberKeyConfig {
+                    quota_rps: 100,
+                    ..member_cfg(idp)
+                },
+            ),
+        );
+        let key = json_body(app.clone().oneshot(issue(Some("good"))).await.unwrap()).await["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let a1 = spawn_chat(&app, &key);
+        let a2 = spawn_chat(&app, &key);
+        wait_until(|| in_flight.load(Ordering::SeqCst) == 2).await;
+        let resp = app.clone().oneshot(chat(&key)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        gate.add_permits(100);
+        for h in [a1, a2] {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
     }
 }
