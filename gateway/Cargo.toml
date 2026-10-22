@@ -172,6 +172,6 @@ name = "citrate-gateway-admin"
 path = "src/bin/citrate-gateway-admin.rs"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"

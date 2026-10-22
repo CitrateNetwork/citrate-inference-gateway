@@ -1786,6 +1786,40 @@ mod tests {
         }
     }
 
+    /// When the shared upstream capacity stays exhausted for the whole queue
+    /// wait, the request is answered 503 and never forwarded. Time is paused
+    /// once the slot is held, so the 60 s wait elapses instantly.
+    #[tokio::test]
+    async fn upstream_queue_wait_expiry_is_503_and_not_forwarded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let upstream = spawn_gated_upstream(in_flight.clone(), gate.clone()).await;
+        let dir = tempdir().unwrap();
+        let store = PersistentKeyStore::open(dir.path(), TEST_MASTER).unwrap();
+        let a = store.create_key("a", 0, 0).unwrap();
+        let b = store.create_key("b", 0, 0).unwrap();
+        let app = build_local_proxy_router(
+            LocalProxyState::new(store, vec![format!("http://{upstream}")]).with_limits(64, 2, 1),
+        );
+
+        let holder = spawn_chat(&app, &a);
+        wait_until(|| in_flight.load(Ordering::SeqCst) == 1).await;
+
+        tokio::time::pause();
+        let resp = app.clone().oneshot(chat(&b)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            1,
+            "the timed-out request must not reach the upstream"
+        );
+        tokio::time::resume();
+
+        gate.add_permits(100);
+        assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    }
+
     #[test]
     fn pba_l3b_003_limits_are_never_zero() {
         let dir = tempdir().unwrap();
