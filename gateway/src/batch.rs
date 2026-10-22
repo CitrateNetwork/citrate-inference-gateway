@@ -1067,3 +1067,195 @@ mod tests {
         assert!(!BatchStatus::Running.is_terminal());
     }
 }
+
+/// Live settlement path for a keyless (x402-paid) batch on the durable
+/// store: a batch whose slots fail must leave a recorded refund obligation
+/// naming the payer — not just a "settled" marker. Drives the real
+/// `submit_batch_handler` and the spawned processor end to end; the
+/// boot-recovery path is covered separately in `tests/agentb_poc.rs`.
+#[cfg(test)]
+mod x402_live_refund_tests {
+    use super::*;
+    use crate::keystore::PersistentKeyStore;
+    use crate::queries::{ChainQueries, ProviderInfo};
+    use async_trait::async_trait;
+    use ethereum_types::H256;
+
+    const QUOTE: u64 = 1_000;
+
+    /// Every model resolves and prices at `QUOTE`; no provider or pool is
+    /// registered, so every dispatched slot errors. Counts name lookups.
+    #[derive(Default)]
+    struct NoProviderQueries {
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChainQueries for NoProviderQueries {
+        async fn resolve_model_name(&self, _name: &str) -> Result<H256, GatewayError> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(H256::from([0x11; 32]))
+        }
+        async fn estimate_cost(
+            &self,
+            _model_hash: H256,
+            _input_tokens: u32,
+            _output_tokens: u32,
+            _tier: u8,
+        ) -> Result<U256, GatewayError> {
+            Ok(U256::from(QUOTE))
+        }
+        async fn list_providers(&self, _h: H256) -> Result<Vec<ProviderInfo>, GatewayError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn request() -> ChatCompletionRequest {
+        request_for("m")
+    }
+
+    fn request_for(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![crate::openai::ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            max_tokens: Some(16),
+            stream: false,
+        }
+    }
+
+    fn state_with(queries: Arc<NoProviderQueries>, store: Arc<PersistentKeyStore>) -> SharedState {
+        Arc::new(crate::state::AppState {
+            config: crate::config::GatewayConfig::default(),
+            http: reqwest::Client::new(),
+            queries,
+            batches: Arc::new(BatchStore::with_persistence(store)),
+            keys: Arc::new(crate::auth::ApiKeyStore::new()),
+            usage: Arc::new(crate::usage::UsageStore::new()),
+        })
+    }
+
+    fn paid_by(payer: H160, amount: u64) -> X402Paid {
+        X402Paid {
+            payer,
+            amount_wei: U256::from(amount),
+            nonce: H256::from([0x0a; 32]),
+            settle_tx_hash: H256::zero(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_refuses_too_many_distinct_models_before_any_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentKeyStore::open(dir.path(), [7u8; 32]).expect("open store");
+        let queries = Arc::new(NoProviderQueries::default());
+        let state = state_with(queries.clone(), store);
+        let requests = (0..=MAX_DISTINCT_BATCH_MODELS)
+            .map(|i| request_for(&format!("model-{i}")))
+            .collect();
+        let result = submit_batch_handler(
+            State(state),
+            Extension(paid_by(H160::from([0xb1; 20]), u64::MAX)),
+            None,
+            Json(BatchSubmitRequest { requests }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GatewayError::BadRequest(ref m)) if m.contains("distinct models")),
+            "over-cap distinct models must be refused, got {:?}",
+            result.map(|r| r.status())
+        );
+        assert_eq!(
+            queries.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no model lookup may run for a refused batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyless_failed_batch_records_a_refund_owed_to_the_payer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentKeyStore::open(dir.path(), [7u8; 32]).expect("open store");
+        let state = state_with(Arc::new(NoProviderQueries::default()), store.clone());
+        let payer = H160::from([0xb1; 20]);
+        let paid = paid_by(payer, 10 * QUOTE);
+
+        let resp = submit_batch_handler(
+            State(state.clone()),
+            Extension(paid),
+            None,
+            Json(BatchSubmitRequest {
+                requests: vec![request(), request()],
+            }),
+        )
+        .await
+        .expect("submit accepted");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let batch_id = json["batch_id"].as_str().expect("batch_id").to_string();
+
+        // Wait for the detached processor to reach terminal + settle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.batch_was_settled(&batch_id).expect("settled flag") {
+            assert!(std::time::Instant::now() < deadline, "batch never settled");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let owed = store
+            .refund_owed(&batch_id)
+            .expect("read obligation")
+            .expect("a failed keyless batch must record the refund it owes");
+        assert_eq!(owed.batch_id, batch_id);
+        assert_eq!(owed.refund_grains, (2 * QUOTE).to_string());
+        assert_eq!(
+            owed.payer.as_deref(),
+            Some(format!("0x{}", hex::encode(payer.as_bytes())).as_str()),
+            "the obligation names the paying address"
+        );
+    }
+
+    /// A record carrying neither an owning key nor a read-token hash (a
+    /// snapshot written before reads were bound to the submitter) is not
+    /// readable by anyone.
+    #[tokio::test]
+    async fn batch_without_a_read_credential_is_not_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentKeyStore::open(dir.path(), [7u8; 32]).expect("open store");
+        let state = state_with(Arc::new(NoProviderQueries::default()), store);
+        let id = "batch_legacy".to_string();
+        state
+            .batches
+            .insert(BatchRecord {
+                id: id.clone(),
+                status: BatchStatus::Completed,
+                paid_escrow_grains: U256::zero(),
+                released_grains: U256::zero(),
+                refunded_grains: U256::zero(),
+                payer_api_key_id: None,
+                x402_payer: None,
+                read_token_hash: None,
+                slots: Vec::new(),
+                created_at: 0,
+            })
+            .await;
+
+        for bearer in ["Bearer brt_anything", "Bearer cgk_anything"] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, bearer.parse().expect("header"));
+            let status = get_batch_handler(State(state.clone()), Path(id.clone()), headers.clone())
+                .await
+                .status();
+            assert_eq!(status, StatusCode::NOT_FOUND, "status read with {bearer}");
+            let status = get_batch_output_handler(State(state.clone()), Path(id.clone()), headers)
+                .await
+                .status();
+            assert_eq!(status, StatusCode::NOT_FOUND, "output read with {bearer}");
+        }
+    }
+}
