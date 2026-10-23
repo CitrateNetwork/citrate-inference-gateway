@@ -59,11 +59,10 @@ fn run_against_mutated_tree(
     let src_dir = tmp.path().join("gateway/src");
     std::fs::create_dir_all(&ci_dir).expect("mkdir scripts/ci");
     std::fs::create_dir_all(&src_dir).expect("mkdir gateway/src");
-    std::fs::copy(root.join("scripts/ci").join(script), ci_dir.join(script))
-        .expect("copy script");
+    std::fs::copy(root.join("scripts/ci").join(script), ci_dir.join(script)).expect("copy script");
     for f in files {
-        let original = std::fs::read_to_string(root.join("gateway/src").join(f))
-            .expect("read gateway source");
+        let original =
+            std::fs::read_to_string(root.join("gateway/src").join(f)).expect("read gateway source");
         let content = if *f == target_file {
             let mutated = mutate(&original);
             assert_ne!(
@@ -88,7 +87,11 @@ fn assert_passes_on_the_real_tree(script: &str) {
         "{script} must pass on the current tree:\n{}",
         out.stdout
     );
-    assert!(out.stdout.contains("ok:"), "{script} output: {}", out.stdout);
+    assert!(
+        out.stdout.contains("ok:"),
+        "{script} output: {}",
+        out.stdout
+    );
 }
 
 fn assert_detects(out: Outcome, script: &str) {
@@ -133,7 +136,11 @@ fn durable_money_store_tripwire_detects_a_volatile_production_fallback() {
 #[test]
 fn durable_money_store_tripwire_detects_a_dropped_durable_open() {
     let out = run_against_mutated_tree(DURABLE, DURABLE_FILES, "lib.rs", |s| {
-        s.replacen("keyvault::open_store(&path)", "open_volatile_store(&path)", 1)
+        s.replacen(
+            "keyvault::open_store(&path)",
+            "open_volatile_store(&path)",
+            1,
+        )
     });
     assert_detects(out, DURABLE);
 }

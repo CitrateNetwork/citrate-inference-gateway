@@ -46,7 +46,10 @@ fn config() -> GatewayConfig {
 /// Point the production store at a fresh temp dir (the production setting).
 fn durable_store_in(dir: &tempfile::TempDir) {
     let path = dir.path().join("keystore");
-    std::env::set_var("CITRATE_GATEWAY_KEYSTORE_PATH", path.to_str().expect("utf8 path"));
+    std::env::set_var(
+        "CITRATE_GATEWAY_KEYSTORE_PATH",
+        path.to_str().expect("utf8 path"),
+    );
 }
 
 async fn status_of(app: &axum::Router, method: &str, uri: &str) -> StatusCode {
@@ -56,7 +59,11 @@ async fn status_of(app: &axum::Router, method: &str, uri: &str) -> StatusCode {
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .expect("request");
-    app.clone().oneshot(req).await.expect("service call").status()
+    app.clone()
+        .oneshot(req)
+        .await
+        .expect("service call")
+        .status()
 }
 
 #[tokio::test]
@@ -196,7 +203,10 @@ async fn production_metrics_are_closed_unless_the_operator_token_matches() {
     // Token configured: a wrong or same-length-wrong bearer is refused.
     std::env::set_var("CITRATE_GATEWAY_METRICS_TOKEN", "prod-surface-secret");
     assert_eq!(scrape(None).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(scrape(Some("prod-surface-secrex")).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        scrape(Some("prod-surface-secrex")).await,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(scrape(Some("prod")).await, StatusCode::UNAUTHORIZED);
     assert_eq!(scrape(Some("prod-surface-secret")).await, StatusCode::OK);
     std::env::remove_var("CITRATE_GATEWAY_METRICS_TOKEN");
