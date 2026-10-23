@@ -12,7 +12,14 @@ share that one store so a batch refund + its balance credit commit atomically.
 This check fails CI if a regression:
   - removes `open_marketplace_store()` from `build_router` (the gated path), or
   - lets `open_marketplace_store()` fall back to in-memory **silently** (no
-    `tracing::warn`), or drops the durable `PersistentKeyStore::open`.
+    `tracing::warn`), or
+  - drops the durable open: `open_marketplace_store()` must call
+    `keyvault::open_store`, and that must open a `PersistentKeyStore`, or
+  - turns the production refusal (no keystore path, no dev profile) back into
+    an in-memory fallback: the `RefusedProdVolatile` arm must `panic!`.
+
+Run under `cargo test` by `gateway/tests/ci_tripwire_scripts.rs`, which also
+holds a negative control for each condition.
 
 Spec: .agentile/sprints/active/INFER-S4-WPF-durable-balances.md
 """
@@ -21,6 +28,7 @@ import sys
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parents[2] / "gateway" / "src" / "lib.rs"
+KEYVAULT = Path(__file__).resolve().parents[2] / "gateway" / "src" / "keyvault.rs"
 
 
 def fn_body(src: str, sig_re: str, name: str) -> str:
@@ -38,6 +46,8 @@ def main() -> int:
     src = LIB.read_text()
     build = fn_body(src, r"pub async fn build_router\(", "build_router")
     opener = fn_body(src, r"fn open_marketplace_store\(", "open_marketplace_store")
+    kv_src = KEYVAULT.read_text()
+    kv_open = fn_body(kv_src, r"pub fn open_store\(", "keyvault::open_store")
 
     problems = []
     if "open_marketplace_store()" not in build:
@@ -45,10 +55,17 @@ def main() -> int:
             "build_router no longer wires `open_marketplace_store()` — the durable "
             "(shared) store path for balances + batches is missing (WP-F regression)."
         )
-    if "PersistentKeyStore::open" not in opener:
+    if "keyvault::open_store(" not in opener or "PersistentKeyStore::open" not in kv_open:
         problems.append(
-            "open_marketplace_store no longer opens a durable `PersistentKeyStore` — "
-            "the money + batch stores would be volatile in production."
+            "open_marketplace_store no longer opens a durable `PersistentKeyStore` "
+            "(via `keyvault::open_store`) — the money + batch stores would be "
+            "volatile in production."
+        )
+    if not re.search(r"MarketplaceStoreDecision::RefusedProdVolatile\s*=>\s*panic!\(", opener):
+        problems.append(
+            "open_marketplace_store no longer refuses to start when no keystore path "
+            "is set outside the dev profile — a production boot could serve money "
+            "paths on a volatile in-memory store."
         )
     if "tracing::warn" not in opener:
         problems.append(
@@ -61,7 +78,8 @@ def main() -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("ok: build_router wires open_marketplace_store(); durable open present; fallback warns loudly")
+    print("ok: build_router wires open_marketplace_store(); durable open present; "
+          "fallback warns loudly; production refuses a volatile store")
     return 0
 
 
