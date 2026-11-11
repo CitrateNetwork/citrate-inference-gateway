@@ -1,0 +1,39 @@
+name: address-drift
+
+# Blocking gate: fails when this repo's vendored copy of the chain-40204 address book differs from the
+# canonical root book, citrate-chain contracts/addresses/40204.json on main. citrate-chain is public, so
+# no token is needed. The daily run turns this red when the chain's book moves (a new genesis), even
+# with no change in this repo. To fix a failure: run `bash scripts/sync-addresses.sh` with citrate-chain
+# checked out beside this repo, and commit the diff (fed ops/r1007-ceremony/ADDRESS_PROPAGATION.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      # scripts/sync-addresses.sh reads ../citrate-chain, so check both repos out side by side.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: citrate-inference-gateway
+          persist-credentials: false
+      - name: Check out citrate-chain (public, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: CitrateNetwork/citrate-chain
+          ref: main
+          path: citrate-chain
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            contracts/addresses/
+      - name: Vendored address book matches the chain (blocking)
+        run: bash citrate-inference-gateway/scripts/sync-addresses.sh --check
