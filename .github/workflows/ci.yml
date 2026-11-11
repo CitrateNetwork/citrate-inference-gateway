@@ -15,7 +15,11 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # The job id and check name stay "rust" (branch protection requires "ci", which waits on it);
+    # only the runner image is pinned. ubuntu-latest moved to 26.04, where librocksdb-sys 0.16
+    # (via the citrate-chain crates) fails to build ('uint64_t' has not been declared). Pinned to
+    # 24.04 until the rocksdb crate moves with the chain pin. Same fix as citrate-native #37.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
